@@ -10,7 +10,18 @@ This repository currently contains only planning/specification documents — no 
 - `# Итоговая архитектура AI Code Review Platform.md` — final architecture: component diagram, API contracts, state machine, DB schema, deployment model.
 - `Системный промт для генерации кода Review Gateway.md` — the staged code-generation brief this project is meant to be built from (Java 21 / Spring Boot 3.2).
 
-Read the two spec files in full before generating code — they are the authoritative reference; the summary below is only for quick orientation. There are no build/lint/test commands yet because no project skeleton exists. Once a Maven/Gradle project is created, this file should be updated with the real commands.
+Read the two spec files in full before generating code — they are the authoritative reference; the summary below is only for quick orientation.
+
+## Build toolchain
+
+No system-wide Java/Maven — use the local installs (export these in every shell before building):
+
+```bash
+export JAVA_HOME="$HOME/tools/jdk-21.0.11+10"
+export PATH="$JAVA_HOME/bin:$HOME/tools/apache-maven-3.9.9/bin:$PATH"
+```
+
+Build/test: `mvn -q compile`, `mvn -q test`. **No Docker on this machine** — Testcontainers will not work; for integration tests use Zonky embedded-postgres (`io.zonky.test:embedded-postgres`) or plain unit tests with mocks.
 
 ## What is being built
 
