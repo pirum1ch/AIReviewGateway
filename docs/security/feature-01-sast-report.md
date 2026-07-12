@@ -93,5 +93,39 @@ tracked). Closed this round: none required for the data-model merge.
 Feature-01 is safe to merge as a data-model layer: no code-level vulnerability, SR-13 verified clean,
 no exposed surface. Schedule the Spring Boot upgrade (F01-01) before feature-03 wires HTTP/security/
 actuator, since that is when the Tomcat/actuator CVEs become reachable and the upgrade becomes costly.
+
+## Remediation update (2026-07-12)
+
+**F01-01 — CLOSED.** Upgraded `spring-boot-starter-parent` from `3.2.12` to `3.5.16` (latest stable
+3.5.x in Maven Central at time of upgrade; the 3.2.x line stays EOL). Requirements §2.1 mandates
+"Spring Boot 3.x" generically, not the 3.2 minor specifically, so this is a spec-compliant move, not a
+deviation — the 3.2.12 pin in the codegen brief/architecture doc was the stricter, now-outdated source.
+Resolved versions after upgrade (`mvn dependency:tree`): `tomcat-embed-core:10.1.55`,
+`spring-core:6.2.19`, `hibernate-core:6.6.53.Final`, `postgresql:42.7.11`,
+`jackson-databind:2.21.4` — all clear of the CVEs listed above. Re-added `flyway-database-postgresql`
+(now required alongside `flyway-core` on Flyway 11.x; both BOM-managed, no explicit version) —
+resolved `flyway-core:11.7.2` / `flyway-database-postgresql:11.7.2`. The `commons-lang3:3.20.0` test
+pin is still required (Boot 3.5.16's BOM only manages 3.17.0, below both the Zonky-required method and
+the CVE-2025-48924 fix line) — kept, comment updated. No `src/main`/`src/test` code changes were needed;
+all 48 existing tests pass unchanged (`mvn test`, exit 0). `V1__initial_schema.sql` was not touched.
+
+**F01-02 — CLOSED** (as predicted): resolved `logback-classic` is now `1.5.34`, well past the patched
+1.5.x line; no standalone action was needed.
+
+**Deferred items — tracking note.** The following findings remain open by design and are not
+addressed in this remediation pass; they will land as follows:
+
+- **F01-03** (`review_events` audit-trail integrity: `ON DELETE CASCADE`, no append-only DB grant) —
+  deferred to the **ops runbook / deployment migration** that provisions the Gateway DB role (grant
+  `INSERT`/`SELECT`-only on `review_events`) and to the retention-job design (SR-22), not this
+  code-level remediation.
+- **F01-04** (test-only string-built SQL, no injectable path) — optional hardening tracked as a CI
+  lint item (Semgrep `p/sql-injection` gate, SR-23), to be wired with the feature-03 pipeline; not a
+  code change against this pass.
+- **F01-05** (unbounded `TEXT` columns; real control is the edge body-cap) — tracked for
+  **feature-02/03** (`POST /reviews` diff-size cap SR-11, `/jobs/{id}/result` size cap SR-21) where the
+  write-path controllers/services are implemented.
+- **F01-06** (`backends.url` SSRF sink, no allowlist) — tracked for **feature-03** (backend-registry
+  write path + probe client, SR-10 allowlist / loopback / link-local / metadata-endpoint rejection).
 </content>
 </invoke>

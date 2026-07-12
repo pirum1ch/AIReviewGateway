@@ -7,7 +7,7 @@
     <parent>
         <groupId>org.springframework.boot</groupId>
         <artifactId>spring-boot-starter-parent</artifactId>
-        <version>3.2.12</version>
+        <version>3.5.16</version>
         <relativePath/>
     </parent>
 
@@ -54,13 +54,16 @@
             <artifactId>spring-boot-starter-actuator</artifactId>
         </dependency>
 
-        <!-- Flyway schema migrations. Spring Boot 3.2.12 manages Flyway 9.22.3, whose flyway-core
-             already bundles native PostgreSQL support; the separate flyway-database-postgresql
-             module only exists from Flyway 10.x onward (paired with Spring Boot 3.3+), so it is
-             deliberately omitted here (see final report for details). -->
+        <!-- Flyway schema migrations. Spring Boot 3.5.x manages Flyway 10.x/11.x, which split
+             native PostgreSQL support out of flyway-core into flyway-database-postgresql. Both
+             artifacts are BOM-managed (no explicit version) so the Boot parent controls the pair. -->
         <dependency>
             <groupId>org.flywaydb</groupId>
             <artifactId>flyway-core</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.flywaydb</groupId>
+            <artifactId>flyway-database-postgresql</artifactId>
         </dependency>
 
         <!-- PostgreSQL driver -->
@@ -102,10 +105,11 @@
             <scope>test</scope>
         </dependency>
 
-        <!-- Spring Boot 3.2.12's dependency management force-downgrades commons-lang3 to 3.13.0,
+        <!-- Spring Boot 3.5.16's dependency management still only provides commons-lang3 3.17.0,
              which lacks SystemProperties.getUserName(String) required by embedded-postgres 2.2.2's
-             own commons-lang3 3.20.0 requirement (NoSuchMethodError at runtime otherwise). Declaring
-             it directly here overrides the inherited BOM version for the whole build. -->
+             own commons-lang3 3.20.0 requirement (NoSuchMethodError at runtime otherwise), and
+             predates the CVE-2025-48924 fix (3.18.0+). Declaring it directly here overrides the
+             inherited BOM version for the whole build; re-check this pin on every Boot upgrade. -->
         <dependency>
             <groupId>org.apache.commons</groupId>
             <artifactId>commons-lang3</artifactId>
