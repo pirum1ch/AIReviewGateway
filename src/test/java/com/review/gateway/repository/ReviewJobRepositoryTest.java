@@ -129,4 +129,65 @@ class ReviewJobRepositoryTest extends AbstractPostgresIntegrationTest {
 
         assertThat(exceeded).containsExactly(longRunning.getId());
     }
+
+    @Test
+    void findReviewIdsWithStaleHeartbeatBoundaryExactlyAtCutoffIsNotYetStale() {
+        // "Stale" means the interval is EXCEEDED (architecture §8: "now - heartbeat_at exceeds the
+        // configured interval"), i.e. strictly more than the timeout. A heartbeat recorded at
+        // exactly the cutoff instant has not yet exceeded it and must not be swept.
+        Backend backend = persistBackend("backend-heartbeat-boundary");
+        Instant cutoff = Instant.now().minus(3, ChronoUnit.MINUTES);
+
+        Review exactlyAtCutoff = persistReview(3L, 24L, "sha-exact-cutoff", ReviewStatus.RUNNING);
+        ReviewJob exactJob = new ReviewJob(exactlyAtCutoff.getId(), backend.getId(), "worker-5");
+        exactJob.setHeartbeatAt(cutoff);
+        entityManager.persistAndFlush(exactJob);
+
+        Review oneMillisStale = persistReview(3L, 25L, "sha-one-millis-stale", ReviewStatus.RUNNING);
+        ReviewJob oneMillisJob = new ReviewJob(oneMillisStale.getId(), backend.getId(), "worker-6");
+        oneMillisJob.setHeartbeatAt(cutoff.minusMillis(1));
+        entityManager.persistAndFlush(oneMillisJob);
+
+        List<Long> staleReviewIds = reviewJobRepository.findReviewIdsWithStaleHeartbeat(cutoff);
+
+        assertThat(staleReviewIds).containsExactly(oneMillisStale.getId());
+        assertThat(staleReviewIds).doesNotContain(exactlyAtCutoff.getId());
+    }
+
+    @Test
+    void findReviewIdsExceedingMaxDurationBoundaryExactlyAtCutoffIsNotYetExceeding() {
+        Backend backend = persistBackend("backend-duration-boundary");
+        Instant cutoff = Instant.now().minus(45, ChronoUnit.MINUTES);
+
+        Review exactlyAtCutoff = persistReview(4L, 33L, "sha-exact-duration-cutoff", ReviewStatus.RUNNING);
+        ReviewJob exactJob = new ReviewJob(exactlyAtCutoff.getId(), backend.getId(), "worker-7");
+        exactJob.setStartedAt(cutoff);
+        entityManager.persistAndFlush(exactJob);
+
+        Review oneMillisOver = persistReview(4L, 34L, "sha-one-millis-over", ReviewStatus.RUNNING);
+        ReviewJob oneMillisJob = new ReviewJob(oneMillisOver.getId(), backend.getId(), "worker-8");
+        oneMillisJob.setStartedAt(cutoff.minusMillis(1));
+        entityManager.persistAndFlush(oneMillisJob);
+
+        List<Long> exceeded = reviewJobRepository.findReviewIdsExceedingMaxDuration(cutoff);
+
+        assertThat(exceeded).containsExactly(oneMillisOver.getId());
+        assertThat(exceeded).doesNotContain(exactlyAtCutoff.getId());
+    }
+
+    @Test
+    void countRunningJobsForBackendExcludesFailedAndQueuedReviews() {
+        Backend backend = persistBackend("backend-non-running-statuses");
+
+        Review running = persistReview(2L, 14L, "sha-run-counted", ReviewStatus.RUNNING);
+        entityManager.persistAndFlush(new ReviewJob(running.getId(), backend.getId(), "worker-1"));
+
+        Review failed = persistReview(2L, 15L, "sha-failed", ReviewStatus.FAILED);
+        entityManager.persistAndFlush(new ReviewJob(failed.getId(), backend.getId(), "worker-2"));
+
+        Review queued = persistReview(2L, 16L, "sha-queued", ReviewStatus.QUEUED);
+        entityManager.persistAndFlush(new ReviewJob(queued.getId(), backend.getId(), "worker-3"));
+
+        assertThat(reviewJobRepository.countRunningJobsForBackend(backend.getId())).isEqualTo(1);
+    }
 }

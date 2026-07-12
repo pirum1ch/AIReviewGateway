@@ -11,7 +11,9 @@ import javax.sql.DataSource;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
+import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Set;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CountDownLatch;
@@ -19,6 +21,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -75,6 +78,70 @@ class ReviewRepositoryConcurrentClaimTest extends AbstractPostgresIntegrationTes
             }
         } finally {
             jdbcTemplate.update("DELETE FROM reviews WHERE id IN (?, ?)", reviewA, reviewB);
+        }
+    }
+
+    /**
+     * Strengthened version of the test above: N threads race, with no artificial ordering
+     * (no latch, no sleep), over M QUEUED reviews where N == M. Each thread performs the full
+     * claim-and-transition (architecture §5 step 2+3: {@code SELECT ... FOR UPDATE SKIP LOCKED}
+     * then {@code UPDATE ... SET status = 'RUNNING'} in the same short transaction). If
+     * {@code SKIP LOCKED} genuinely prevents double-claims, every one of the M reviews is claimed
+     * by exactly one thread — no duplicates, no thread walks away empty-handed, no review is left
+     * unclaimed.
+     */
+    @Test
+    void nThreadsRacingOverNQueuedReviewsEachClaimExactlyOneDistinctRow() throws Exception {
+        final int reviewCount = 12;
+        JdbcTemplate jdbcTemplate = new JdbcTemplate(dataSource);
+        List<Long> reviewIds = new ArrayList<>();
+        for (int i = 0; i < reviewCount; i++) {
+            reviewIds.add(insertQueuedReview(jdbcTemplate, 950L, 100L + i, "race-sha-" + i));
+        }
+
+        ExecutorService executor = Executors.newFixedThreadPool(reviewCount);
+        try {
+            List<Future<Long>> futures = new ArrayList<>();
+            for (int i = 0; i < reviewCount; i++) {
+                futures.add(executor.submit(this::claimAndMarkRunning));
+            }
+
+            List<Long> claimedIds = new ArrayList<>();
+            for (Future<Long> future : futures) {
+                claimedIds.add(future.get(10, TimeUnit.SECONDS));
+            }
+
+            assertThat(claimedIds).doesNotContainNull();
+            assertThat(claimedIds).as("no two threads may claim the same review")
+                    .doesNotHaveDuplicates();
+            assertThat(new HashSet<>(claimedIds))
+                    .as("every queued review must end up claimed by exactly one thread")
+                    .containsExactlyInAnyOrderElementsOf(reviewIds);
+        } finally {
+            executor.shutdownNow();
+            jdbcTemplate.update(
+                    "DELETE FROM reviews WHERE id IN (" +
+                            reviewIds.stream().map(String::valueOf).collect(Collectors.joining(",")) + ")");
+        }
+    }
+
+    private Long claimAndMarkRunning() throws Exception {
+        try (Connection connection = dataSource.getConnection()) {
+            connection.setAutoCommit(false);
+            Long claimedId;
+            try (PreparedStatement statement = connection.prepareStatement(CLAIM_SQL);
+                 ResultSet resultSet = statement.executeQuery()) {
+                claimedId = resultSet.next() ? resultSet.getLong(1) : null;
+            }
+            if (claimedId != null) {
+                try (PreparedStatement update = connection.prepareStatement(
+                        "UPDATE reviews SET status = 'RUNNING' WHERE id = ?")) {
+                    update.setLong(1, claimedId);
+                    update.executeUpdate();
+                }
+            }
+            connection.commit();
+            return claimedId;
         }
     }
 

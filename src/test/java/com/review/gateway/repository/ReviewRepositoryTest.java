@@ -4,6 +4,8 @@ import com.review.gateway.AbstractPostgresIntegrationTest;
 import com.review.gateway.model.Review;
 import com.review.gateway.model.enums.ReviewStatus;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.orm.jpa.TestEntityManager;
 
@@ -143,6 +145,15 @@ class ReviewRepositoryTest extends AbstractPostgresIntegrationTest {
     void claimQueryReturnsEmptyWhenNothingQueued() {
         Review running = newReview(4L, 40L, "sha-running", ReviewStatus.RUNNING, 10);
         entityManager.persistAndFlush(running);
+
+        assertThat(reviewRepository.findNextQueuedReviewIdForUpdate()).isEmpty();
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = ReviewStatus.class, names = {"QUEUED"}, mode = EnumSource.Mode.EXCLUDE)
+    void claimQuerySkipsEveryNonQueuedStatus(ReviewStatus nonQueuedStatus) {
+        Review notQueued = newReview(8L, 80L, "sha-not-queued-" + nonQueuedStatus, nonQueuedStatus, 10);
+        entityManager.persistAndFlush(notQueued);
 
         assertThat(reviewRepository.findNextQueuedReviewIdForUpdate()).isEmpty();
     }
