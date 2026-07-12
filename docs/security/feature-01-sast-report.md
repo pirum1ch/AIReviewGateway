@@ -88,6 +88,11 @@ feature-03), and `semgrep` `p/java`/`p/spring`/`p/sql-injection`/`p/secrets` (ke
 Open: F01-01 (High, before feature-03/release), F01-03 (Low, ops/grant), F01-02/04/05/06 (Low/Info,
 tracked). Closed this round: none required for the data-model merge.
 
+**Update after remediation + verification (2026-07-12):** F01-01 and F01-02 → **CLOSED-VERIFIED**
+(Spring Boot 3.5.16, all resolved versions re-checked clean, 48/48 tests green). F01-03/04/05/06 remain
+**OPEN by design**, correctly routed to later features/ops. See "Remediation verification" section at
+the end for the independent re-check. Verdict: **APPROVED-FOR-MERGE.**
+
 ## Bottom line
 
 Feature-01 is safe to merge as a data-model layer: no code-level vulnerability, SR-13 verified clean,
@@ -127,5 +132,54 @@ addressed in this remediation pass; they will land as follows:
   write-path controllers/services are implemented.
 - **F01-06** (`backends.url` SSRF sink, no allowlist) — tracked for **feature-03** (backend-registry
   write path + probe client, SR-10 allowlist / loopback / link-local / metadata-endpoint rejection).
+
+## Remediation verification (2026-07-12, AppSec — independent re-check before merge)
+
+Method: re-resolved the dependency tree myself (`mvn -o dependency:tree`, JDK 21.0.11 / Maven 3.9.9),
+re-ran the full suite (`mvn -o test`), and did a diff-level sanity pass over `pom.xml`, entities,
+repositories and `V1__initial_schema.sql`. Report claims were **not** trusted — versions and test
+count were reproduced from the toolchain output.
+
+**F01-01 — CLOSED-VERIFIED.** `pom.xml` parent confirmed `spring-boot-starter-parent:3.5.16` (a
+supported, actively-patched 3.5.x line; 3.2.x stays EOL). Resolved versions reproduced from
+`dependency:tree` and cross-checked against known CVEs (knowledge cutoff Jan 2026):
+  - `tomcat-embed-core:10.1.55` — clears CVE-2025-24813 (fix 10.1.35), CVE-2025-31650/31651 (fix
+    10.1.40) and the 10.1.42-era fixes; no known unpatched CVE at 10.1.55.
+  - `spring-core / spring-web / spring-webmvc:6.2.19` — clears CVE-2025-22233 (DataBinder, fix 6.2.7);
+    no known unpatched CVE.
+  - `spring-security-core:6.5.11` — current line (the previously-flagged 6.2.8 is gone); no known
+    unpatched CVE.
+  - `postgresql:42.7.11` — clears CVE-2025-49146 (channel-binding, fix 42.7.6) and the older SQLi
+    fix; clean.
+  - `jackson-databind:2.21.4`, `hibernate-core:6.6.53.Final`, `snakeyaml:2.4` — clean.
+  - `flyway-core:11.7.2` + `flyway-database-postgresql:11.7.2` — both BOM-managed, no explicit
+    version pin; no known CVE. The re-added `flyway-database-postgresql` is a functional dependency
+    of Flyway 11.x, not a security change.
+  - `commons-lang3:3.20.0` (test scope) — retained pin, above the CVE-2025-48924 fix line (3.18.0);
+    test-only, no shipped blast radius. Justification comment present in `pom.xml`.
+
+**F01-02 — CLOSED-VERIFIED.** Resolved `logback-classic:1.5.34` / `logback-core:1.5.34`, well past the
+CVE-2024-12798 / CVE-2024-12801 fix (1.5.13). Cleared automatically by the F01-01 upgrade as predicted.
+
+**Deferred items (F01-03/04/05/06) — verified correctly routed, remain OPEN by design.** The tracking
+note above correctly defers each to its proper stage: F01-03 → ops runbook / DB-role grant + retention
+job (SR-19/SR-22); F01-04 → CI Semgrep gate (SR-23); F01-05 → feature-02/03 edge body-cap + result-size
+cap (SR-11/SR-21); F01-06 → feature-03 backend-registry write path + SR-10 allowlist. None is reachable
+at the data-model layer; none blocks this merge. These stay OPEN and must be picked up at the named
+stages.
+
+**Regression — PASS.** `mvn -o test` → `Tests run: 48, Failures: 0, Errors: 0, Skipped: 0`,
+BUILD SUCCESS (the 48 claim reproduced exactly). The SQL `23505` errors in the log are the intended
+negative-path assertions of the dedup/constraint tests, not failures.
+
+**New-code sanity pass — PASS.** `src/main` tree unchanged vs. review (11 entities/enums, 7
+repositories, single `V1__initial_schema.sql`, `application.yml`); no new files. No string-built SQL in
+`src/main` (all native queries are text-block + bound-param, SR-13 still clean); no hardcoded secrets
+(`password`/`secret`/`token` matches are all LLM token-count columns or "NEVER secrets" doc comments).
+`V1__initial_schema.sql` untouched. Security posture unchanged from the reviewed state; the only delta
+is the dependency upgrade, which improves it.
+
+**Verdict: APPROVED-FOR-MERGE.** F01-01 and F01-02 closed and independently verified; deferred items
+correctly routed; suite green; no posture-changing new code.
 </content>
 </invoke>
