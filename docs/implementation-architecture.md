@@ -1,6 +1,6 @@
 # Review Gateway — Implementation Architecture
 
-Target: a backend developer can build the service from this document without further design decisions. Java 21, Spring Boot 3.2.x, PostgreSQL-only, Flyway, virtual threads, single Gateway instance, stateless Worker.
+Target: a backend developer can build the service from this document without further design decisions. Java 21, Spring Boot 3.5.x (see §1 for the F01-01 upgrade note), PostgreSQL-only, Flyway, virtual threads, single Gateway instance, stateless Worker.
 
 All decisions here are derived strictly from `Требования_Review_Gateway_v2.md`, `# Итоговая архитектура AI Code Review Platform.md`, and `CLAUDE.md`. Nothing beyond those specs is invented; where the specs left a gap (notably the missing home for the dedup key and the Review aggregate) the resolution is called out explicitly.
 
@@ -23,7 +23,7 @@ All decisions here are derived strictly from `Требования_Review_Gatewa
 - **version:** `1.0.0-SNAPSHOT`
 - **Java:** 21
 - **Base package:** `com.review.gateway`
-- **Build:** Maven, Spring Boot parent `3.2.12` (last 3.2.x line; upgrade within 3.2.x only unless a Boot 3.3 migration is scheduled).
+- **Build:** Maven, Spring Boot parent `3.5.16` (latest stable 3.5.x as of 2026-07; upgraded from the originally-specified `3.2.12` per SAST finding F01-01 — the 3.2.x line is EOL for free/OSS security patches, and requirements §2.1 only mandates "Spring Boot 3.x", not the 3.2 minor specifically. Flyway now requires the separate `flyway-database-postgresql` artifact alongside `flyway-core`, both BOM-managed).
 
 ### pom.xml (dependency list)
 
@@ -37,7 +37,7 @@ All decisions here are derived strictly from `Требования_Review_Gatewa
     <parent>
         <groupId>org.springframework.boot</groupId>
         <artifactId>spring-boot-starter-parent</artifactId>
-        <version>3.2.12</version>
+        <version>3.5.16</version>
         <relativePath/>
     </parent>
 
