@@ -1,0 +1,125 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>3.2.12</version>
+        <relativePath/>
+    </parent>
+
+    <groupId>com.review</groupId>
+    <artifactId>review-gateway</artifactId>
+    <version>1.0.0-SNAPSHOT</version>
+    <name>review-gateway</name>
+
+    <properties>
+        <java.version>21</java.version>
+        <zonky.embedded.version>2.5.1</zonky.embedded.version>
+    </properties>
+
+    <dependencies>
+        <!-- Web (REST, JSON via Jackson) -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+
+        <!-- Persistence -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-jpa</artifactId>
+        </dependency>
+
+        <!-- Bean Validation on request DTOs -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-validation</artifactId>
+        </dependency>
+
+        <!-- Security: bearer-token filter for CI / WORKER / ADMIN roles -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-security</artifactId>
+        </dependency>
+
+        <!-- Actuator: ONLY for /actuator/health (DB health indicator) and readiness.
+             NO Prometheus registry is added (see requirements §15). Business /metrics
+             is a custom controller reading from PostgreSQL. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+
+        <!-- Flyway schema migrations. Spring Boot 3.2.12 manages Flyway 9.22.3, whose flyway-core
+             already bundles native PostgreSQL support; the separate flyway-database-postgresql
+             module only exists from Flyway 10.x onward (paired with Spring Boot 3.3+), so it is
+             deliberately omitted here (see final report for details). -->
+        <dependency>
+            <groupId>org.flywaydb</groupId>
+            <artifactId>flyway-core</artifactId>
+        </dependency>
+
+        <!-- PostgreSQL driver -->
+        <dependency>
+            <groupId>org.postgresql</groupId>
+            <artifactId>postgresql</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+
+        <!-- ===== TEST ===== -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+            <!-- brings JUnit 5, Mockito, AssertJ, JsonPath -->
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.security</groupId>
+            <artifactId>spring-security-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- Zonky embedded PostgreSQL: real Postgres binary in-process, no Docker.
+             Replaces Testcontainers because Docker is unavailable on the build host.
+             embedded-database-spring-test alone only wires Testcontainers-based providers
+             (Docker); io.zonky.test:embedded-postgres additionally provides the native-binary
+             "ZONKY" provider used explicitly in tests via
+             @AutoConfigureEmbeddedDatabase(provider = ZONKY, type = POSTGRES). -->
+        <dependency>
+            <groupId>io.zonky.test</groupId>
+            <artifactId>embedded-database-spring-test</artifactId>
+            <version>${zonky.embedded.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.zonky.test</groupId>
+            <artifactId>embedded-postgres</artifactId>
+            <version>2.2.2</version>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- Spring Boot 3.2.12's dependency management force-downgrades commons-lang3 to 3.13.0,
+             which lacks SystemProperties.getUserName(String) required by embedded-postgres 2.2.2's
+             own commons-lang3 3.20.0 requirement (NoSuchMethodError at runtime otherwise). Declaring
+             it directly here overrides the inherited BOM version for the whole build. -->
+        <dependency>
+            <groupId>org.apache.commons</groupId>
+            <artifactId>commons-lang3</artifactId>
+            <version>3.20.0</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+</project>
