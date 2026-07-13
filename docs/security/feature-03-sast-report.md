@@ -160,9 +160,14 @@ by the WebFlux-only CVE-2024-38821; authorization-bypass fixes of the 6.x line a
 | SR-17 error/actuator/topology disclosure | **CLOSED** | f03 handler + actuator health-only + `BackendView` |
 | SR-18 auth-failure logging + identity | **CLOSED** | f03 filter/`SecurityConfig` + f02 `EventService` |
 | SR-21 raw-response cap | **CLOSED** | f02 `ResultProcessor` (verified) |
-| **SR-23 CI security gates (gitleaks/SCA/semgrep)** | **OPEN** | no `.github/workflows`/`.gitlab-ci.yml`/pre-commit config in repo |
+| **SR-23 CI security gates (gitleaks/SCA/semgrep)** | **CLOSED** (feature/04, GitHub Actions) | `.github/workflows/security-gate.yml`; detail `docs/security/sr-23-ci-gate.md` |
 
-**Every code-level MUST control is closed.** The one still-open MUST is **SR-23** — no CI/CD security-gate
+> Status update: SR-23 was OPEN at the time of this feature-03 review and has since been **CLOSED** by the
+> `feature/04-ci-security-gate` implementation (GitHub Actions gate: gitleaks full-history + osv-scanner
+> High/Critical + semgrep ERROR + `mvn verify`). See `docs/security/sr-23-ci-gate.md`. The paragraphs below
+> describe the feature-03-era state (SR-23 then open) and are retained as the point-in-time record.
+
+**Every code-level MUST control is closed.** The one then-still-open MUST was **SR-23** — no CI/CD security-gate
 config exists in the repository. This is a process/infra control (not application code), but as the final
 feature it must be **explicitly wired or accepted**: add `gitleaks` (pre-commit + full-history),
 `osv-scanner`/OWASP Dependency-Check on `pom.xml` (block High/Critical), and `semgrep`
@@ -259,13 +264,16 @@ identity), SR-21 (raw-response cap). Injection surface clean; no SSRF/authz bypa
 the actively-patched baseline (`spring-boot 3.5.16`, `spring-security 6.5.11`, `tomcat 10.1.55`,
 `jackson 2.21.4`, `postgresql 42.7.11`).
 
-**The one OPEN MUST — SR-23 (CI/CD security gate).** No pipeline config exists in the repo. Concrete next
-step (open-source, per threat-model §5): add a CI workflow that runs `gitleaks` (pre-commit + full-history,
-block on any hit), `osv-scanner` **or** OWASP Dependency-Check on `pom.xml` (fail build on High/Critical —
-this is the gate that would have caught the F01-01 EOL-Spring-Boot class of issue), and `semgrep`
-(`p/java` `p/spring` `p/sql-injection` `p/secrets`) on every PR; keep the per-PR set under ~2 min and run
-Dependency-Check-full + a ZAP baseline on a schedule. Until wired, **SR-23 must be explicitly accepted by
-the owner** with the understanding that dependency-EOL/secret-commit regressions are ungated.
+**SR-23 (CI/CD security gate) — CLOSED (implemented on `feature/04-ci-security-gate`).** The GitHub
+Actions gate `.github/workflows/security-gate.yml` now runs on every PR + push to `master`: `gitleaks`
+(full-history, blocking), `osv-scanner` over a fully-resolved CycloneDX SBOM (blocking on High/Critical —
+the control that would have caught the F01-01 EOL-Spring-Boot CVEs), `semgrep`
+(`p/java`/`p/spring`/`p/sql-injection`/`p/secrets`, blocking on ERROR), and `mvn verify` on Temurin JDK 21.
+gitleaks and osv-scanner were verified locally against the repo (gitleaks: clean after a value-scoped
+`.gitleaks.toml` allowlist of known test fixtures — no real secret, none in `src/main`; osv-scanner: only
+Medium/Low advisories present — `logback-core 1.5.34`→1.5.35 recommended, `jackson-databind 2.21.4` Medium
+no-fix, both below the gate). semgrep is configured but not runnable in the sandbox (no pip/Docker) — first
+verified on the branch's opening PR. Full detail: `docs/security/sr-23-ci-gate.md`. **No open MUST remains.**
 
 **Accepted-risk SHOULDs (threat-model-sanctioned at this scale; recorded, not blocking):**
 SR-03 (multi-token rotation), SR-06 (claim lease token), SR-07 (per-backend token binding) — the
