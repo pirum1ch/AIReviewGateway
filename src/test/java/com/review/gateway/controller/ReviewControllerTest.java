@@ -110,6 +110,44 @@ class ReviewControllerTest {
     }
 
     @Test
+    void createReviewReturns400OnMalformedJsonSyntax() throws Exception {
+        // Distinct from createReviewReturns400OnMissingRequiredField (syntactically-valid JSON that
+        // fails bean validation): this is syntactically-BROKEN JSON, which Jackson rejects before
+        // validation even runs, routing through HttpMessageNotReadableException instead of
+        // MethodArgumentNotValidException. Must still be 400, not 500 (contract edge case).
+        mockMvc.perform(post("/reviews")
+                        .header("Authorization", "Bearer " + SecurityTestTokens.CI_TOKEN)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{ this is not valid json"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("MALFORMED_REQUEST"));
+    }
+
+    @Test
+    void createReviewReturns400OnEmptyBody() throws Exception {
+        mockMvc.perform(post("/reviews")
+                        .header("Authorization", "Bearer " + SecurityTestTokens.CI_TOKEN)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(""))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("MALFORMED_REQUEST"));
+    }
+
+    @Test
+    void createReviewReturns400OnNegativeProjectId() throws Exception {
+        String invalidJson = """
+                {"projectId": -1, "mergeRequestId": 2, "headSha": "abc", "baseSha": "def", "diff": "x", "promptVersion": "v1"}
+                """;
+
+        mockMvc.perform(post("/reviews")
+                        .header("Authorization", "Bearer " + SecurityTestTokens.CI_TOKEN)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(invalidJson))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"));
+    }
+
+    @Test
     void createReviewReturns401WithoutAToken() throws Exception {
         mockMvc.perform(post("/reviews")
                         .contentType(MediaType.APPLICATION_JSON)
@@ -151,6 +189,21 @@ class ReviewControllerTest {
                 .andExpect(jsonPath("$.error").value("INTERNAL_ERROR"))
                 .andExpect(jsonPath("$.message").value("An unexpected error occurred"))
                 .andExpect(jsonPath("$.message", org.hamcrest.Matchers.not(org.hamcrest.Matchers.containsString("internal detail"))));
+    }
+
+    @Test
+    void getStatusWithNonNumericIdShouldReturn400NotInternalError() throws Exception {
+        // DEFECT (QA finding, Minor): a non-numeric path variable ("/reviews/abc") makes Spring MVC
+        // throw MethodArgumentTypeMismatchException while resolving the @PathVariable Long id, BEFORE
+        // the controller method body runs. GlobalExceptionHandler has no handler for that exception
+        // type, so it falls through to the generic Exception handler and returns 500 INTERNAL_ERROR --
+        // for what is unambiguously a client input error, indistinguishable in cause from the (already
+        // correctly-handled-as-400) "missing required field" case just above. No internal detail leaks
+        // (the generic body is used either way), so this is a correctness/contract defect, not a
+        // security one: a malformed URL segment should not present as a server fault to CI/monitoring.
+        mockMvc.perform(get("/reviews/{id}", "abc")
+                        .header("Authorization", "Bearer " + SecurityTestTokens.CI_TOKEN))
+                .andExpect(status().isBadRequest());
     }
 
     @Test
