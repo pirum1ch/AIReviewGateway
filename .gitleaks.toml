@@ -1,0 +1,55 @@
+# gitleaks configuration for AIReviewGateway (SR-23 CI security gate).
+#
+# Policy: use the full default gitleaks ruleset (NO detection rules disabled). Exemptions below are keyed
+# on the exact, known, non-secret FIXTURE VALUES (regex-only), not on whole files — so any *other* secret,
+# even if added to the same test files later, is still detected. No production path is broadly exempted;
+# the only path-based exemption is generated build output (`target/`, gitignored).
+#
+# Every exempted value is a documented test fixture:
+#   * dummy >=32-char bearer tokens that exist only to satisfy GatewayProperties' SR-01 startup check when
+#     a Spring context boots in tests (never valid against any real GitLab/backend), and
+#   * intentional fake secret strings fed INTO the EventService scrubber to prove it redacts them (SR-12/14).
+#
+# Verified locally: with these exemptions, `gitleaks git` (full history) and `gitleaks dir` report no
+# leaks, while a GitHub-PAT canary injected into one of these very test files IS still caught (the
+# exemptions are value-specific, not file-wide).
+
+title = "AIReviewGateway gitleaks config"
+
+[extend]
+useDefault = true
+
+# --- Exemption 0: build output (generated, gitignored, never committed) ------------------------------
+# `target/` is Maven build output; its test reports/compiled classes echo the dummy test tokens. The
+# authoritative gate is the full-history `gitleaks git` scan, which never sees target/ at all.
+[[allowlists]]
+description = "Maven build output (generated, gitignored, not source)"
+paths = [
+    '''target/''',
+    '''.*/target/''',
+]
+
+# --- Exemption 1: dummy >=32-char test bearer tokens (SR-01 context-boot placeholders) ---------------
+# Fixed, public, non-functional literals mirrored across src/test/resources/application.yml and the
+# security-matrix / lifecycle tests. Value-specific regexes: any real secret in those same files still trips.
+[[allowlists]]
+description = "Dummy >=32-char test bearer tokens (SR-01 context-boot placeholders, not real secrets)"
+regexTarget = "line"
+regexes = [
+    '''test-(ci|worker|admin|gitlab)-token-[0-9]+''',
+    '''totally-unrecognized-token-value-xyz-000''',
+]
+
+# --- Exemption 2: EventService scrubber test fixtures ------------------------------------------------
+# EventServiceTest feeds deliberately secret-SHAPED strings into EventService.record(...) to assert the
+# SR-12/SR-14 scrubber masks them; they must stay verbatim for the test to be meaningful.
+[[allowlists]]
+description = "Fake secret strings used as inputs to the EventService scrubber test (not real secrets)"
+regexTarget = "line"
+regexes = [
+    '''AKIA1234567890''',
+    '''s3cr3t-value-xyz''',
+    '''Bearer abc\.def\.ghi123''',
+    '''password: hunter2''',
+    '''secret=topsecret''',
+]
