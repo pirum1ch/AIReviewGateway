@@ -219,3 +219,69 @@ It is a one-line reorder to close. Recommend: land the F02-08 reorder (+ one quo
 is APPROVE-on-re-verify. If the coordinator judges F02-08 acceptable to defer given the KD-1 backstop
 now bounds it to a self-limiting per-review FAILED, downgrade to **APPROVED-WITH-TRACKED-FOLLOWUP** — but
 my recommendation is to fix it now, since it is trivial and reopens a just-gated defect class.
+
+---
+
+# Verification round 2 — F02-08 remediation commit `2bbf736` (2026-07-13)
+
+Method: read the full `2bbf736` diff **and** the current `CommentParser` source (claims not trusted),
+confirmed the reordering in **both** sanitation pipelines, checked specifically that the length cap is
+the genuine final step with no post-cap character insertion, confirmed the new tests exercise the
+escaped-inflation path, and re-ran the whole suite. HEAD `2bbf736`, tree clean, no code/tests modified.
+
+**Suite: `mvn test` → `Tests run: 231, Failures: 0, Errors: 0, Skipped: 0`, BUILD SUCCESS.**
+
+## F02-08 — **CLOSED-VERIFIED**
+
+- **Both pipelines reordered to `neutralizeMentions → htmlEscape → capLength` (cap LAST).** Verified in
+  current source: `sanitize` (`CommentParser.java:196-198`) caps `escaped` and returns `capped`;
+  `sanitizeFilePath` (`CommentParser.java:228-230`) caps `escaped` and returns it directly. The cap is
+  the **final** operation in each method — nothing after it can re-inflate the value.
+- **No new inflation path.** I confirmed the only post-escape steps are the cap itself. `capLength`
+  returns either the input unchanged (when `≤ max`) or `substring(0, max - suffix) + "... [truncated]"`,
+  whose length is exactly `max` for any `max ≥ 15` (`FILE_PATH_MAX_LENGTH=1024` and the default
+  `maxCommentLength=4000` both far exceed the 15-char suffix). So the persisted `file_path` is now
+  provably `≤ 1024`.
+- **No injection reintroduced by capping the escaped value.** Truncating an already-escaped string can
+  only cut *inside* an HTML entity (e.g. `&quot;` → `&quo`), yielding shorter **inert** text; it can
+  never resurrect a raw `<`/`>`/`"`/`&`, because those were already replaced with entities *before* the
+  cut. HTML-safety (SR-08) is preserved.
+- **Tests genuinely exercise the escaped-inflation path** (not tautologies):
+  - `CommentParserTest.filePathThatIsAllQuoteCharactersIsCappedAfterEscapingNotBeforeIt` (1024×`"` → 6144
+    post-escape) and `...AllAmpersandCharactersIsCappedAfterEscapingNotBeforeIt` — assert `filePath ≤ 1024`
+    + `[truncated]`.
+  - `commentTextCapAppliesToTheEscapedValueNotThePreEscapeValue` — covers the comment-text pipeline
+    (`maxCommentLength=50`, 100×`"`).
+  - `ResultProcessorOversizedFilePathTest.filePathOfAllQuoteCharactersIsCappedAfterEscapingAndReviewCompletesNormally`
+    — **end-to-end Zonky/real-Postgres**: my exact reproduce case (1024×`"` filePath) now `process()`
+    does not throw, review reaches `COMPLETED`, stored `file_path ≤ 1024`. This is the DB-overflow path
+    that previously wedged the review; it is now covered.
+- **No regression.** No `pom.xml` change; only `CommentParser` (2 method reorders + javadoc) and tests.
+  The comment-text change is behaviour-preserving for normal input (cap still applies), and moving the
+  cap after escaping strictly tightens the SR-09 guarantee.
+
+## Final per-finding status
+
+| # | Sev | Final verdict |
+|---|-----|---------------|
+| KD-1 | High (avail.) | **CLOSED-VERIFIED** |
+| F02-01 (SR-21) | High | **CLOSED-VERIFIED** |
+| F02-03 | Low | **CLOSED-VERIFIED** |
+| F02-04 / KD-2 | Low / Med | **CLOSED-VERIFIED** (length + line normalisation; the escape-inflation residual it left is now closed via F02-08) |
+| F02-05 | Low | **CLOSED-VERIFIED** |
+| F02-08 | Medium | **CLOSED-VERIFIED** |
+| F02-02 | Medium | **DEFERRED — feature 03** (SR-06 lease token or review row-lock/`@Version`) |
+| F02-06 | Info | **DEFERRED (accepted)** |
+| F02-07 | Info | **DEFERRED (accepted, T-06 residual)** |
+
+Still owed at feature 03 (HTTP/security layer MUST controls, unchanged): **SR-01, SR-02, SR-06, SR-07,
+SR-10, SR-11, SR-15, SR-16, SR-17, SR-18**, plus the deferred **F02-02**.
+
+## FINAL VERDICT: **APPROVED FOR MERGE**
+
+All must-fix findings for the feature-02 service layer are closed and independently verified against the
+current sources and a green 231/231 suite: KD-1 and F02-01 (the two High blockers), F02-03/04/05, and
+the fix-induced F02-08 residual. Every "closed" claim was reproduced from code + tests, not trusted. The
+remaining open items are the agreed feature-03 deferrals (F02-02 and the HTTP-layer SR controls), which
+are correctly out of scope for this stage and tracked above. No new security regressions were introduced
+by any remediation commit. The feature-02 service layer is cleared to merge.
