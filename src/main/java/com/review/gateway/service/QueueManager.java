@@ -1,6 +1,5 @@
 package com.review.gateway.service;
 
-import com.review.gateway.exception.JobNotClaimableException;
 import com.review.gateway.model.Backend;
 import com.review.gateway.model.Review;
 import com.review.gateway.model.ReviewInput;
@@ -64,18 +63,18 @@ public class QueueManager {
      * {@code RUNNING} status + heartbeat, never a held DB lock.
      *
      * @return the claimed job's payload, or empty if there is nothing to claim right now (204) —
-     *         which also covers "backend not ACTIVE" and "backend at capacity"
-     *         ({@link JobNotClaimableException} is caught here, not propagated, for those two cases).
+     *         which also covers "backend unknown", "backend not ACTIVE", and "backend at capacity"
+     *         ({@link BackendDispatcher#resolveClaimableBackend} returns empty for all three; see its
+     *         javadoc for why it must not throw here instead).
      */
     @Transactional(propagation = Propagation.REQUIRES_NEW, isolation = Isolation.READ_COMMITTED)
     public Optional<ClaimedJob> claim(String backendName, String workerId) {
-        Backend backend;
-        try {
-            backend = backendDispatcher.resolveClaimableBackend(backendName);
-        } catch (JobNotClaimableException notClaimable) {
-            log.debug("Claim declined for backend '{}': {}", backendName, notClaimable.getMessage());
+        Optional<Backend> backendOpt = backendDispatcher.resolveClaimableBackend(backendName);
+        if (backendOpt.isEmpty()) {
+            log.debug("Claim declined for backend '{}': not claimable right now", backendName);
             return Optional.empty();
         }
+        Backend backend = backendOpt.get();
 
         Optional<Long> reviewIdOpt = reviewRepository.findNextQueuedReviewIdForUpdate();
         if (reviewIdOpt.isEmpty()) {
@@ -181,11 +180,11 @@ public class QueueManager {
         if (review.getStatus() != ReviewStatus.RUNNING) {
             log.info("Idempotent no-op result submission: jobId={} reviewId={} currentStatus={}",
                     jobId, review.getId(), review.getStatus());
-            return SubmitResultOutcome.idempotentNoop(review.getStatus());
+            return SubmitResultOutcome.idempotentNoop(review.getId(), review.getStatus());
         }
 
         ReviewStatus finalStatus = resultProcessor.process(review.getId(), job.getId(), workerId, job.getBackendId(), command);
-        return SubmitResultOutcome.accepted(finalStatus);
+        return SubmitResultOutcome.accepted(review.getId(), finalStatus);
     }
 
     private boolean isOwner(ReviewJob job, String workerId) {

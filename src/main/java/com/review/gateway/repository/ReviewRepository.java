@@ -2,7 +2,9 @@ package com.review.gateway.repository;
 
 import com.review.gateway.model.Review;
 import com.review.gateway.model.enums.ReviewStatus;
+import jakarta.persistence.LockModeType;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Lock;
 import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
@@ -89,6 +91,19 @@ public interface ReviewRepository extends JpaRepository<Review, Long> {
      */
     List<Review> findByProjectIdAndMergeRequestIdAndHeadShaNotAndStatusIn(
             Long projectId, Long mergeRequestId, String headSha, Collection<ReviewStatus> obsoletableStatuses);
+
+    /**
+     * F02-02 fix: loads a Review under a row-level {@code SELECT ... FOR UPDATE} lock (SR-06 spirit —
+     * serializes completion instead of a lease token, since the frozen V1 schema has no lease column
+     * to add). {@code ResultProcessor}'s completion/fail phase uses this instead of {@code findById} so
+     * that two genuinely concurrent {@code submitResult} calls for the same Review cannot both insert
+     * comments and both transition {@code RUNNING -> COMPLETED}: the second caller's lock acquisition
+     * blocks until the first's {@code REQUIRES_NEW} transaction commits, at which point it re-observes
+     * the Review as no longer {@code RUNNING} and safely no-ops.
+     */
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("SELECT r FROM Review r WHERE r.id = :id")
+    Optional<Review> findByIdForUpdate(@Param("id") Long id);
 
     /**
      * Aggregate counts per status, backing {@code GET /metrics}.

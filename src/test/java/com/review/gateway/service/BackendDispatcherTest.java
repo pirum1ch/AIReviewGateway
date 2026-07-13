@@ -1,6 +1,5 @@
 package com.review.gateway.service;
 
-import com.review.gateway.exception.JobNotClaimableException;
 import com.review.gateway.model.Backend;
 import com.review.gateway.model.enums.BackendStatus;
 import com.review.gateway.repository.BackendRepository;
@@ -12,7 +11,6 @@ import org.mockito.Mockito;
 import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.Mockito.when;
 
 class BackendDispatcherTest {
@@ -38,39 +36,45 @@ class BackendDispatcherTest {
         when(backendRepository.findByName("mac-mini-1")).thenReturn(Optional.of(backend));
         when(reviewJobRepository.countRunningJobsForBackend(backend.getId())).thenReturn(1L);
 
-        Backend resolved = dispatcher.resolveClaimableBackend("mac-mini-1");
+        Optional<Backend> resolved = dispatcher.resolveClaimableBackend("mac-mini-1");
 
-        assertThat(resolved).isSameAs(backend);
+        assertThat(resolved).contains(backend);
     }
 
     @Test
-    void unknownBackendNameThrows() {
+    void unknownBackendNameReturnsEmpty() {
         when(backendRepository.findByName("ghost")).thenReturn(Optional.empty());
 
-        assertThatThrownBy(() -> dispatcher.resolveClaimableBackend("ghost"))
-                .isInstanceOf(JobNotClaimableException.class)
-                .hasMessageContaining("Unknown backend");
+        assertThat(dispatcher.resolveClaimableBackend("ghost")).isEmpty();
     }
 
     @Test
-    void nonActiveBackendThrows() {
+    void nonActiveBackendReturnsEmpty() {
         Backend backend = activeBackend("mac-mini-2", 2);
         backend.setStatus(BackendStatus.SUSPECT);
         when(backendRepository.findByName("mac-mini-2")).thenReturn(Optional.of(backend));
 
-        assertThatThrownBy(() -> dispatcher.resolveClaimableBackend("mac-mini-2"))
-                .isInstanceOf(JobNotClaimableException.class)
-                .hasMessageContaining("not ACTIVE");
+        assertThat(dispatcher.resolveClaimableBackend("mac-mini-2")).isEmpty();
     }
 
     @Test
-    void backendAtCapacityThrows() {
+    void backendAtCapacityReturnsEmpty() {
         Backend backend = activeBackend("mac-mini-3", 1);
         when(backendRepository.findByName("mac-mini-3")).thenReturn(Optional.of(backend));
         when(reviewJobRepository.countRunningJobsForBackend(backend.getId())).thenReturn(1L);
 
-        assertThatThrownBy(() -> dispatcher.resolveClaimableBackend("mac-mini-3"))
-                .isInstanceOf(JobNotClaimableException.class)
-                .hasMessageContaining("at capacity");
+        assertThat(dispatcher.resolveClaimableBackend("mac-mini-3")).isEmpty();
+    }
+
+    @Test
+    void neverThrowsForAnyDeclineReason() {
+        // QA-critical regression guard: resolveClaimableBackend must return Optional.empty() for every
+        // decline reason, never throw -- throwing here (even if caught by the caller) crosses this
+        // method's own transactional-AOP boundary were it ever re-annotated @Transactional, which is
+        // exactly what caused the UnexpectedRollbackException bug this contract change fixes.
+        when(backendRepository.findByName("anything")).thenReturn(Optional.empty());
+
+        org.assertj.core.api.Assertions.assertThatCode(() -> dispatcher.resolveClaimableBackend("anything"))
+                .doesNotThrowAnyException();
     }
 }
