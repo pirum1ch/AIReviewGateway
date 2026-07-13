@@ -81,8 +81,21 @@ public class ResultProcessor {
                         command.durationMs(), command.model())
                 : command;
 
-        requiresNewTransactionTemplate.executeWithoutResult(status ->
-                storeRawResult(reviewId, backendId, effectiveCommand));
+        // F02-02 follow-up: the try/catch for a concurrent duplicate insert must wrap the call to
+        // executeWithoutResult from OUTSIDE that transaction, not be nested inside storeRawResult
+        // itself. Hibernate marks its Session (and therefore the enclosing Spring transaction)
+        // rollback-only the instant a flush hits the unique-constraint violation, even though the
+        // DataIntegrityViolationException is caught immediately in application code -- so attempting to
+        // let that same transaction commit afterward throws UnexpectedRollbackException instead of
+        // quietly succeeding. Letting the whole small (single-insert) REQUIRES_NEW transaction roll back
+        // is harmless and correct here: it contains nothing but this one insert attempt, and a
+        // concurrent winner has already durably stored an equivalent raw result.
+        try {
+            requiresNewTransactionTemplate.executeWithoutResult(status ->
+                    storeRawResult(reviewId, backendId, effectiveCommand));
+        } catch (DataIntegrityViolationException alreadyStoredByAConcurrentSubmission) {
+            log.debug("Concurrent review_results insert for reviewId={}, ignoring", reviewId);
+        }
 
         List<ParsedComment> parsed;
         try {
@@ -121,7 +134,12 @@ public class ResultProcessor {
         return new CappedRawResponse(truncated, true, originalLength, max);
     }
 
-    /** Idempotent: a pre-existing row (e.g. a retried delivery after a mid-process crash) is left untouched. */
+    /**
+     * Idempotent: a pre-existing row (e.g. a retried delivery after a mid-process crash, or a
+     * genuinely concurrent submission that reaches the insert first) is left untouched. Does NOT
+     * catch a unique-violation itself: see the caller ({@link #process}) for why that must happen
+     * outside this method's transaction.
+     */
     private void storeRawResult(Long reviewId, Long backendId, SubmitResultCommand command) {
         if (reviewResultRepository.existsByReviewId(reviewId)) {
             log.debug("review_results already present for reviewId={}, skipping insert", reviewId);
@@ -133,15 +151,14 @@ public class ResultProcessor {
         ReviewResult result = new ReviewResult(reviewId, command.rawResponse(), null,
                 command.promptTokens(), command.completionTokens(), totalTokens,
                 command.durationMs(), command.model(), backendId);
-        try {
-            reviewResultRepository.save(result);
-        } catch (DataIntegrityViolationException alreadyStored) {
-            log.debug("Concurrent review_results insert for reviewId={}, ignoring", reviewId);
-        }
+        reviewResultRepository.save(result);
     }
 
     private void markFailed(Long reviewId, Long jobId, String workerId, Long backendId, Exception cause, CappedRawResponse capped) {
-        Review review = reviewRepository.findById(reviewId)
+        // F02-02: pessimistic row lock (see ReviewRepository#findByIdForUpdate) -- serializes this
+        // phase against a genuinely concurrent submitResult call for the same Review, so at most one
+        // of them can ever see status == RUNNING and actually transition/insert.
+        Review review = reviewRepository.findByIdForUpdate(reviewId)
                 .orElseThrow(() -> new IllegalStateException("Review " + reviewId + " vanished during result processing"));
         if (review.getStatus() != ReviewStatus.RUNNING) {
             log.debug("Review {} no longer RUNNING ({}) when marking parse-failure FAILED, skipping", reviewId, review.getStatus());
@@ -155,7 +172,12 @@ public class ResultProcessor {
 
     private void persistCommentsAndComplete(Long reviewId, Long jobId, String workerId, Long backendId,
                                              List<ParsedComment> parsed, CappedRawResponse capped) {
-        Review review = reviewRepository.findById(reviewId)
+        // F02-02: same pessimistic-lock rationale as markFailed above. A second, truly concurrent
+        // submitResult for this reviewId blocks here until the first commits (or rolls back), then
+        // observes status != RUNNING and safely no-ops -- closing the duplicate-comments/duplicate-
+        // publish race the SAST report flagged (review_comments has no unique constraint to fall back
+        // on, and Review carries no @Version since the V1 schema is frozen).
+        Review review = reviewRepository.findByIdForUpdate(reviewId)
                 .orElseThrow(() -> new IllegalStateException("Review " + reviewId + " vanished during result processing"));
         if (review.getStatus() != ReviewStatus.RUNNING) {
             log.debug("Review {} no longer RUNNING ({}) when completing, skipping", reviewId, review.getStatus());

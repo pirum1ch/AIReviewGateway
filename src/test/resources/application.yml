@@ -1,6 +1,15 @@
 spring:
   application:
     name: review-gateway-test
+  datasource:
+    # Never actually connected to: Zonky's @AutoConfigureEmbeddedDatabase replaces the DataSource bean
+    # for every test that needs one. These are only here so DataSourceProperties' placeholder binding
+    # (${DB_USER}/${DB_PASSWORD} in the main application.yml have no default) doesn't fail full
+    # @SpringBootTest context loads, where -- unlike the @DataJpaTest slice -- regular
+    # DataSourceAutoConfiguration participates in the auto-configuration set.
+    url: jdbc:postgresql://localhost:5432/unused-placeholder
+    username: test
+    password: test
   jpa:
     hibernate:
       ddl-auto: validate            # schema owned by Flyway only; Zonky provides the datasource
@@ -11,3 +20,17 @@ spring:
   test:
     database:
       replace: none                 # Zonky's @AutoConfigureEmbeddedDatabase supplies the DataSource
+
+# Dummy-but-valid (>=32 chars, SR-01) test credentials so any Spring context that wires
+# GatewayProperties/SecurityConfig (full @SpringBootTest, or a @WebMvcTest that @Imports SecurityConfig)
+# boots without failing GatewayProperties' startup validation. Never used against a real GitLab/backend.
+gateway:
+  security:
+    ci-token: test-ci-token-01234567890123456789012345
+    worker-token: test-worker-token-0123456789012345678901
+    admin-token: test-admin-token-01234567890123456789012
+  gitlab:
+    base-url: https://gitlab.example.test/api/v4
+    token: test-gitlab-token-0123456789012345678901
+  backend:
+    allowed-host-pattern: ".*"

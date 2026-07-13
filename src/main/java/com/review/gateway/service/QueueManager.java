@@ -181,11 +181,11 @@ public class QueueManager {
         if (review.getStatus() != ReviewStatus.RUNNING) {
             log.info("Idempotent no-op result submission: jobId={} reviewId={} currentStatus={}",
                     jobId, review.getId(), review.getStatus());
-            return SubmitResultOutcome.idempotentNoop(review.getStatus());
+            return SubmitResultOutcome.idempotentNoop(review.getId(), review.getStatus());
         }
 
         ReviewStatus finalStatus = resultProcessor.process(review.getId(), job.getId(), workerId, job.getBackendId(), command);
-        return SubmitResultOutcome.accepted(finalStatus);
+        return SubmitResultOutcome.accepted(review.getId(), finalStatus);
     }
 
     private boolean isOwner(ReviewJob job, String workerId) {
