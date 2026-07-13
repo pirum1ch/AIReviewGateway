@@ -195,3 +195,94 @@ security posture of the whole system is sound (all code MUSTs closed, dependenci
 SSRF-bypass/auth-bypass found). **PASS-with-notes.** The only non-code gap is SR-23 (CI gates), and the
 only functional blocker for production is the QA-owned claim-decline availability bug — neither is an
 AppSec merge blocker. Land the deployment-config must-dos and the SR-23 pipeline before go-live.
+
+---
+
+# Verification round — QA-defect remediation commit `bd789a1` (2026-07-13)
+
+Method: read the full `bd789a1` diff **and** the current sources; checked the `Optional` refactor did
+not weaken any contract (searched for every caller and every remaining reference to the old throwing
+path); confirmed no new transaction-boundary hazard; re-ran the whole suite. HEAD `bd789a1`, tree clean,
+no production code/tests modified by me.
+
+**Suite (run by me): `mvn test` → `Tests run: 346, Failures: 0, Errors: 0, Skipped: 0`, BUILD SUCCESS.**
+All four previously-failing intentional QA defect demos are now inverted to passing.
+
+## QA-defect verdicts
+
+- **QA-CRITICAL (claim-decline 500) — CLOSED-VERIFIED.** `BackendDispatcher.resolveClaimableBackend`
+  now returns `Optional<Backend>` (empty for unknown / not-ACTIVE / at-capacity) and its own
+  `@Transactional(readOnly=true)` is removed, so **no exception crosses a transactional-AOP proxy
+  boundary** and nothing marks `QueueManager.claim`'s `REQUIRES_NEW` transaction rollback-only — the
+  decline path now commits and returns 204. Verified: it is the **only** caller (`QueueManager.claim:72`
+  consumes the `Optional`); `JobNotClaimableException` is **no longer thrown anywhere** in `src/main`
+  (grep-confirmed: only the now-dead exception class + its orphaned `GlobalExceptionHandler` mapping
+  remain — harmless, as agreed). No new tx hazard: the reads (`findByName`, `countRunningJobsForBackend`)
+  still execute inside `claim`'s transaction (its sole call site is transactional), and a plain
+  no-`@Transactional` bean method cannot mark the shared tx rollback-only. Tests
+  `BackendDispatcherClaimDeclineTransactionBugTest` (×3, inverted to `doesNotThrow` + empty) and
+  `BackendDispatcherTest`'s regression guard genuinely exercise all three decline cases.
+- **QA-MINOR (type-mismatch 500 → 400) — CLOSED-VERIFIED.** `GlobalExceptionHandler.handleTypeMismatch`
+  maps `MethodArgumentTypeMismatchException` → `400 VALIDATION_ERROR`. The message
+  (`"<param>: must be a valid <SimpleTypeName>"`, e.g. `"id: must be a valid Long"`) exposes only the
+  public path-variable name and a generic Java simple-type name — **no** stack trace, package, internal
+  class, or SQL; SR-15/SR-17 preserved (same disposition as the existing `handleValidation`). Demo test
+  `getStatusWithNonNumericIdShouldReturn400NotInternalError` inverted and passing.
+
+## Finding dispositions (unchanged, carried forward)
+
+F03-01 (Low, DNS-rebinding TOCTOU) · F03-02 (Low, permissive default allowlist — **deployment must-do**)
+· F03-03 (Info, uncapped worker-only bodies) · F03-04 (Low, SR-06/07 self-declared identity — accepted)
+· F03-05 (Low, DB `sslmode` — **deployment must-do**) · F03-06 (Info, SR-20 rate limiting — accepted).
+None is a merge blocker; F03-02/F03-05 are deployment prerequisites.
+
+## FINAL VERDICT: **APPROVED FOR MERGE**
+
+Both QA defects are closed and independently verified against the current sources and a green 346/346
+suite; the `Optional` refactor weakened nothing and introduced no new transaction hazard; every
+code-level MUST control for the whole system is closed; dependencies are clean; no injection / SSRF-bypass
+/ auth-bypass was found. Feature-03 — and the system — is cleared to merge, subject to the deployment
+prerequisites and the one open process control below.
+
+---
+
+# Whole-system security posture summary (final — all three features)
+
+**Code-level MUST controls: ALL CLOSED and verified.**
+SR-01 (env tokens + ≥32-char + `https` startup gate), SR-02 (constant-time compare), SR-04 (job
+ownership), SR-05 (diff only to claimant), SR-08 (LLM output HTML-escape/neutralize), SR-09 (comment
+count/length + filePath caps), SR-10 (SSRF allowlist/loopback/redirect/timeout — notes F03-01/02),
+SR-11 (edge body cap — note F03-03), SR-12 (no secrets/payload in events), SR-13 (bound parameters),
+SR-14 (no diff/raw/token in logs), SR-15 (generic errors + HTTPS — DB-hop = F03-05), SR-16 (single-role
+matrix + `denyAll`), SR-17 (actuator health-only, no topology/URL leak), SR-18 (auth-failure logging +
+identity), SR-21 (raw-response cap). Injection surface clean; no SSRF/authz bypass found; dependencies on
+the actively-patched baseline (`spring-boot 3.5.16`, `spring-security 6.5.11`, `tomcat 10.1.55`,
+`jackson 2.21.4`, `postgresql 42.7.11`).
+
+**The one OPEN MUST — SR-23 (CI/CD security gate).** No pipeline config exists in the repo. Concrete next
+step (open-source, per threat-model §5): add a CI workflow that runs `gitleaks` (pre-commit + full-history,
+block on any hit), `osv-scanner` **or** OWASP Dependency-Check on `pom.xml` (fail build on High/Critical —
+this is the gate that would have caught the F01-01 EOL-Spring-Boot class of issue), and `semgrep`
+(`p/java` `p/spring` `p/sql-injection` `p/secrets`) on every PR; keep the per-PR set under ~2 min and run
+Dependency-Check-full + a ZAP baseline on a schedule. Until wired, **SR-23 must be explicitly accepted by
+the owner** with the understanding that dependency-EOL/secret-commit regressions are ungated.
+
+**Accepted-risk SHOULDs (threat-model-sanctioned at this scale; recorded, not blocking):**
+SR-03 (multi-token rotation), SR-06 (claim lease token), SR-07 (per-backend token binding) — the
+self-declared-worker-identity residual (F03-04, T-04); SR-19 (append-only DB grant on `review_events` —
+ops/DB-role task); SR-20 (in-memory per-token rate limiting — F03-06, T-16/T-23); SR-22 (at-rest/backup
+encryption + retention purge — ops); SR-24 (per-worker claim metrics). Plus the standing ACCEPTED-RISK
+items: single-instance SPOF availability, shared-CI-token IDOR on `GET /reviews/{id}` (diff excluded from
+the response), inherent diff exposure to a legitimately-claimed worker, and DB-loopback non-TLS.
+
+**Deployment prerequisites (must be satisfied at/before go-live):**
+1. Provide all four secrets (`CI_TOKEN`, `WORKER_TOKEN`, `ADMIN_TOKEN`, `GITLAB_TOKEN`) as env vars,
+   each ≥32 chars — the app refuses to start otherwise (SR-01). Least-privilege, expiring GitLab
+   project/group token scoped to the reviewed projects (SR-14/T-11).
+2. Set `BACKEND_ALLOWED_HOST_PATTERN` to the real backend network — do not ship the `.*` default (F03-02).
+3. Append `?sslmode=require` to a non-loopback `DB_URL` (F03-05); provide `DB_USER`/`DB_PASSWORD` via env.
+4. Terminate TLS on every hop (CI→/Worker→/Admin→Gateway, Gateway→GitLab already `https`-enforced) at the
+   reverse proxy; that proxy also supplies HSTS (T-12).
+5. Wire the SR-23 CI security gate (above).
+6. Grant the Gateway DB role `INSERT`/`SELECT`-only on `review_events` (SR-19) and enable volume/backup
+   encryption + a retention purge for `review_inputs.diff`/`review_results.raw_response` (SR-22).
