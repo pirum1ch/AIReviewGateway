@@ -5,7 +5,7 @@ name: security-gate
 #   1. gitleaks   — secret scan over FULL history (fetch-depth: 0), blocking on any leak.
 #   2. sca        — osv-scanner over a fully-resolved CycloneDX SBOM, blocking on High/Critical CVSS.
 #                   (This is the control that would have caught the F01-01 EOL-Spring-Boot CVEs.)
-#   3. semgrep    — p/java + p/spring + p/sql-injection + p/secrets, blocking on ERROR-severity findings.
+#   3. semgrep    — p/java + p/sql-injection + p/secrets, blocking on ERROR-severity findings.
 #   4. build-test — mvn verify on Temurin JDK 21 (Zonky embedded-postgres, no Docker needed on the runner).
 #
 # Scanner binary versions are pinned; the two scanner configs live in the repo root
@@ -93,12 +93,12 @@ jobs:
       - name: Semgrep — full report (informational, non-blocking)
         run: |
           semgrep scan --metrics off --disable-version-check \
-            --config p/java --config p/spring --config p/sql-injection --config p/secrets \
+            --config p/java --config p/sql-injection --config p/secrets \
             . || true
       - name: Semgrep — ERROR-severity gate (blocking)
         run: |
           semgrep scan --metrics off --disable-version-check --error --severity ERROR \
-            --config p/java --config p/spring --config p/sql-injection --config p/secrets \
+            --config p/java --config p/sql-injection --config p/secrets \
             .
 
   build-test:

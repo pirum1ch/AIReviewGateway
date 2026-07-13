@@ -34,7 +34,8 @@ jobs — any red job blocks the merge:
    BOM-managed empty-version entries (`spring-security-test`) and hits Maven-registry 429s; a
    Maven-generated SBOM is deterministic.
 3. **semgrep** — container `semgrep/semgrep`; one informational full scan (`|| true`) then a **blocking**
-   `--error --severity ERROR` scan over `p/java`, `p/spring`, `p/sql-injection`, `p/secrets`.
+   `--error --severity ERROR` scan over `p/java`, `p/sql-injection`, `p/secrets`.
+   (Ruleset choice / the `p/spring` correction are documented under "semgrep ruleset decision" below.)
 4. **build-test** — Temurin JDK 21, `mvn -B -ntp verify`. Zonky embedded-postgres runs on the ubuntu
    runner **without Docker**.
 
@@ -84,10 +85,40 @@ Two advisories found, **both below the High/Critical gate threshold** → SCA ga
 The sandbox has no `pip`/`pipx`/`ensurepip` and no Docker, so semgrep could not be installed or run
 locally. Only its **configuration** (`.semgrepignore` + the workflow's rule set/severity gate) is provided;
 it executes in CI via the official `semgrep/semgrep` container, which has network access to the semgrep
-registry (`p/java`, `p/spring`, `p/sql-injection`, `p/secrets`). **This is the one gate component whose
+registry (`p/java`, `p/sql-injection`, `p/secrets`). **This is the one gate component whose
 findings have not been observed locally** — its first real run will be on the opening PR of this branch.
 (Note: features 01–03 were manually reviewed by AppSec for the same rule classes — injection, secrets,
 Spring misconfig — and came back clean, so a large ERROR-severity surprise is unlikely, but unverified.)
+
+### semgrep ruleset decision (post-first-CI-run fix, `fix/security-gate-semgrep-config`)
+
+The first live gate run (Actions run `29280063782`, push to `master`) had gitleaks / osv-scanner /
+build-test all green, but the **semgrep job failed on config, not on code**: the registry ruleset
+`p/spring` does not exist — `https://semgrep.dev/c/p/spring` returns **HTTP 404** (so does `p/spring-boot`),
+and semgrep aborts the blocking step with "invalid configuration file found" (exit 7). Registry check:
+`p/java`, `p/sql-injection`, `p/secrets`, `p/owasp-top-ten` → 200; `p/spring` / `p/spring-boot` → 404.
+
+**Fix:** `p/spring` removed from **both** semgrep steps (informational + blocking). The gate now runs
+`p/java` + `p/sql-injection` + `p/secrets`. A local run of these three (semgrep 1.x via `uv`, done by the
+coordinator) resolved **56 rules over 143 files, 0 findings, exit 0** — clean and green.
+
+**Decision — do NOT add `p/owasp-top-ten` as a replacement (as gate author):**
+- *Precision over recall for a merge-blocking gate.* Threat-model §5 explicitly requires the per-PR set to
+  stay fast and low-noise so the team does not route around it. `p/owasp-top-ten` is a broad meta-pack that
+  overlaps heavily with `p/java` and adds runtime plus potential ERROR-severity findings that would **block
+  merges** — the exact anti-pattern that gets a gate disabled.
+- *The lost coverage is already covered.* The Spring/web security-misconfig classes `p/spring` was meant to
+  catch (CSRF, actuator exposure, permitAll/access-control, SpEL/SSRF) are (a) substantially within
+  `p/java`, and (b) were **manually reviewed clean** by AppSec across features 01–03 — `SecurityConfig`
+  single-role matrix (SR-16), SSRF allowlist (SR-10), no SpEL/unsafe-deserialization sinks, actuator
+  health-only (SR-17).
+- *No local validation possible here.* This sandbox cannot run semgrep, so adding an unvalidated blocking
+  pack risks reintroducing exactly the broken-gate failure being fixed. Shipping only the three
+  coordinator-validated (0-finding) packs keeps the gate green and trustworthy.
+- **Follow-up (recommended, non-blocking):** once someone validates `p/owasp-top-ten`'s finding set against
+  this repo (e.g. via the same `uv` semgrep run), it can be added to the **informational** step, or to a
+  **scheduled** deeper scan — giving extra recall without risking spurious merge blocks. Tracked here, not
+  wired now. (There is currently no registry Spring-specific pack that returns 200 to use instead.)
 
 ## Residuals / hardening notes
 
