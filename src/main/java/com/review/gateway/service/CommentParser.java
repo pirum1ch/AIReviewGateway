@@ -22,11 +22,13 @@ import java.util.regex.Pattern;
  * same sanitation pipeline before being handed back (SR-08/SR-09/T-06):
  * <ol>
  *   <li>strip lines that are GitLab quick-actions (trimmed line starts with {@code /});</li>
- *   <li>cap length (excess is truncated with a marker);</li>
  *   <li>neutralize {@code @mentions} by inserting a zero-width space right after {@code @}, so
  *       GitLab does not resolve it as a mention trigger while it still reads as {@code @name} to a
  *       human;</li>
- *   <li>HTML-escape the result, so any injected {@code <script>}/markup renders inert.</li>
+ *   <li>HTML-escape the result, so any injected {@code <script>}/markup renders inert;</li>
+ *   <li>cap length LAST, after escaping (excess is truncated with a marker) — F02-08: escaping can
+ *       significantly inflate the string ({@code "} → {@code &quot;}, {@code &} → {@code &amp;}, ...),
+ *       so capping before escaping would not actually bound the final, persisted/published length.</li>
  * </ol>
  * The comment <em>count</em> is capped separately, after sanitation, dropping any excess.
  *
@@ -176,21 +178,29 @@ public class CommentParser {
         }
     }
 
-    /** @return the sanitized comment, or {@code null} if nothing publishable remains (SR-08/SR-09). */
+    /**
+     * @return the sanitized comment, or {@code null} if nothing publishable remains (SR-08/SR-09).
+     */
     private ParsedComment sanitize(RawComment candidate) {
         String withoutQuickActions = stripQuickActionLines(candidate.text());
         String trimmed = withoutQuickActions.trim();
         if (trimmed.isEmpty()) {
             return null;
         }
-        String capped = capLength(trimmed, properties.getPublish().getMaxCommentLength());
-        String mentionsNeutralized = neutralizeMentions(capped);
+        // F02-08: capLength MUST run LAST, after HTML-escaping, not before. HtmlUtils.htmlEscape can
+        // significantly *inflate* the string (each '"' becomes "&quot;", each '&' becomes "&amp;",
+        // etc.), so capping before escaping does not bound the final, actually-stored/published length
+        // at all -- it only bounds the pre-escape length, defeating the SR-09 guarantee on the value
+        // that actually reaches the DB/GitLab. Same class of defect as the filePath VARCHAR(1024)
+        // overflow this fix's sibling method (sanitizeFilePath) also had (F02-04/KD-2).
+        String mentionsNeutralized = neutralizeMentions(trimmed);
         String escaped = HtmlUtils.htmlEscape(mentionsNeutralized);
+        String capped = capLength(escaped, properties.getPublish().getMaxCommentLength());
 
         String sanitizedFilePath = sanitizeFilePath(candidate.filePath());
         Integer normalizedLine = normalizeLineNumber(candidate.lineNumber());
 
-        return new ParsedComment(sanitizedFilePath, normalizedLine, candidate.severity(), escaped);
+        return new ParsedComment(sanitizedFilePath, normalizedLine, candidate.severity(), capped);
     }
 
     /**
@@ -199,6 +209,11 @@ public class CommentParser {
      * {@code VARCHAR(1024)} column, KD-2) and no HTML-escape/mention-neutralization (a latent
      * injection sink the moment file/line are published in a future feature). Embedded newlines/control
      * characters are collapsed first so a multi-line payload cannot smuggle content via this field.
+     *
+     * <p>F02-08: {@code capLength} runs LAST, after {@code htmlEscape} — see the comment in
+     * {@link #sanitize} for why capping before escaping does not actually bound the persisted length
+     * (this was the exact defect that made an all-{@code "}/{@code &} {@code filePath} still overflow
+     * {@code VARCHAR(1024)} after the F02-04 fix, crashing {@code persistCommentsAndComplete}).
      *
      * @return the sanitized file path, or {@code null} if nothing remains after sanitation
      */
@@ -210,9 +225,9 @@ public class CommentParser {
         if (singleLine.isEmpty()) {
             return null;
         }
-        String capped = capLength(singleLine, FILE_PATH_MAX_LENGTH);
-        String mentionsNeutralized = neutralizeMentions(capped);
-        return HtmlUtils.htmlEscape(mentionsNeutralized);
+        String mentionsNeutralized = neutralizeMentions(singleLine);
+        String escaped = HtmlUtils.htmlEscape(mentionsNeutralized);
+        return capLength(escaped, FILE_PATH_MAX_LENGTH);
     }
 
     /**

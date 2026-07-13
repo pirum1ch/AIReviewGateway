@@ -116,4 +116,39 @@ class ResultProcessorOversizedFilePathTest extends AbstractPostgresIntegrationTe
         assertThat(comments.get(0).getFilePath()).hasSizeLessThanOrEqualTo(1024);
         assertThat(comments.get(0).getFilePath()).endsWith("[truncated]");
     }
+
+    /**
+     * F02-08 regression: a {@code filePath} that is entirely HTML-special characters is short enough
+     * pre-escape ({@code <= 1024}) but balloons well past the column limit once escaped
+     * ({@code "} -> {@code &quot;} is a 6x inflation) -- this must still be capped to {@code <=1024}
+     * (capped AFTER escaping) and the Review must still complete normally, not crash persistence.
+     */
+    @Test
+    void filePathOfAllQuoteCharactersIsCappedAfterEscapingAndReviewCompletesNormally() {
+        Review review = persistRunningReview("sha-escaped-filepath-inflation");
+        ReviewJob job = persistJob(review);
+
+        CommentParser commentParser = new CommentParser(new GatewayProperties());
+        ResultProcessor processor = newResultProcessor(commentParser);
+
+        // 1024 literal '"' characters pre-escape -- exactly at the column limit before escaping, but
+        // 1024 * 6 = 6144 chars once HtmlUtils.htmlEscape turns each '"' into "&quot;" (the F02-08 defect).
+        String rawFilePathValue = "\"".repeat(1024);
+        String jsonEscapedFilePathValue = rawFilePathValue.replace("\"", "\\\"");
+        String raw = "[{\"file\":\"" + jsonEscapedFilePathValue + "\",\"comment\":\"finding\"}]";
+
+        assertThatCode(() -> processor.process(review.getId(), job.getId(), "worker-1", job.getBackendId(),
+                new SubmitResultCommand(raw, 10, 5, 1000L, "model-x")))
+                .as("FIXED: capLength runs after htmlEscape, so escaping's inflation of an all-quote "
+                        + "filePath cannot overflow review_comments.file_path VARCHAR(1024)")
+                .doesNotThrowAnyException();
+
+        Review reloaded = reviewRepository.findById(review.getId()).orElseThrow();
+        assertThat(reloaded.getStatus()).isEqualTo(ReviewStatus.COMPLETED);
+
+        List<ReviewComment> comments = reviewCommentRepository.findByReviewId(review.getId());
+        assertThat(comments).hasSize(1);
+        assertThat(comments.get(0).getFilePath()).hasSizeLessThanOrEqualTo(1024);
+        assertThat(comments.get(0).getFilePath()).endsWith("[truncated]");
+    }
 }

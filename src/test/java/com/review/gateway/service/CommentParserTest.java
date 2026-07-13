@@ -303,4 +303,56 @@ class CommentParserTest {
 
         assertThat(comments.get(0).lineNumber()).isNull();
     }
+
+    // ---- F02-08: cap MUST run after HTML-escaping, not before (escaping can inflate the string) ----
+
+    @Test
+    void filePathThatIsAllQuoteCharactersIsCappedAfterEscapingNotBeforeIt() {
+        CommentParser parser = parser();
+        // 1024 literal '"' characters -> HtmlUtils.htmlEscape turns each into "&quot;" (6 chars) ->
+        // 6144 chars if capped BEFORE escaping (the F02-08 defect); must be <=1024 (the VARCHAR(1024)
+        // column limit) once capped AFTER escaping, as production actually does.
+        String rawFilePathValue = "\"".repeat(1024);
+        String jsonEscapedFilePathValue = rawFilePathValue.replace("\"", "\\\"");
+        String raw = "[{\"file\": \"" + jsonEscapedFilePathValue + "\", \"comment\": \"finding\"}]";
+
+        List<ParsedComment> comments = parser.parse(raw);
+
+        String filePath = comments.get(0).filePath();
+        assertThat(filePath).hasSizeLessThanOrEqualTo(1024);
+        assertThat(filePath).endsWith("[truncated]");
+    }
+
+    @Test
+    void filePathThatIsAllAmpersandCharactersIsCappedAfterEscapingNotBeforeIt() {
+        CommentParser parser = parser();
+        // Each '&' becomes "&amp;" (5 chars) once escaped -- same class of inflation as '"', different
+        // multiplier; also must end up <=1024 once capped after escaping.
+        String rawFilePathValue = "&".repeat(1024);
+        String raw = "[{\"file\": \"" + rawFilePathValue + "\", \"comment\": \"finding\"}]";
+
+        List<ParsedComment> comments = parser.parse(raw);
+
+        String filePath = comments.get(0).filePath();
+        assertThat(filePath).hasSizeLessThanOrEqualTo(1024);
+        assertThat(filePath).endsWith("[truncated]");
+    }
+
+    @Test
+    void commentTextCapAppliesToTheEscapedValueNotThePreEscapeValue() {
+        GatewayProperties properties = properties();
+        properties.getPublish().setMaxCommentLength(50);
+        CommentParser parser = new CommentParser(properties);
+
+        // 100 literal '"' characters pre-escape (already over the 50-char cap on its own), but the
+        // defect being guarded against is specifically that escaping inflates a string that was
+        // *already under* the cap pre-escape into something over cap post-escape. 100 x 6 = 600 chars
+        // post-escape either way demonstrates the fix: the persisted text must still be capped at 50.
+        String raw = "\"".repeat(100);
+
+        List<ParsedComment> comments = parser.parse(raw);
+
+        assertThat(comments.get(0).text()).hasSizeLessThanOrEqualTo(50);
+        assertThat(comments.get(0).text()).endsWith("[truncated]");
+    }
 }

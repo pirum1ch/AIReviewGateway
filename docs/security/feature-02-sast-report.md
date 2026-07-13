@@ -128,3 +128,94 @@ but tree-model parsing with default typing off carries no deserialization CVE. *
 
 Open (this round): F02-01 (High, MUST), F02-02 (Medium), F02-03/04/05 (Low), F02-06/07 (Info); KD-1
 (High, MUST — QA-owned), KD-2 (Medium — = F02-04). Closed: none (review round).
+
+---
+
+# Verification round — remediation commit `e400b4f` (2026-07-13)
+
+Method: read the full `e400b4f` diff **and** the current sources (claims not trusted), re-ran the whole
+suite from the local toolchain, confirmed each regression test genuinely exercises the fixed path (not a
+tautology), empirically reproduced one edge case in a throwaway JVM, and checked for fix-induced
+regressions. HEAD `e400b4f`, working tree clean, no production code/tests modified by me.
+
+**Suite: `mvn test` → `Tests run: 227, Failures: 0, Errors: 0, Skipped: 0`, BUILD SUCCESS** (aggregated
+across all surefire reports; the `ux_reviews_dedup_active` / `read-only` log lines are intended
+negative-path assertions, not failures). Matches the expected 227/227.
+
+## Per-finding verdicts
+
+| # | Sev | Prior status | Verdict | Evidence / reasoning |
+|---|-----|--------------|---------|----------------------|
+| KD-1 | High (avail.) | MUST | **CLOSED-VERIFIED** | `TimeoutManager.sweepStaleHeartbeats()`/`enforceMaxDuration()` no longer `@Transactional(readOnly=true)` (now plain `@Transactional`). `TimeoutManagerSpringProxyIntegrationTest` runs both as **real `@Import`-ed, AOP-proxied** beans against embedded Postgres — the only wiring that exercises the propagation defect — and now asserts the stale review actually moves `RUNNING→QUEUED` (+`RETRY` event, `swept==1`), and a new test asserts an attempts-exhausted review moves `RUNNING→FAILED` (+`FAILED` event) via the max-duration backstop. Genuine reproduce→fix→verify. No longer throws `cannot execute INSERT in a read-only transaction`. |
+| F02-01 | High | MUST | **CLOSED-VERIFIED** | `ResultProcessor.capRawResponseIfNeeded` truncates to `publish.maxRawResponseLength` **before** `storeRawResult` and **before** `commentParser.parse` (the truncated `effectiveCommand` feeds both). `ResultProcessorTest.oversizedRawResponseIsTruncatedBeforePersistAndParsing` proves stored `raw_response ≤ cap`, contains the marker, and the full payload run does **not** survive; `rawResponseWithinTheCapIsStoredUnchanged` proves the no-truncation path. SR-14 preserved: only lengths (`N->limit`), never content, reach the audit note. |
+| F02-03 | Low | tracked | **CLOSED-VERIFIED** | Both sinks now log `getClass().getSimpleName()` only — `CommentParser:113` and `ResultProcessor:93` — never the Jackson `toString()` source excerpt. Verified in current source. |
+| F02-05 | Low | tracked | **CLOSED-VERIFIED** | `SubmitResultOutcome.ownershipMismatch()` drops the `ReviewStatus` arg (now `null`), and `QueueManager.submitResult` calls the no-arg form. A non-owner response is now indistinguishable from `NOT_FOUND`; no cross-tenant status leak. (Covered by compilation + inspection; no dedicated assertion, acceptable for a signature change.) |
+| F02-04 / KD-2 | Low / Med | recommended | **CLOSED-WITH-RESIDUAL → see F02-08** | The length-cap + `lineNumber` normalisation are correctly added (`sanitizeFilePath`, `normalizeLineNumber`) and well-tested (oversized→`[truncated]`, exact-1024 kept, mentions/HTML escaped, newlines collapsed, blank/absent→null, non-positive/out-of-int-range line→null). **However the fix ordering is unsound for a fixed-width column — a new reachable residual (F02-08) reopens the same persistence crash.** |
+| F02-08 | **Medium** | *new (introduced by the F02-04 fix)* | **OPEN — blocks merge** | See below. |
+| F02-02 | Medium | deferred | **DEFERRED (tracked, feature 03)** | Duplicate-comment race under concurrent double-submit. Agreed deferral; close via the SR-06 claim/heartbeat lease token or a `SELECT … FOR UPDATE`/`@Version` on the review in `persistCommentsAndComplete`. |
+| F02-06 | Info | deferred | **DEFERRED (accepted)** | Capacity-check TOCTOU; benign at 1–10 backends. |
+| F02-07 | Info | deferred | **DEFERRED (accepted, = T-06 residual)** | Markdown links + `#`/`!`/`%` refs not neutralised (only `@`); comment body is HTML-escaped. Optional code-fence hardening in feature 03. |
+
+## F02-08 (Medium, NEW) — HTML-escape after the length-cap re-inflates `filePath` past `VARCHAR(1024)`
+
+- **Where:** `CommentParser.sanitizeFilePath` (`CommentParser.java:205-216`) → `capLength(singleLine, 1024)`
+  **then** `neutralizeMentions` **then** `HtmlUtils.htmlEscape`. The cap is applied to the *pre-escape*
+  string, but the value actually stored into `review_comments.file_path VARCHAR(1024)` is the *post-escape*
+  string, which can be several times longer.
+- **CWE-770 / CWE-20, A04:2021. Exploit path (T-06→T-19):** a prompt-injected diff makes the model emit a
+  `"file"` value dominated by HTML-special characters. `HtmlUtils.htmlEscape` expands `"`→`&quot;` (×6),
+  `&`→`&amp;` (×5), `<`/`>`→`&lt;`/`&gt;` (×4). **Empirically confirmed** in a throwaway JVM against the
+  project classpath: a filePath of 1024 `"` passes the 1024-cap unchanged, then escapes to **6144 chars**;
+  ~205 `&` chars alone exceed 1024. The oversized value overflows `file_path VARCHAR(1024)` →
+  `DataIntegrityViolationException` thrown from `persistCommentsAndComplete`, which is **uncaught** (only
+  the `commentParser.parse` phase is wrapped in try/catch, not the persist phase) → the Review is left
+  `RUNNING` and the Worker's `POST /jobs/{id}/result` returns a 500. This is the **exact defect class
+  KD-2/F02-04 was meant to remove** — the remediation's stated invariant ("filePath capped to the column
+  width") does not hold for this reachable input.
+- **Impact — Medium (down-rated from KD-2's original because KD-1 now backstops it):** with the KD-1 fix in
+  place, the stuck-`RUNNING` review is now swept by heartbeat/max-duration and retried, so it is no longer
+  wedged *forever* — it burns up to `max-attempts` (3) re-claims + backend capacity, then lands `FAILED`.
+  Per-review, self-limiting, but attacker-triggerable and a live 500 on the worker result path. The
+  existing tests miss it because every test filePath uses only `a` and `/` (neither is HTML-escaped).
+- **Fix (small):** escape **before** capping, or cap the **final** escaped string to 1024 (i.e. move
+  `capLength(..., FILE_PATH_MAX_LENGTH)` to be the last step, after `htmlEscape`), so the stored value is
+  guaranteed ≤ column width. Add a test with a `"`/`&`-heavy filePath asserting the stored length ≤ 1024
+  and the review reaches `COMPLETED`. (Note: the identical escape-after-cap ordering on the *comment text*
+  is harmless — `review_comments.comment` is unbounded `TEXT`.)
+
+## Fix-induced regression check
+
+- **No dependency change** in `e400b4f` (no `pom.xml` touch) — baseline stays the clean feature-01 set.
+- **KD-1 side effect:** the two sweeps are now a single writable transaction spanning the candidate loop
+  (each `RetryManager.requeueOrFail` joins via `REQUIRED`). A poison row would roll back the whole pass,
+  but every `requeueOrFail` is idempotent + status-guarded, so the next scheduled tick re-attempts safely —
+  no security regression, minor robustness note only.
+- **F02-01/F02-03/F02-05:** inspected; no new sink, no broadened surface. Truncation audit note carries
+  only integer lengths (SR-14 intact). `ObjectMapper` still tree-model only (no deserialization surface).
+- **F02-08 is the only fix-induced regression** and is called out above.
+
+## Deferred-to-feature-03 tracking (must not be lost)
+
+- **F02-02** (concurrent duplicate-submit → duplicate published comments) — close via SR-06 lease token
+  or review row-lock/`@Version`.
+- **HTTP/security-layer MUST controls** still owed at feature 03:
+  **SR-01** (token env-load + length floor), **SR-02** (constant-time compare), **SR-06** (claim lease
+  token), **SR-07** (per-backend token → identity binding), **SR-10** (backend-URL SSRF allowlist +
+  loopback/link-local/metadata rejection, redirect-disable, timeouts), **SR-11** (edge body-cap),
+  **SR-15** (HTTPS enforcement + `sslmode`), **SR-16** (per-endpoint single-role matrix), **SR-17**
+  (generic error body + actuator `health`-only), **SR-18** (auth-failure logging + identity on
+  security events).
+
+## Verification verdict
+
+**NOT APPROVED FOR MERGE — one blocker: F02-08 (Medium).**
+
+The two designated hard blockers are genuinely and verifiably fixed: **KD-1 (High) and F02-01 (High) are
+CLOSED-VERIFIED** with real, non-tautological tests, and **F02-03 / F02-05 are CLOSED-VERIFIED**. The
+suite is 227/227 green. But the F02-04/KD-2 remediation applied its length cap on the wrong side of
+`htmlEscape`, so for a reachable, attacker-influenceable input the stored `filePath` still overflows
+`VARCHAR(1024)` and re-triggers the very persistence-crash DoS the fix targeted (empirically reproduced).
+It is a one-line reorder to close. Recommend: land the F02-08 reorder (+ one quote-heavy test), then this
+is APPROVE-on-re-verify. If the coordinator judges F02-08 acceptable to defer given the KD-1 backstop
+now bounds it to a self-limiting per-review FAILED, downgrade to **APPROVED-WITH-TRACKED-FOLLOWUP** — but
+my recommendation is to fix it now, since it is trivial and reopens a just-gated defect class.
