@@ -186,4 +186,121 @@ class CommentParserTest {
         assertThat(comments).hasSize(1);
         assertThat(comments.get(0).text()).contains("no publishable content");
     }
+
+    // ---- F02-04/KD-2: filePath now goes through the same sanitation pipeline as comment text ----
+
+    @Test
+    void oversizedFilePathIsCappedToTheColumnLimitWithATruncationMarker() {
+        CommentParser parser = parser();
+        String hugeFilePath = "a/".repeat(1000) + "File.java"; // ~3009 chars, column is VARCHAR(1024)
+        String raw = "[{\"file\": \"" + hugeFilePath + "\", \"comment\": \"finding\"}]";
+
+        List<ParsedComment> comments = parser.parse(raw);
+
+        assertThat(comments).hasSize(1);
+        assertThat(comments.get(0).filePath()).hasSizeLessThanOrEqualTo(1024);
+        assertThat(comments.get(0).filePath()).endsWith("[truncated]");
+    }
+
+    @Test
+    void filePathAtExactlyTheColumnLimitIsNotTruncated() {
+        CommentParser parser = parser();
+        String exactFilePath = "a".repeat(1024);
+        String raw = "[{\"file\": \"" + exactFilePath + "\", \"comment\": \"finding\"}]";
+
+        List<ParsedComment> comments = parser.parse(raw);
+
+        assertThat(comments.get(0).filePath()).isEqualTo(exactFilePath);
+    }
+
+    @Test
+    void filePathMentionsAreNeutralizedAndHtmlEscaped() {
+        CommentParser parser = parser();
+        String raw = "[{\"file\": \"<script>alert(1)</script>/@all/Foo.java\", \"comment\": \"finding\"}]";
+
+        List<ParsedComment> comments = parser.parse(raw);
+
+        String filePath = comments.get(0).filePath();
+        assertThat(filePath).doesNotContain("<script>");
+        assertThat(filePath).contains("&lt;script&gt;");
+        assertThat(filePath).doesNotContain("/@all/");
+        assertThat(filePath).contains("@​all");
+    }
+
+    @Test
+    void filePathWithEmbeddedNewlinesIsCollapsedToASingleLine() {
+        CommentParser parser = parser();
+        String raw = "[{\"file\": \"Foo.java\\n/close\\nEvil.java\", \"comment\": \"finding\"}]";
+
+        List<ParsedComment> comments = parser.parse(raw);
+
+        String filePath = comments.get(0).filePath();
+        assertThat(filePath).doesNotContain("\n").doesNotContain("\r");
+        assertThat(filePath).contains("Foo.java").contains("Evil.java");
+    }
+
+    @Test
+    void blankFilePathIsNormalizedToNull() {
+        CommentParser parser = parser();
+        String raw = "[{\"file\": \"   \", \"comment\": \"finding\"}]";
+
+        List<ParsedComment> comments = parser.parse(raw);
+
+        assertThat(comments.get(0).filePath()).isNull();
+    }
+
+    @Test
+    void absentFilePathStaysNull() {
+        CommentParser parser = parser();
+        String raw = "[{\"comment\": \"finding with no file field at all\"}]";
+
+        List<ParsedComment> comments = parser.parse(raw);
+
+        assertThat(comments.get(0).filePath()).isNull();
+    }
+
+    // ---- F02-04/KD-2: lineNumber validation/normalization ----
+
+    @Test
+    void negativeLineNumberIsNormalizedToNull() {
+        CommentParser parser = parser();
+        String raw = "[{\"file\": \"Foo.java\", \"line\": -5, \"comment\": \"finding\"}]";
+
+        List<ParsedComment> comments = parser.parse(raw);
+
+        assertThat(comments.get(0).lineNumber()).isNull();
+    }
+
+    @Test
+    void zeroLineNumberIsNormalizedToNull() {
+        CommentParser parser = parser();
+        String raw = "[{\"file\": \"Foo.java\", \"line\": 0, \"comment\": \"finding\"}]";
+
+        List<ParsedComment> comments = parser.parse(raw);
+
+        assertThat(comments.get(0).lineNumber()).isNull();
+    }
+
+    @Test
+    void positiveLineNumberIsPreserved() {
+        CommentParser parser = parser();
+        String raw = "[{\"file\": \"Foo.java\", \"line\": 17, \"comment\": \"finding\"}]";
+
+        List<ParsedComment> comments = parser.parse(raw);
+
+        assertThat(comments.get(0).lineNumber()).isEqualTo(17);
+    }
+
+    @Test
+    void outOfIntRangeLineNumberIsIgnoredAndStaysNull() {
+        CommentParser parser = parser();
+        // 9999999999999 does not fit in an int; JsonNode#isInt() is false for it, and it is not textual
+        // either, so firstInt(...) must not blow up trying to parse it -- it should just fall through to
+        // null, same as "no line field at all".
+        String raw = "[{\"file\": \"Foo.java\", \"line\": 9999999999999, \"comment\": \"finding\"}]";
+
+        List<ParsedComment> comments = parser.parse(raw);
+
+        assertThat(comments.get(0).lineNumber()).isNull();
+    }
 }

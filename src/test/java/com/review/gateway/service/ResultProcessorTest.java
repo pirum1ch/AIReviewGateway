@@ -22,6 +22,7 @@ import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Instant;
+import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.when;
@@ -79,10 +80,14 @@ class ResultProcessorTest extends AbstractPostgresIntegrationTest {
     }
 
     private ResultProcessor newResultProcessor(CommentParser commentParser) {
+        return newResultProcessor(commentParser, new GatewayProperties());
+    }
+
+    private ResultProcessor newResultProcessor(CommentParser commentParser, GatewayProperties properties) {
         EventService eventService = new EventService(reviewEventRepository);
         StateMachine stateMachine = new StateMachine(eventService);
         return new ResultProcessor(reviewRepository, reviewJobRepository, reviewResultRepository,
-                reviewCommentRepository, commentParser, stateMachine, transactionManager);
+                reviewCommentRepository, commentParser, stateMachine, properties, transactionManager);
     }
 
     private Review persistRunningReview(String headSha) {
@@ -169,5 +174,64 @@ class ResultProcessorTest extends AbstractPostgresIntegrationTest {
         assertThat(reviewResultRepository.findByReviewId(review.getId()).orElseThrow().getRawResponse())
                 .isEqualTo("first raw response");
         assertThat(resultCountAfterFirst).isEqualTo(1);
+    }
+
+    // ---- F02-01/SR-21: raw response size cap ----
+
+    @Test
+    void oversizedRawResponseIsTruncatedBeforePersistAndParsing() {
+        Review review = persistRunningReview("sha-oversized-raw");
+        ReviewJob job = persistJob(review);
+
+        GatewayProperties properties = new GatewayProperties();
+        properties.getPublish().setMaxRawResponseLength(100);
+        CommentParser commentParser = new CommentParser(properties);
+        ResultProcessor processor = newResultProcessor(commentParser, properties);
+
+        String oversizedRaw = "x".repeat(1000);
+        ReviewStatus finalStatus = processor.process(review.getId(), job.getId(), "worker-1", job.getBackendId(),
+                new SubmitResultCommand(oversizedRaw, 10, 5, 1000L, "model-x"));
+
+        assertThat(finalStatus).isEqualTo(ReviewStatus.COMPLETED);
+
+        // Stored raw_response must be capped, never the full 1000-char payload (SR-21).
+        String storedRaw = reviewResultRepository.findByReviewId(review.getId()).orElseThrow().getRawResponse();
+        assertThat(storedRaw).hasSizeLessThanOrEqualTo(100);
+        assertThat(storedRaw).contains("TRUNCATED");
+        assertThat(storedRaw).doesNotContain("x".repeat(200)); // the full-length run of x's must not survive intact
+
+        // The truncated (not the original) content is what CommentParser actually saw.
+        assertThat(reviewCommentRepository.findByReviewId(review.getId())).hasSize(1);
+
+        // Truncation fact (never raw content) is recorded in the audit trail alongside the COMPLETED event.
+        List<com.review.gateway.model.ReviewEvent> events = reviewEventRepository.findByReviewIdOrderByCreatedAtAsc(review.getId());
+        assertThat(events)
+                .filteredOn(e -> e.getEventType() == com.review.gateway.model.enums.EventType.COMPLETED)
+                .extracting(com.review.gateway.model.ReviewEvent::getDetails)
+                .anySatisfy(details -> assertThat(details).contains("truncated"));
+    }
+
+    @Test
+    void rawResponseWithinTheCapIsStoredUnchanged() {
+        Review review = persistRunningReview("sha-within-cap");
+        ReviewJob job = persistJob(review);
+
+        GatewayProperties properties = new GatewayProperties();
+        properties.getPublish().setMaxRawResponseLength(100);
+        CommentParser commentParser = new CommentParser(properties);
+        ResultProcessor processor = newResultProcessor(commentParser, properties);
+
+        String withinCapRaw = "a normal, short model response";
+        processor.process(review.getId(), job.getId(), "worker-1", job.getBackendId(),
+                new SubmitResultCommand(withinCapRaw, 10, 5, 1000L, "model-x"));
+
+        String storedRaw = reviewResultRepository.findByReviewId(review.getId()).orElseThrow().getRawResponse();
+        assertThat(storedRaw).isEqualTo(withinCapRaw);
+
+        List<com.review.gateway.model.ReviewEvent> events = reviewEventRepository.findByReviewIdOrderByCreatedAtAsc(review.getId());
+        assertThat(events)
+                .filteredOn(e -> e.getEventType() == com.review.gateway.model.enums.EventType.COMPLETED)
+                .extracting(com.review.gateway.model.ReviewEvent::getDetails)
+                .noneSatisfy(details -> assertThat(details).contains("truncated"));
     }
 }

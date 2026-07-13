@@ -43,6 +43,9 @@ public class CommentParser {
     private static final String ZERO_WIDTH_SPACE = "​";
     private static final String TRUNCATION_SUFFIX = "... [truncated]";
 
+    /** Matches {@code review_comments.file_path VARCHAR(1024)} (V1 migration) — F02-04/KD-2. */
+    private static final int FILE_PATH_MAX_LENGTH = 1024;
+
     private final ObjectMapper objectMapper = new ObjectMapper();
     private final GatewayProperties properties;
 
@@ -109,8 +112,12 @@ public class CommentParser {
             }
             return comments;
         } catch (Exception malformed) {
-            log.debug("Raw response has a JSON-array-shaped slice that failed to parse; falling back to plain text: {}",
-                    malformed.toString());
+            // F02-03/SR-14: never log malformed.toString() here -- Jackson's exception toString()
+            // includes a source excerpt (INCLUDE_SOURCE_IN_LOCATION is default-on), which would leak a
+            // fragment of the untrusted raw_response (possibly proprietary source, A7) into file logs.
+            // Log only the exception class and a static message.
+            log.debug("Raw response has a JSON-array-shaped slice that failed to parse ({}); falling back to plain text",
+                    malformed.getClass().getSimpleName());
             return null;
         }
     }
@@ -176,10 +183,46 @@ public class CommentParser {
         if (trimmed.isEmpty()) {
             return null;
         }
-        String capped = capLength(trimmed);
+        String capped = capLength(trimmed, properties.getPublish().getMaxCommentLength());
         String mentionsNeutralized = neutralizeMentions(capped);
         String escaped = HtmlUtils.htmlEscape(mentionsNeutralized);
-        return new ParsedComment(candidate.filePath(), candidate.lineNumber(), candidate.severity(), escaped);
+
+        String sanitizedFilePath = sanitizeFilePath(candidate.filePath());
+        Integer normalizedLine = normalizeLineNumber(candidate.lineNumber());
+
+        return new ParsedComment(sanitizedFilePath, normalizedLine, candidate.severity(), escaped);
+    }
+
+    /**
+     * F02-04/KD-2: {@code filePath} is LLM-controlled (T-06/T-19) and, until this fix, bypassed the
+     * comment-text sanitation pipeline entirely — no length cap (crashing persistence past the
+     * {@code VARCHAR(1024)} column, KD-2) and no HTML-escape/mention-neutralization (a latent
+     * injection sink the moment file/line are published in a future feature). Embedded newlines/control
+     * characters are collapsed first so a multi-line payload cannot smuggle content via this field.
+     *
+     * @return the sanitized file path, or {@code null} if nothing remains after sanitation
+     */
+    private String sanitizeFilePath(String filePath) {
+        if (filePath == null) {
+            return null;
+        }
+        String singleLine = filePath.replaceAll("\\R", " ").trim();
+        if (singleLine.isEmpty()) {
+            return null;
+        }
+        String capped = capLength(singleLine, FILE_PATH_MAX_LENGTH);
+        String mentionsNeutralized = neutralizeMentions(capped);
+        return HtmlUtils.htmlEscape(mentionsNeutralized);
+    }
+
+    /**
+     * F02-04/KD-2: line numbers are 1-based; a non-positive value is nonsensical (and an out-of-{@code
+     * int}-range value is already filtered out upstream in {@link #firstInt}, which only accepts
+     * {@link JsonNode#isInt()} values or values that parse cleanly as {@code int}). Normalizes any
+     * invalid value to {@code null} rather than persisting/publishing a misleading line reference.
+     */
+    private Integer normalizeLineNumber(Integer lineNumber) {
+        return (lineNumber != null && lineNumber > 0) ? lineNumber : null;
     }
 
     private String stripQuickActionLines(String text) {
@@ -196,8 +239,8 @@ public class CommentParser {
         return result.toString();
     }
 
-    private String capLength(String text) {
-        int max = Math.max(0, properties.getPublish().getMaxCommentLength());
+    private String capLength(String text, int maxLength) {
+        int max = Math.max(0, maxLength);
         if (text.length() <= max) {
             return text;
         }

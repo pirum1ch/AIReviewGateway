@@ -10,22 +10,26 @@ import java.util.List;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * Documents two sanitation gaps requested for explicit verification (SR-08/SR-09 scope): path
- * traversal / absurd values in the LLM-controlled {@code filePath} and {@code lineNumber} fields.
- * {@link CommentParser} sanitizes the free-text {@code comment} field thoroughly (HTML-escape,
- * quick-action stripping, mention neutralization, length cap — see {@code CommentParserTest}), but
- * applies <b>no</b> validation at all to {@code filePath}/{@code lineNumber}.
+ * Documents the LLM-controlled {@code filePath}/{@code lineNumber} fields' sanitation posture
+ * (SR-08/SR-09 scope), updated after the F02-04/KD-2 fix.
  *
- * <p>This is recorded as <b>informational, not a blocking defect</b>: {@code filePath}/{@code
- * lineNumber} are never used as a filesystem path, URL segment, or GitLab API parameter anywhere in
- * the current call graph ({@link GitLabClient#postDiscussion} only ever receives the sanitized
- * {@code comment} body — see {@code GitLabPublisher.publishOneComment}) — they are purely stored,
- * displayed data (`review_comments.file_path`/`line_number`). There is therefore no current traversal
- * or injection sink. This should be revisited if a future feature (e.g. line-anchored diff comments
- * via GitLab's per-line discussion API) starts using {@code filePath} to address a location.
+ * <p><b>Fixed (previously an accepted informational gap):</b> {@code filePath} now goes through the
+ * same length-cap/mention-neutralization/HTML-escape pipeline as the comment text
+ * ({@code CommentParser.sanitizeFilePath}), and {@code lineNumber} is now validated to be a positive
+ * integer, normalizing non-positive values to {@code null} ({@code CommentParser.normalizeLineNumber}).
+ * Path-traversal-*shaped* strings (e.g. {@code ../../../etc/passwd}) are still stored verbatim as far
+ * as their textual content goes — they contain no HTML-special or mention characters for the pipeline
+ * to touch, and {@code filePath}/{@code lineNumber} are still never used as a filesystem path, URL
+ * segment, or GitLab API parameter anywhere in the current call graph
+ * ({@link GitLabClient#postDiscussion} only ever receives the sanitized {@code comment} body — see
+ * {@code GitLabPublisher.publishOneComment}) — they are purely stored, displayed data
+ * (`review_comments.file_path`/`line_number`). This should be revisited if a future feature (e.g.
+ * line-anchored diff comments via GitLab's per-line discussion API) starts using {@code filePath} to
+ * address a location.
  *
- * <p>The oversized-{@code filePath} length-cap gap (a genuine, DB-crashing defect, distinct from this
- * file) is covered separately by {@code ResultProcessorOversizedFilePathTest}.
+ * <p>The oversized-{@code filePath} length-cap fix itself (this file's genuine, previously DB-crashing
+ * defect) is covered end-to-end by {@code ResultProcessorOversizedFilePathTest}; this file covers only
+ * {@link CommentParser}'s unit-level behavior.
  */
 class CommentParserSanitationGapsTest {
 
@@ -40,7 +44,8 @@ class CommentParserSanitationGapsTest {
         List<ParsedComment> comments = parser().parse(raw);
 
         assertThat(comments).hasSize(1);
-        // Current (unsanitized) behavior -- filePath passes through completely untouched.
+        // No HTML-special/mention characters in this path -> the sanitation pipeline is a no-op on its
+        // textual content; filePath is unchanged (still not used as a real path/URL anywhere in scope).
         assertThat(comments.get(0).filePath()).isEqualTo("../../../../etc/passwd");
     }
 
@@ -54,21 +59,21 @@ class CommentParserSanitationGapsTest {
     }
 
     @Test
-    void negativeLineNumbersAreAcceptedWithoutValidation() {
+    void negativeLineNumbersAreNormalizedToNull() {
         String raw = "[{\"file\": \"A.java\", \"line\": -999, \"comment\": \"finding\"}]";
 
         List<ParsedComment> comments = parser().parse(raw);
 
-        assertThat(comments.get(0).lineNumber()).isEqualTo(-999);
+        assertThat(comments.get(0).lineNumber()).isNull();
     }
 
     @Test
-    void zeroLineNumberIsAcceptedWithoutValidation() {
+    void zeroLineNumberIsNormalizedToNull() {
         String raw = "[{\"file\": \"A.java\", \"line\": 0, \"comment\": \"finding\"}]";
 
         List<ParsedComment> comments = parser().parse(raw);
 
-        assertThat(comments.get(0).lineNumber()).isZero();
+        assertThat(comments.get(0).lineNumber()).isNull();
     }
 
     @Test

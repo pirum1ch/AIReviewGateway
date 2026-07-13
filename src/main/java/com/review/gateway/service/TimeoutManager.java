@@ -40,7 +40,14 @@ public class TimeoutManager {
      * @return the number of candidate reviews swept (not all necessarily still RUNNING by the time
      *         {@code RetryManager} looked, since this is inherently a best-effort snapshot query)
      */
-    @Transactional(readOnly = true)
+    // NOT readOnly: this method delegates to RetryManager.requeueOrFail (a different, writing
+    // @Transactional bean). With Spring's default validateExistingTransaction=false, that writing call
+    // silently JOINS whatever physical transaction is already open here rather than erroring or opening
+    // an isolated one -- so a readOnly=true here previously made every RetryManager write (the
+    // QUEUED/FAILED transition, the review_events insert) execute against a connection PostgreSQL
+    // itself rejects writes on, permanently wedging stuck RUNNING reviews (KD-1, confirmed by
+    // TimeoutManagerSpringProxyIntegrationTest against a real Postgres instance).
+    @Transactional
     public int sweepStaleHeartbeats() {
         Instant cutoff = Instant.now().minus(properties.getHeartbeat().getTimeout());
         List<Long> staleReviewIds = reviewJobRepository.findReviewIdsWithStaleHeartbeat(cutoff);
@@ -59,7 +66,8 @@ public class TimeoutManager {
      *
      * @return the number of candidate reviews swept
      */
-    @Transactional(readOnly = true)
+    // NOT readOnly: same reasoning as sweepStaleHeartbeats() above (KD-1).
+    @Transactional
     public int enforceMaxDuration() {
         Instant cutoff = Instant.now().minus(properties.getJob().getMaxDuration());
         List<Long> exceeded = reviewJobRepository.findReviewIdsExceedingMaxDuration(cutoff);

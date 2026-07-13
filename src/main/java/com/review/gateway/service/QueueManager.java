@@ -174,7 +174,8 @@ public class QueueManager {
 
         if (!isOwner(job, workerId)) {
             log.warn("Result submission ownership mismatch: jobId={} claimedBy={} callerWorkerId={}", jobId, job.getWorkerId(), workerId);
-            return SubmitResultOutcome.ownershipMismatch(review.getStatus());
+            // F02-05: do not echo review.getStatus() to a non-owner -- indistinguishable from NOT_FOUND.
+            return SubmitResultOutcome.ownershipMismatch();
         }
 
         if (review.getStatus() != ReviewStatus.RUNNING) {
