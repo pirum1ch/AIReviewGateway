@@ -59,4 +59,27 @@ public interface ReviewJobRepository extends JpaRepository<ReviewJob, Long> {
               AND j.started_at < :cutoff
             """, nativeQuery = true)
     List<Long> findReviewIdsExceedingMaxDuration(@Param("cutoff") Instant cutoff);
+
+    /**
+     * Average time (ms) a Review waits in {@code QUEUED} before being claimed, over every job that
+     * has been claimed at least once. Backs {@code StatisticsService}/{@code GET /metrics}.
+     */
+    @Query(value = """
+            SELECT COALESCE(AVG(EXTRACT(EPOCH FROM (j.claimed_at - r.created_at)) * 1000), 0)
+            FROM review_jobs j
+            JOIN reviews r ON r.id = j.review_id
+            WHERE j.claimed_at IS NOT NULL
+            """, nativeQuery = true)
+    Double averageQueueWaitMillis();
+
+    /**
+     * Average execution time (ms) across every job that has finished at least one run. Backs
+     * {@code StatisticsService}/{@code GET /metrics}.
+     */
+    @Query(value = """
+            SELECT COALESCE(AVG(EXTRACT(EPOCH FROM (j.finished_at - j.started_at)) * 1000), 0)
+            FROM review_jobs j
+            WHERE j.finished_at IS NOT NULL AND j.started_at IS NOT NULL
+            """, nativeQuery = true)
+    Double averageRunDurationMillis();
 }

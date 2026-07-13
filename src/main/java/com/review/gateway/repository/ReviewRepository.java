@@ -79,6 +79,18 @@ public interface ReviewRepository extends JpaRepository<Review, Long> {
     List<Review> findByStatusOrderByCreatedAtAsc(ReviewStatus status);
 
     /**
+     * Candidates for the OBSOLETE sweep (req. 1.5): every Review of the same (project, MR) whose
+     * {@code headSha} differs from the newly-arrived one and whose status is still one of
+     * {@code obsoletableStatuses}. Unlike {@link #markObsoleteForOtherHeadShas}, this returns the
+     * managed entities themselves (not just a row count) so {@code ReviewService} can drive each one
+     * through {@code StateMachine} individually — which is what produces one {@code OBSOLETE}
+     * {@code review_events} row per affected Review (req. 1.11), rather than a single silent bulk
+     * UPDATE with no per-row audit trail.
+     */
+    List<Review> findByProjectIdAndMergeRequestIdAndHeadShaNotAndStatusIn(
+            Long projectId, Long mergeRequestId, String headSha, Collection<ReviewStatus> obsoletableStatuses);
+
+    /**
      * Aggregate counts per status, backing {@code GET /metrics}.
      */
     @Query("SELECT r.status AS status, COUNT(r) AS total FROM Review r GROUP BY r.status")
