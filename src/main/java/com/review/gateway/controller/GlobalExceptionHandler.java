@@ -13,6 +13,7 @@ import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
 
 /**
  * Maps domain exceptions to the uniform {@link ErrorResponse} body (architecture §11, SR-17). Every
@@ -63,6 +64,20 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ErrorResponse> handleMalformedBody(HttpMessageNotReadableException ex) {
         return ResponseEntity.status(HttpStatus.BAD_REQUEST)
                 .body(new ErrorResponse("MALFORMED_REQUEST", "Request body is missing or malformed"));
+    }
+
+    /**
+     * A non-numeric {@code @PathVariable} (e.g. {@code GET /reviews/abc}) fails Spring's argument
+     * conversion before the controller method runs; without this handler it falls through to the
+     * generic 500 handler below instead of a proper 400. Same generic-body format as
+     * {@link #handleValidation} — no internal type/conversion detail leaks (SR-15/SR-17).
+     */
+    @ExceptionHandler(MethodArgumentTypeMismatchException.class)
+    public ResponseEntity<ErrorResponse> handleTypeMismatch(MethodArgumentTypeMismatchException ex) {
+        String expectedType = ex.getRequiredType() != null ? ex.getRequiredType().getSimpleName() : "a different type";
+        String message = ex.getName() + ": must be a valid " + expectedType;
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST)
+                .body(new ErrorResponse("VALIDATION_ERROR", message));
     }
 
     /**
