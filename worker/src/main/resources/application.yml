@@ -1,0 +1,73 @@
+spring:
+  main:
+    banner-mode: off
+  application:
+    name: llm-worker
+  lifecycle:
+    timeout-per-shutdown-phase: 30s
+
+server:
+  port: ${WORKER_HTTP_PORT:8081}
+  shutdown: graceful
+
+management:
+  # WSR-12: actuator (health/prometheus) MUST bind to loopback only -- WorkerProperties fails startup
+  # fast if this is blank or resolves to a non-loopback address.
+  server:
+    address: 127.0.0.1
+  endpoints:
+    web:
+      exposure:
+        include: health,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+
+# Gateway-facing HTTP client (short timeout -- must never block as long as an LLM completion).
+gateway:
+  url: ${GATEWAY_URL}
+  api-key: ${GATEWAY_API_KEY}
+
+worker:
+  id: ${WORKER_ID}
+  version: 1.0.0
+  # Dev-only escape hatch: valid ONLY when gateway.url resolves to a loopback host (WSR-09);
+  # WorkerProperties fails startup fast otherwise, regardless of this flag.
+  allow-insecure-gateway: ${WORKER_ALLOW_INSECURE_GATEWAY:false}
+  limits:
+    max-diff-bytes: ${WORKER_MAX_DIFF_BYTES:262144}
+    max-response-bytes: ${WORKER_MAX_RESPONSE_BYTES:200000}
+
+backend:
+  id: ${BACKEND_ID}
+
+# llama-server HTTP client (long timeout -- a single completion can take tens of minutes).
+llama:
+  url: ${LLAMA_URL:http://127.0.0.1:8000}
+  model: ${LLAMA_MODEL}
+  temperature: ${LLAMA_TEMPERATURE:0.1}
+  max-tokens: ${LLAMA_MAX_TOKENS:4096}
+  # WSR-06 (SHOULD): a non-loopback llama.url only warns at startup unless this is set, since the
+  # llama-server socket is unauthenticated by design.
+  allow-non-loopback: ${LLAMA_ALLOW_NON_LOOPBACK:false}
+
+network:
+  poll-interval-ms: ${WORKER_POLL_INTERVAL_MS:3000}
+  request-timeout-sec: ${WORKER_REQUEST_TIMEOUT_SEC:1800}
+  gateway-timeout-sec: ${WORKER_GATEWAY_TIMEOUT_SEC:10}
+
+heartbeat:
+  # Must stay well below the Gateway's ~180s stale-heartbeat sweep interval; WorkerProperties fails
+  # startup fast at >=180s and warns above 90s.
+  interval-sec: ${WORKER_HEARTBEAT_INTERVAL_SEC:60}
+
+prompt:
+  # WSR-07: MUST start with "classpath:" -- templates ship only inside the fat JAR, never from an
+  # operator-writable filesystem directory. WorkerProperties fails startup fast otherwise.
+  location: classpath:prompts/
+
+# Recommended JVM launch flags for the launchd/systemd unit that runs this fat JAR (not enforceable
+# from inside the JVM once it has already started -- see WorkerProperties' best-effort WARN-only check):
+#   -XX:-HeapDumpOnOutOfMemoryError
+# A heap dump on OOM could persist an in-flight diff/LLM-response to disk in plaintext (WT-10).
