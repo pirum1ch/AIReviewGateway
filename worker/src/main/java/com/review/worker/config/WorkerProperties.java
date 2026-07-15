@@ -31,9 +31,15 @@ import java.util.Locale;
  *   <li>WSR-09: {@code worker.allow-insecure-gateway} is honored only when {@code gateway.url}'s host is
  *       loopback; a non-loopback host with a plain {@code http://} URL always fails startup, flag or
  *       not.</li>
- *   <li>WSR-12: {@code management.server.address} must resolve to a loopback address; a blank or
- *       off-loopback value fails startup (this is the one rule here that reads a property outside the
- *       {@code gateway/worker/.../prompt} tree, via a direct {@code @Value} injection).</li>
+ *   <li>WSR-12: the <em>effective</em> actuator bind address must resolve to a loopback address; a blank
+ *       or off-loopback value fails startup. This is the one rule here that reads properties outside the
+ *       {@code gateway/worker/.../prompt} tree, via direct {@code @Value} injection — and it deliberately
+ *       computes which property is actually in effect (per Spring Boot's documented behavior, actuator
+ *       follows {@code management.server.address} only when {@code management.server.port} is a
+ *       <em>distinct</em> port from {@code server.port}; otherwise it follows {@code server.address})
+ *       rather than always validating {@code management.server.address} in isolation, which would be
+ *       false assurance (FW-01) whenever no distinct management port is configured (the Worker's own
+ *       {@code application.yml} default).</li>
  * </ul>
  *
  * <p>Basic per-field constraints (non-blank, positive) are also declared as JSR-380 annotations
@@ -72,14 +78,26 @@ public class WorkerProperties {
     private final Prompt prompt = new Prompt();
 
     /**
-     * Read directly (not part of the {@code gateway/worker/...} tree) so {@link #validateOnStartup()}
-     * can enforce WSR-12 (management endpoints must bind to loopback only) without requiring every
-     * caller to also inject Spring Boot's own {@code ManagementServerProperties}.
+     * These four are read directly (not part of the {@code gateway/worker/...} tree) so
+     * {@link #validateOnStartup()} can enforce WSR-12 (actuator must bind to loopback only) without
+     * requiring every caller to also inject Spring Boot's own {@code ServerProperties}/
+     * {@code ManagementServerProperties}. All four together determine which address is *actually*
+     * effective for the actuator endpoints (FW-01: {@code management.server.address} alone is silently
+     * ignored whenever no distinct {@code management.server.port} is configured).
      */
+    private final String serverAddress;
+    private final String serverPort;
     private final String managementServerAddress;
+    private final String managementServerPort;
 
-    public WorkerProperties(@Value("${management.server.address:}") String managementServerAddress) {
+    public WorkerProperties(@Value("${server.address:}") String serverAddress,
+                             @Value("${server.port:}") String serverPort,
+                             @Value("${management.server.address:}") String managementServerAddress,
+                             @Value("${management.server.port:}") String managementServerPort) {
+        this.serverAddress = serverAddress;
+        this.serverPort = serverPort;
         this.managementServerAddress = managementServerAddress;
+        this.managementServerPort = managementServerPort;
     }
 
     public Gateway getGateway() {
@@ -121,7 +139,7 @@ public class WorkerProperties {
         requirePositive("worker.limits.maxDiffBytes", worker.getLimits().getMaxDiffBytes());
         requirePositive("worker.limits.maxResponseBytes", worker.getLimits().getMaxResponseBytes());
         validatePromptLocation();
-        validateManagementServerAddress();
+        validateServerBinding();
         warnIfHeapDumpOnOutOfMemoryEnabled();
     }
 
@@ -209,18 +227,45 @@ public class WorkerProperties {
         }
     }
 
-    private void validateManagementServerAddress() {
-        // WSR-12: fail fast unless management endpoints are explicitly bound to loopback -- a blank
-        // value (Spring's default: bind to the same address as the main server, i.e. all interfaces)
-        // or an off-loopback value would expose /actuator/prometheus and /actuator/health beyond the host.
-        if (managementServerAddress == null || managementServerAddress.isBlank()) {
+    /**
+     * WSR-12/FW-01: fail fast unless the actuator's <em>effective</em> bind address is loopback -- not
+     * just whatever {@code management.server.address} literally says, which is silently ignored by
+     * Spring Boot whenever {@code management.server.port} is unset or equal to {@code server.port} (the
+     * documented behavior: management only gets its own bind address when it has its own, distinct
+     * port). Validating the inert property in that case is a false-assurance anti-pattern -- it looks
+     * covered in review/tests but the actuator actually binds via {@code server.address} instead, which
+     * could be unset (⇒ all interfaces).
+     *
+     * <p>Two cases:
+     * <ul>
+     *   <li>No distinct management port (the Worker's own {@code application.yml} default): the actuator
+     *       follows {@code server.address}, so that is what must be loopback.</li>
+     *   <li>A distinct {@code management.server.port} is configured (whether via this project's own
+     *       config or an operator's environment override): the actuator gets its own bind address from
+     *       {@code management.server.address}, so <em>that</em> must be loopback instead.</li>
+     * </ul>
+     */
+    private void validateServerBinding() {
+        boolean distinctManagementPort = hasDistinctManagementPort();
+        String effectiveAddress = distinctManagementPort ? managementServerAddress : serverAddress;
+        String effectivePropertyName = distinctManagementPort ? "management.server.address" : "server.address";
+
+        if (effectiveAddress == null || effectiveAddress.isBlank()) {
             throw new IllegalStateException(
-                    "management.server.address must be set to a loopback address (127.0.0.1) — refusing to start");
+                    effectivePropertyName + " must be set to a loopback address (127.0.0.1) — refusing to start");
         }
-        if (!isLoopbackHost(managementServerAddress.trim())) {
+        if (!isLoopbackHost(effectiveAddress.trim())) {
             throw new IllegalStateException(
-                    "management.server.address must be a loopback address (127.0.0.1/::1/localhost) — refusing to start");
+                    effectivePropertyName + " must be a loopback address (127.0.0.1/::1/localhost) — refusing to start");
         }
+    }
+
+    private boolean hasDistinctManagementPort() {
+        if (managementServerPort == null || managementServerPort.isBlank()) {
+            return false;
+        }
+        String normalizedServerPort = serverPort == null ? "" : serverPort.trim();
+        return !managementServerPort.trim().equals(normalizedServerPort);
     }
 
     /**

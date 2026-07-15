@@ -25,6 +25,16 @@
     <properties>
         <java.version>21</java.version>
         <mockwebserver.version>4.12.0</mockwebserver.version>
+        <!-- FW-03: jackson-bom 2.21.4 (Boot 3.5.16's default) carries jackson-databind 2.21.4, affected by
+             CVE-2026-54515 (GHSA-5jmj-h7xm-6q6v, JsonIgnoreProperties bypass on case-insensitive
+             deserialization). Bump the whole Jackson BOM (not just jackson-databind in isolation) so every
+             Jackson module (core/databind/annotations) stays on one consistent, Boot-BOM-recognized
+             line; fixed in 2.21.5. -->
+        <jackson-bom.version>2.21.5</jackson-bom.version>
+        <!-- FW-04: logback-core 1.5.34 (Boot 3.5.16's default) is affected by GHSA-jhq6-gfmj-v8fx; fixed in
+             1.5.35. This property (Boot's standard override point) re-pins both logback-core and
+             logback-classic together. -->
+        <logback.version>1.5.35</logback.version>
     </properties>
 
     <dependencies>

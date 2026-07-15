@@ -1,12 +1,18 @@
 name: security-gate
 
 # SR-23 CI security gate (threat-model §5). Runs on every PR and on push to master.
-# Four jobs, all independent; a red job blocks the merge:
-#   1. gitleaks   — secret scan over FULL history (fetch-depth: 0), blocking on any leak.
-#   2. sca        — osv-scanner over a fully-resolved CycloneDX SBOM, blocking on High/Critical CVSS.
-#                   (This is the control that would have caught the F01-01 EOL-Spring-Boot CVEs.)
-#   3. semgrep    — p/java + p/sql-injection + p/secrets, blocking on ERROR-severity findings.
-#   4. build-test — mvn verify on Temurin JDK 21 (Zonky embedded-postgres, no Docker needed on the runner).
+# Independent jobs; a red job blocks the merge:
+#   1. gitleaks          — secret scan over FULL history (fetch-depth: 0), whole repo (incl. worker/), blocking.
+#   2. sca               — osv-scanner over the GATEWAY CycloneDX SBOM, blocking on High/Critical CVSS.
+#                          (This is the control that would have caught the F01-01 EOL-Spring-Boot CVEs.)
+#   3. sca-worker        — same, for the standalone worker/ project (FW-02: worker deps were previously ungated).
+#   4. semgrep           — p/java + p/sql-injection + p/secrets over the whole tree (incl. worker/), block on ERROR.
+#   5. build-test        — mvn verify on Temurin JDK 21 for the Gateway (Zonky embedded-postgres, no Docker).
+#   6. build-test-worker — mvn -f worker/pom.xml verify (FW-02: worker tests were previously never run in CI).
+#
+# The worker/ tree is a SEPARATE Maven project (its own worker/pom.xml, not a module of the root pom), so it
+# needs its own build/test and its own SBOM SCA. gitleaks (full history) and semgrep (whole tree) already
+# cover worker/ — no path filter in .gitleaks.toml/.semgrepignore excludes it (only build output / docs).
 #
 # Scanner binary versions are pinned; the two scanner configs live in the repo root
 # (.gitleaks.toml value-scoped allowlist, .semgrepignore).
@@ -83,6 +89,47 @@ jobs:
             print "SCA gate PASS: no High/Critical (Medium/Low are reported above, non-blocking).";
           }'
 
+  sca-worker:
+    name: Worker dependency CVEs (osv-scanner, block High/Critical)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+      - name: Generate CycloneDX SBOM for worker/ (fully-resolved transitive tree)
+        # worker/ is a standalone Maven project (own pom, not a root module) -> its own SBOM at
+        # worker/target/bom.json. Same plugin/invocation as the Gateway sca job.
+        run: mvn -B -ntp -f worker/pom.xml org.cyclonedx:cyclonedx-maven-plugin:2.9.1:makeAggregateBom -DoutputFormat=json -DoutputName=bom
+      - name: Install osv-scanner
+        run: |
+          set -euo pipefail
+          curl -sSL -o osv-scanner \
+            "https://github.com/google/osv-scanner/releases/download/v${OSV_SCANNER_VERSION}/osv-scanner_linux_amd64"
+          sudo install -m 0755 osv-scanner /usr/local/bin/osv-scanner
+          osv-scanner --version
+      - name: Scan worker SBOM and gate on High/Critical (CVSS >= 7.0)
+        run: |
+          set -uo pipefail
+          # Human-readable summary in the log (never fails the step itself):
+          osv-scanner scan --format table -L worker/target/bom.json || true
+          # Machine-readable for the gate:
+          osv-scanner scan --format json -L worker/target/bom.json > osv.json || true
+          MAX=$(jq -r '[.results[]?.packages[]?.groups[]?.max_severity
+                         | select(. != "" and . != null) | tonumber] | max // 0' osv.json)
+          HIGHCRIT=$(jq -r '[.results[]?.packages[]?.vulnerabilities[]?.database_specific.severity // empty
+                              | ascii_upcase | select(. == "HIGH" or . == "CRITICAL")] | length' osv.json)
+          echo "Highest CVSS = ${MAX}; High/Critical-labeled advisories = ${HIGHCRIT}"
+          awk -v s="$MAX" -v h="$HIGHCRIT" 'BEGIN{
+            if (s+0 >= 7.0 || h+0 > 0) {
+              print "::error::Worker SCA gate: High/Critical dependency vulnerability present — blocking merge.";
+              exit 1
+            }
+            print "Worker SCA gate PASS: no High/Critical (Medium/Low are reported above, non-blocking).";
+          }'
+
   semgrep:
     name: SAST (semgrep, block ERROR-severity)
     runs-on: ubuntu-latest
@@ -113,3 +160,17 @@ jobs:
           cache: maven
       - name: mvn verify (Zonky embedded-postgres, no Docker)
         run: mvn -B -ntp verify
+
+  build-test-worker:
+    name: Worker build & test (Temurin JDK 21)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+      - name: mvn -f worker/pom.xml verify
+        # worker/ is a standalone project; verify runs its own 98-test suite (previously never run in CI, FW-02).
+        run: mvn -B -ntp -f worker/pom.xml verify

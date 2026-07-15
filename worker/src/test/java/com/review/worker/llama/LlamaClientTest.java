@@ -1,6 +1,7 @@
 package com.review.worker.llama;
 
 import com.review.worker.config.WorkerProperties;
+import com.review.worker.core.LlamaResult;
 import com.review.worker.error.LlamaException;
 import com.review.worker.llama.dto.ChatMessage;
 import okhttp3.mockwebserver.MockResponse;
@@ -33,7 +34,7 @@ class LlamaClientTest {
         server = new MockWebServer();
         server.start();
 
-        WorkerProperties properties = new WorkerProperties("127.0.0.1");
+        WorkerProperties properties = new WorkerProperties("127.0.0.1", "8081", "", "");
         properties.getGateway().setUrl("https://gateway.internal");
         properties.getGateway().setApiKey("a".repeat(40));
         properties.getWorker().setId("worker-1");
@@ -47,7 +48,7 @@ class LlamaClientTest {
                 .baseUrl(server.url("/").toString())
                 .requestFactory(new JdkClientHttpRequestFactory(httpClient))
                 .build();
-        llamaClient = new LlamaClient(restClient, new com.fasterxml.jackson.databind.ObjectMapper(), properties);
+        llamaClient = new LlamaClient(restClient, httpClient, new com.fasterxml.jackson.databind.ObjectMapper(), properties);
     }
 
     @AfterEach

@@ -26,7 +26,7 @@ class PromptTemplateServiceTest {
 
     @BeforeEach
     void setUp() {
-        WorkerProperties properties = new WorkerProperties("127.0.0.1");
+        WorkerProperties properties = new WorkerProperties("127.0.0.1", "8081", "", "");
         properties.getGateway().setUrl("https://gateway.internal");
         properties.getGateway().setApiKey("a".repeat(40));
         properties.getWorker().setId("worker-1");
@@ -105,7 +105,7 @@ class PromptTemplateServiceTest {
 
     @Test
     void oversizedDiffIsAbandonedBeforeTemplateResolution() {
-        WorkerProperties properties = new WorkerProperties("127.0.0.1");
+        WorkerProperties properties = new WorkerProperties("127.0.0.1", "8081", "", "");
         properties.getGateway().setUrl("https://gateway.internal");
         properties.getGateway().setApiKey("a".repeat(40));
         properties.getWorker().setId("worker-1");
