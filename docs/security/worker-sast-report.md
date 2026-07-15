@@ -178,3 +178,98 @@ not introduced by the Worker's own new deps). The genuinely new Worker deps —
 3. FW-03: pin `jackson-databind` to `2.21.5` (or accept as tracked-Medium matching the Gateway).
 4. FW-05: masking `toString()` on `JobPayload`/`ResultRequest` to keep WSR-10 regression-proof.
 5. FW-04: pick up `logback-core` 1.5.35 on the next Boot patch bump.
+
+---
+
+# Verification (2026-07-15)
+
+Re-audit of the remediation on `feature/02-worker-loop-lifecycle` after fix commits `074a785` (dev) and
+`095ade6` (CI). Every fix was verified against the **code**, not the fix description — files re-read, guard
+logic re-derived across all input combinations, dependency versions resolved from the actual tree, tests
+re-run, tools re-executed.
+
+**Re-run evidence (this session):**
+- `mvn -f worker/pom.xml verify` → **98/98 tests, 0 failures, 0 errors, 0 skipped**, BUILD SUCCESS.
+- `semgrep p/java,p/sql-injection,p/secrets` over `worker/src/main` → **0 findings, 0 errors**.
+- `osv-scanner` over a fresh `worker/target/bom.json` (53 pkgs) → **1 Medium (jackson), 0 High/Critical, 0 Low** (logback advisory gone).
+- `mvn dependency:tree` → `jackson-databind 2.21.5`, `jackson-core 2.21.5`, `logback-core 1.5.35`, `logback-classic 1.5.35`.
+
+## Per-finding verdicts
+
+### FW-01 (WSR-12) — **VERIFIED-FIXED**
+- `application.yml`: `server.address: 127.0.0.1` now set; the inert `management.server.address` key **removed**;
+  `management` block retains only `exposure.include: health,prometheus` + health probes. Correct — with no
+  distinct management port the actuator follows `server.address`, which is now loopback.
+- `WorkerProperties.validateServerBinding()` (lines 248-269) validates the **effective** address:
+  `hasDistinctManagementPort()` returns true only when `management.server.port` is set **and differs** from
+  `server.port`; it then checks `management.server.address`, otherwise `server.address`. Fail-closed on
+  blank/non-loopback in both branches. I re-derived all combinations (no mgmt port / mgmt port == server port /
+  distinct mgmt port × blank / loopback / non-loopback address) — all resolve correctly; the pathological
+  "server.port unset + management.server.port set to the real default" edge fails *closed* (over-strict, never
+  over-permissive), and is unreachable given the shipped config always sets `server.port`.
+- Tests: `WorkerPropertiesTest` adds the 8-case matrix incl. the exact false-assurance scenario
+  (`nonLoopbackServerAddressStillFailsEvenIfManagementServerAddressLooksLoopback`),
+  `...WhenManagementPortEqualsServerPort`, and the three distinct-management-port cases — each asserts
+  `IllegalStateException` (fail-fast) or `doesNotThrowAnyException`. Genuinely assert fail-fast, not just no-throw.
+- The false-assurance anti-pattern from the original finding is gone: the guard no longer green-lights an inert property.
+
+### FW-02 (WSR-17) — **VERIFIED-FIXED**
+- `.github/workflows/security-gate.yml` parses as valid YAML with **6 jobs**: `gitleaks`, `sca`, **`sca-worker`**,
+  `semgrep`, `build-test`, **`build-test-worker`**.
+- `build-test-worker`: `mvn -B -ntp -f worker/pom.xml verify` — the 98-test worker suite now runs in CI.
+- `sca-worker`: generates the SBOM from `worker/pom.xml` (`-f worker/pom.xml ...makeAggregateBom`) and runs
+  `osv-scanner` on `worker/target/bom.json`. The gate jq/awk is **byte-identical** to the root `sca` job:
+  blocks on `max_severity ≥ 7.0` **or** any HIGH/CRITICAL-labelled advisory (`exit 1`). Confirmed the worker's
+  dependency tree is now gated (it was invisible to CI before). gitleaks + semgrep already scanned `.`
+  (whole tree), so all four scan types now cover `worker/`.
+
+### FW-03 (jackson CVE-2026-54515) — **VERIFIED-FIXED** (with a data-quality note; non-blocking)
+- `worker/pom.xml` sets `<jackson-bom.version>2.21.5</jackson-bom.version>`; `dependency:tree` confirms
+  `jackson-databind:2.21.5` resolved. **2.21.5 is the GHSA's designated patched release for the 2.21.x line**
+  (fixed set: 2.18.9 / 2.21.5 / 2.22.1 / 3.1.4) — the correct fix is in place.
+- Note: `osv-scanner` still cosmetically reports GHSA-5jmj-h7xm-6q6v against 2.21.5. Verified against the OSV
+  API record: the machine-readable `com.fasterxml.jackson.core` ranges have an open-ended
+  `introduced: 2.19.0` with **no `fixed` event**, and the enumerated `versions` list stops at 2.21.4 (stale) —
+  so range-matching over-includes 2.21.5. This is an OSV metadata gap, not a real exposure. It is **Medium (5.3),
+  below the CI gate's ≥7.0 block threshold** (the `sca-worker` awk yields PASS), and non-exploitable here (no DTO
+  relies on `@JsonIgnoreProperties` for a security control). Acceptable as a tracked-Medium.
+
+### FW-04 (logback) — **VERIFIED-FIXED**
+- `<logback.version>1.5.35</logback.version>`; `dependency:tree` confirms `logback-core:1.5.35` +
+  `logback-classic:1.5.35`. The advisory no longer appears in the fresh osv-scan.
+
+### FW-05 (DTO toString masking) — **VERIFIED-FIXED** for the specified DTOs (with a completeness residual; non-blocking)
+- `JobPayload`, `ResultRequest`, `ClaimResponse` override `toString()` to mask `diff`/`rawResponse` (byte-length
+  only). `ClaimResponse.toString()` renders `payload=` via `JobPayload`'s masked `toString()` → **transitively
+  safe** (confirmed the nested-record concern is addressed). Accessors are untouched, so Jackson JSON
+  (de)serialization is unaffected. `SensitiveDtoToStringMaskingTest` (6 tests) asserts content absent, `masked`
+  present, length present, accessor still returns full content, transitive `ClaimResponse→payload` masking, and
+  null-safety.
+- **Residual (new, minor, non-blocking):** the masking is **not exhaustive** across all content-bearing records.
+  `llama/dto/ChatMessage.content` (holds the diff-bearing prompt on the way out and the raw model response on the
+  way back), `ChatCompletionRequest`/`ChatCompletionResponse`/`Choice`, and core records `LlamaResult.rawResponse`
+  / `ResolvedPrompt.messages` still use the default record `toString()`. **No active leak exists** — I grepped
+  every `log.*` statement and exception message in `src/main`: no content-bearing record is ever logged as a whole
+  object; only ids/sizes/status/token-counts are logged, and RestClient exceptions carry the *response* body, not
+  the request. So **WSR-10 still PASSES**. Recommend extending the masking (or a Semgrep rule forbidding these
+  types as `{}` log args) to keep the invariant regression-proof on the llama path too.
+
+### FW-06 / QA metrics defect — **VERIFIED-FIXED** (no security impact, as originally assessed)
+- `WorkerLoop.submitResultWithRedelivery` now returns a `RedeliveryOutcome`; `runInference` increments
+  `jobs_completed_total` **only** on `DELIVERED` (Gateway acknowledged via 200/403/404) and increments
+  `jobs_failed_total` + logs a WARN on `ABANDONED` (redelivery interrupted before acknowledgement). The
+  miscount is closed. Security impact remains nil (observability counter only).
+
+## WSR regression check
+- **WSR-12 — now PASS.** Actuator effectively bound to loopback; fail-fast guard validates the effective address; 8-case test matrix.
+- **WSR-17 — now PASS.** `worker/` dependency tree and test suite are covered by the CI gate (`sca-worker` + `build-test-worker`), same block policy as the Gateway.
+- All previously-passing WSRs (01/02/03/04/05/07/09/10/11/14/15) re-checked for regressions across the changed files: **no regressions**. Semgrep clean; 98/98 green.
+
+## New concerns
+- One minor, non-blocking completeness gap only: FW-05 residual (llama-side + core records unmasked, latent, no active log path). Nothing merge-blocking.
+
+## Final verdict: **PASS — approved for merge to master**
+Both must-fix findings (FW-01, FW-02) are fully and correctly remediated with real, asserting tests; the two
+dependency findings and the metrics defect are closed; the masking fix is correct for the DTOs that matter, with
+only a latent, non-exploitable completeness residual tracked for follow-up. No Critical/High, no injection/exfil
+path, no CI-gate-blocking CVE. Suite 98/98, semgrep clean.
