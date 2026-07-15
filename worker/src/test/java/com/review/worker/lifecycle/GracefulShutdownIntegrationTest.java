@@ -103,7 +103,7 @@ class GracefulShutdownIntegrationTest {
     private WorkerLoop buildWorkerLoop(MockWebServer gatewayServer, GatewayDispatcher dispatcher, MockWebServer llamaServer,
                                         int requestTimeoutSec) {
         gatewayServer.setDispatcher(dispatcher);
-        WorkerProperties properties = new WorkerProperties("127.0.0.1");
+        WorkerProperties properties = new WorkerProperties("127.0.0.1", "8081", "", "");
         properties.getGateway().setUrl(gatewayServer.url("/").toString());
         properties.getGateway().setApiKey("a".repeat(40));
         properties.getWorker().setAllowInsecureGateway(true);

@@ -201,7 +201,7 @@ class WorkerLoopContractAndResilienceTest {
         GatewayDispatcher gatewayDispatcher = new GatewayDispatcher();
         gatewayServer.setDispatcher(gatewayDispatcher);
 
-        WorkerProperties properties = new WorkerProperties("127.0.0.1");
+        WorkerProperties properties = new WorkerProperties("127.0.0.1", "8081", "", "");
         properties.getGateway().setUrl(gatewayServer.url("/").toString());
         properties.getGateway().setApiKey("a".repeat(40));
         properties.getWorker().setAllowInsecureGateway(true);
@@ -504,17 +504,19 @@ class WorkerLoopContractAndResilienceTest {
     }
 
     /**
-     * DEFECT DEMONSTRATION (see QA report): {@code WorkerLoop.runInference} calls
-     * {@code metrics.incrementJobsCompleted()} unconditionally right after
-     * {@code submitResultWithRedelivery(...)} returns -- including the escape hatch where that method
-     * returns early because the thread was interrupted mid-redelivery (the exact mechanism
-     * {@code GracefulShutdown.abandonCurrentJob()} uses once its grace period elapses, architecture §9).
-     * This test proves (a) the desired behavior -- an interrupt during the redelivery backoff sleep stops
-     * further redelivery attempts promptly -- and (b) the side effect: the job is still counted as
-     * "completed" even though its result was never actually accepted by the Gateway.
+     * QA/SAST fix verification (was a defect demonstration; see {@code docs/security/worker-sast-report.md}
+     * FW-06 and the accompanying QA finding): {@code WorkerLoop.runInference} now routes
+     * {@code submitResultWithRedelivery(...)}'s outcome through a {@code RedeliveryOutcome} enum and only
+     * calls {@code metrics.incrementJobsCompleted()} when the Gateway actually acknowledged the result
+     * (DELIVERED); the escape hatch where redelivery is interrupted mid-backoff (the exact mechanism
+     * {@code GracefulShutdown.abandonCurrentJob()} uses once its grace period elapses, architecture §9) is
+     * routed to {@code metrics.incrementJobsFailed()} instead. This test proves (a) an interrupt during
+     * the redelivery backoff sleep stops further redelivery attempts promptly, and (b) the job is now
+     * correctly counted as failed, never as completed, since its result was never actually accepted by
+     * the Gateway.
      */
     @Test
-    void interruptDuringResultRedeliveryStopsRedeliveryButMiscountsAsCompleted() throws Exception {
+    void interruptDuringResultRedeliveryStopsRedeliveryAndCountsAsFailedNotCompleted() throws Exception {
         MockWebServer gatewayServer = newServer();
         MockWebServer llamaServer = newServer();
         Harness harness = newHarness(gatewayServer, llamaServer,
@@ -531,8 +533,7 @@ class WorkerLoopContractAndResilienceTest {
         assertThat(takeRequestWithPath(gatewayServer, "/jobs/claim", Duration.ofSeconds(3))).isNotNull();
         assertThat(llamaServer.takeRequest(3, TimeUnit.SECONDS)).isNotNull();
 
-        // Prime the dispatcher so subsequent (there should be none) attempts don't hang the test if the
-        // defect were ever fixed and redelivery legitimately continued.
+        // Prime the dispatcher so subsequent (there should be none) attempts don't hang the test.
         for (int i = 0; i < 10; i++) {
             harness.gatewayDispatcher.enqueueResult(new MockResponse().setSocketPolicy(SocketPolicy.NO_RESPONSE));
         }
@@ -547,13 +548,14 @@ class WorkerLoopContractAndResilienceTest {
         RecordedRequest secondAttempt = takeRequestWithPath(gatewayServer, "/jobs/25/result", Duration.ofSeconds(2));
         assertThat(secondAttempt).as("redelivery must stop once interrupted, not keep retrying").isNull();
 
-        // The defect: despite never receiving a 200/403/404 for job 25, it is still counted as completed.
+        // Fixed behavior: since job 25 never received a 200/403/404, it must be counted as failed, never
+        // as completed (RedeliveryOutcome.ABANDONED routes to metrics.incrementJobsFailed()).
         awaitTrue(Duration.ofSeconds(2), () -> counterValue(harness.registry, "worker.jobs") == 1.0);
+        awaitTrue(Duration.ofSeconds(2), () -> counterValue(harness.registry, "worker.jobs.failed") == 1.0);
         assertThat(counterValue(harness.registry, "worker.jobs.completed"))
-                .as("WorkerLoop.java processJob/runInference: jobs.completed is incremented even when "
-                        + "submitResultWithRedelivery returns without ever delivering (interrupted mid-backoff)")
-                .isEqualTo(1.0);
-        assertThat(counterValue(harness.registry, "worker.jobs.failed")).isEqualTo(0.0);
+                .as("an interrupted/abandoned result redelivery must never be counted as completed")
+                .isEqualTo(0.0);
+        assertThat(counterValue(harness.registry, "worker.jobs.failed")).isEqualTo(1.0);
     }
 
     @Test

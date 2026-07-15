@@ -195,7 +195,7 @@ class WorkerLoopIntegrationTest {
         GatewayDispatcher gatewayDispatcher = new GatewayDispatcher();
         gatewayServer.setDispatcher(gatewayDispatcher);
 
-        WorkerProperties properties = new WorkerProperties("127.0.0.1");
+        WorkerProperties properties = new WorkerProperties("127.0.0.1", "8081", "", "");
         properties.getGateway().setUrl(gatewayServer.url("/").toString());
         properties.getGateway().setApiKey("a".repeat(40));
         properties.getWorker().setAllowInsecureGateway(true);

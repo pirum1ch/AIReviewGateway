@@ -223,8 +223,17 @@ public class WorkerLoop {
             return;
         }
 
-        submitResultWithRedelivery(job.jobId(), workerId, result);
-        metrics.incrementJobsCompleted();
+        RedeliveryOutcome redeliveryOutcome = submitResultWithRedelivery(job.jobId(), workerId, result);
+        if (redeliveryOutcome == RedeliveryOutcome.DELIVERED) {
+            metrics.incrementJobsCompleted();
+        } else {
+            // QA defect fix: an interrupted/abandoned redelivery (e.g. GracefulShutdown's grace period
+            // elapsing mid-backoff) must never be counted as completed -- the Gateway never actually
+            // acknowledged the result, so from an observability standpoint this job did not succeed.
+            log.warn("Result redelivery abandoned before the Gateway ever acknowledged it; counting job "
+                    + "as failed, not completed (jobId={})", job.jobId());
+            metrics.incrementJobsFailed();
+        }
     }
 
     /**
@@ -264,13 +273,24 @@ public class WorkerLoop {
         }
     }
 
+    /** Outcome of {@link #submitResultWithRedelivery}, driving whether the job counts as completed or failed. */
+    private enum RedeliveryOutcome {
+        /** The Gateway responded (200/403/404 — all terminal, idempotent-acknowledged outcomes). */
+        DELIVERED,
+        /** Redelivery was interrupted/abandoned before the Gateway ever acknowledged the result. */
+        ABANDONED
+    }
+
     /**
      * Transport-level redelivery of an already-computed, idempotent result (architecture §7): retries
      * with capped exponential backoff until the Gateway accepts it, rejects it as not-owned/not-found
-     * (both terminal from the Worker's perspective), or this thread is interrupted (shutdown abandoning
-     * it). Never re-invokes the LLM -- this is not business retry.
+     * (both terminal from the Worker's perspective, and both count as {@link RedeliveryOutcome#DELIVERED}
+     * — the Gateway *processed* the request either way, per {@code GatewayClient.submitResult}'s existing
+     * 200/403/404 semantics, which this method does not change), or this thread is interrupted (shutdown
+     * abandoning it, {@link RedeliveryOutcome#ABANDONED}). Never re-invokes the LLM -- this is not
+     * business retry.
      */
-    private void submitResultWithRedelivery(long jobId, String workerId, LlamaResult result) {
+    private RedeliveryOutcome submitResultWithRedelivery(long jobId, String workerId, LlamaResult result) {
         ResultRequest request = new ResultRequest(workerId, result.rawResponse(), result.promptTokens(),
                 result.completionTokens(), result.durationMs(), result.model());
         long backoffMs = 0;
@@ -278,7 +298,7 @@ public class WorkerLoop {
             try {
                 ResultOutcome outcome = gatewayClient.submitResult(jobId, request);
                 log.info("Result delivered (jobId={}, status={})", jobId, outcome.status());
-                return;
+                return RedeliveryOutcome.DELIVERED;
             } catch (GatewayUnavailableException e) {
                 metrics.incrementGatewayErrors();
                 backoffMs = nextBackoff(backoffMs);
@@ -289,7 +309,7 @@ public class WorkerLoop {
                 } catch (InterruptedException interrupted) {
                     Thread.currentThread().interrupt();
                     log.warn("Interrupted while redelivering result; giving up (jobId={})", jobId);
-                    return;
+                    return RedeliveryOutcome.ABANDONED;
                 }
             }
         }

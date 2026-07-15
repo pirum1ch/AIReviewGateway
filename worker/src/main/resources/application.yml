@@ -7,14 +7,20 @@ spring:
     timeout-per-shutdown-phase: 30s
 
 server:
+  # WSR-12/FW-01: the Worker is a pure outbound HTTP client and serves nothing to the network except the
+  # actuator endpoints below -- binding the whole embedded server to loopback is correct and sufficient.
+  # Deliberately NOT setting management.server.port: per Spring Boot's documented behavior, actuator only
+  # binds to management.server.address when management.server.port is a DISTINCT port from server.port;
+  # with no distinct management port configured, actuator follows server.address (this one), so a
+  # separate (and, without this comment, easily-forgotten-as-inert) management.server.address key is not
+  # needed. WorkerProperties.validateServerBinding() fails startup fast if this resolves to anything but a
+  # loopback address (and additionally guards the distinct-management-port case, in case one is ever
+  # introduced via an environment override outside this file).
+  address: 127.0.0.1
   port: ${WORKER_HTTP_PORT:8081}
   shutdown: graceful
 
 management:
-  # WSR-12: actuator (health/prometheus) MUST bind to loopback only -- WorkerProperties fails startup
-  # fast if this is blank or resolves to a non-loopback address.
-  server:
-    address: 127.0.0.1
   endpoints:
     web:
       exposure:
