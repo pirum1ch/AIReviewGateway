@@ -30,6 +30,7 @@ illustrative hostnames chosen for this runbook, not values baked into the code.
 8. [Step 6: End-to-end smoke test](#8-step-6-end-to-end-smoke-test)
 9. [Operations quick reference](#9-operations-quick-reference)
 10. [Config file appendix](#10-config-file-appendix)
+11. [Docker deployment (verified, both images)](#11-docker-deployment-verified-both-images)
 
 ---
 
@@ -94,7 +95,7 @@ GitLab or database access of its own. See the root [README.md §1](README.md#1-w
 | Maven | 3.9+ | Both projects build with `spring-boot-maven-plugin`. |
 | PostgreSQL | Tested against 14.22; 12+ is a reasonable practical floor (no Postgres-14-specific SQL features are used) | Root [README §2](README.md#2-requirements). Only the Gateway touches PostgreSQL — the Worker has no JDBC dependency at all. |
 | `llama-server` (llama.cpp) | An already-running, OpenAI-Chat-Completions-compatible HTTP server | **Out of scope for this repository** — installing/running `llama.cpp` itself is not something either component's code does. This runbook only documents the exact API path the Worker calls against it (`POST /v1/chat/completions`, verified from `worker/src/main/java/com/review/worker/llama/LlamaClient.java`) and the health path the Gateway probes it on (`GET {url}/health`, verified from `BackendProberImpl`). |
-| Docker | **Not required anywhere**, for either component | Both test suites use in-process fakes (Zonky embedded PostgreSQL for the Gateway, real-socket `okhttp3:mockwebserver` for the Worker) — no Testcontainers, no external services needed to build or test. |
+| Docker | **Not required to build or test**, for either component | Both test suites use in-process fakes (Zonky embedded PostgreSQL for the Gateway, real-socket `okhttp3:mockwebserver` for the Worker) — no Testcontainers, no external services needed to build or test. A `Dockerfile` at the repo root and `worker/Dockerfile` provide an *optional* containerized deployment path for both components — see [§11](#11-docker-deployment-verified-both-images). |
 
 **Port assumption for the `llama-server` example address.** The Worker's own `llama.url` property
 defaults to `http://127.0.0.1:8000` (`worker/src/main/resources/application.yml` /
@@ -283,6 +284,28 @@ curl -s http://localhost:8080/actuator/health
 # Spring Boot Actuator's own check, reports DB connectivity separately from the endpoint above
 ```
 
+### 4.4 Docker alternative
+
+Instead of [§4](#4-step-2-deploy-the-gateway)'s jar+systemd path, build and run the root `Dockerfile`
+(multi-stage `maven:3.9-eclipse-temurin-21` → `eclipse-temurin:21-jre-jammy`, non-root user, built-in
+`HEALTHCHECK` against `GET /health`):
+
+```bash
+docker build -t review-gateway:latest .
+
+docker run -d --name review-gateway \
+  --env-file /etc/review-gateway/review-gateway.env \
+  -p 8080:8080 \
+  review-gateway:latest
+```
+
+The env file is exactly the one from [§4.1](#41-environment-file)/[§10.1](#101-gateway-environment-file-etcreview-gatewayreview-gatewayenv)
+— every property the image reads is a plain environment variable, nothing Docker-specific. The image sets
+no placeholder values for the six required secrets (`DB_USER`, `DB_PASSWORD`, `CI_TOKEN`, `WORKER_TOKEN`,
+`ADMIN_TOKEN`, `GITLAB_TOKEN`), so a container started without them fails fast in its logs exactly like
+the bare-jar deployment. See [§11](#11-docker-deployment-verified-both-images) for a fully worked,
+verified example (Postgres + Gateway + Worker, all containerized, exercised end-to-end).
+
 ## 5. Step 3: Register the llama backend
 
 > **STUB — not implemented: no admin API for backend registration.** `AdminController` exposes only
@@ -397,6 +420,36 @@ curl -s http://127.0.0.1:8081/actuator/prometheus | grep worker_
 # worker_jobs_total, worker_jobs_completed_total, worker_jobs_failed_total,
 # worker_llama_duration_seconds_*, worker_gateway_errors_total, worker_uptime_seconds
 ```
+
+### 6.4 Docker alternative
+
+Instead of [§6](#6-step-4-deploy-the-worker)'s jar+systemd/launchd path, build and run `worker/Dockerfile`
+(same base-image pattern as the Gateway's, `HEALTHCHECK` against `GET /actuator/health`):
+
+```bash
+docker build -t llm-worker:latest worker/
+
+docker run -d --name llm-worker \
+  --env-file /etc/llm-worker/llm-worker.env \
+  llm-worker:latest
+```
+
+The env file is the one from [§6.1](#61-environment-file)/[§10.3](#103-worker-environment-file-etcllm-workerllm-workerenv).
+**Do not** publish the Worker's port with `-p`: `server.address: 127.0.0.1` is hardcoded in the Worker's
+own `application.yml` (actuator must never be reachable off the Worker's own host,
+[worker/README.md §8](worker/README.md#8-observability)) — check it with `docker exec` instead of a
+mapped host port:
+
+```bash
+docker exec llm-worker curl -s http://127.0.0.1:8081/actuator/health
+docker inspect --format '{{.State.Health.Status}}' llm-worker
+```
+
+**Gotcha carried over from containerizing the Gateway too:** `GATEWAY_URL` must be `https://` unless it
+resolves to an actual loopback address (worker/README.md's WSR-09 check) — in a normal deployment where
+the Worker reaches the Gateway through the reverse-proxy `https://gateway.internal` endpoint, this needs
+no special handling. It only becomes relevant for a same-host dev/smoke-test setup, worked through fully
+in [§11](#11-docker-deployment-verified-both-images).
 
 ## 7. Step 5: GitLab integration
 
@@ -677,4 +730,102 @@ CI_TOKEN>`.
 ```sql
 INSERT INTO backends (name, url, model, capacity)
 VALUES ('llama-01', 'http://192.168.1.101:8000', 'qwen2.5-coder', 1);
+```
+
+## 11. Docker deployment (verified, both images)
+
+Both components ship a `Dockerfile` — root (Gateway) and `worker/Dockerfile` (Worker) — each a
+multi-stage build (`maven:3.9-eclipse-temurin-21` → `eclipse-temurin:21-jre-jammy`, non-root user, a
+built-in `curl`-based `HEALTHCHECK`). Neither image is published anywhere; build locally from the repo:
+
+```bash
+docker build -t review-gateway:latest .
+docker build -t llm-worker:latest worker/
+```
+
+Every environment variable documented in this runbook ([§4.1](#41-environment-file)/[§10.1](#101-gateway-environment-file-etcreview-gatewayreview-gatewayenv)
+for the Gateway, [§6.1](#61-environment-file)/[§10.3](#103-worker-environment-file-etcllm-workerllm-workerenv)
+for the Worker) is read by the image the same way as by the bare jar — plain `${VAR}` Spring property
+resolution, nothing Docker-specific. Neither image bakes in a placeholder for a required secret
+(`DB_USER`/`DB_PASSWORD`/`CI_TOKEN`/`WORKER_TOKEN`/`ADMIN_TOKEN`/`GITLAB_TOKEN` for the Gateway;
+`GATEWAY_URL`/`GATEWAY_API_KEY`/`WORKER_ID`/`BACKEND_ID`/`LLAMA_MODEL` for the Worker) — a container
+started without one fails fast in its own logs, same as [§4](#4-step-2-deploy-the-gateway)/[§6](#6-step-4-deploy-the-worker).
+
+### 11.1 Production topology: reverse proxy, no special flags needed
+
+In a real deployment the Gateway sits behind the same TLS-terminating reverse proxy this runbook already
+assumes ([§2, network matrix](#2-prerequisites)), so a containerized Worker reaching it via
+`GATEWAY_URL=https://gateway.internal` needs no Docker-specific handling at all — it behaves exactly like
+[§6.4](#64-docker-alternative) describes. `docker run -p 8080:8080` for the Gateway and normal container
+networking (a Docker network, a service mesh, or just routable hosts) is all that's required; the Worker
+container never publishes any port (its Actuator is loopback-only by design, checked via `docker exec`,
+see [§6.4](#64-docker-alternative)).
+
+### 11.2 Local single-host smoke test (this is the exact recipe used to verify both images)
+
+This is the full topology actually exercised end-to-end against both images on this project: one Docker
+network for Postgres↔Gateway, and `--network host` for the Worker so its one hard requirement —
+`gateway.url` must resolve to a **real** loopback address to use the `WORKER_ALLOW_INSECURE_GATEWAY`
+dev escape hatch (worker/README.md's WSR-09 check) — is satisfiable without a reverse proxy. A
+container-to-container hostname on a bridge network (e.g. `http://review-gateway:8080`) does **not**
+count as loopback, so this networking choice is not just convenience; it is what makes the Worker start
+at all without TLS in front of the Gateway.
+
+```bash
+# 1. Network + Postgres
+docker network create airg-test
+docker run -d --name airg-postgres --network airg-test \
+  -e POSTGRES_DB=review_gateway -e POSTGRES_USER=review_gateway -e POSTGRES_PASSWORD=change-me \
+  postgres:14-alpine
+until docker exec airg-postgres pg_isready -U review_gateway >/dev/null 2>&1; do sleep 1; done
+
+# 2. Gateway (Flyway migration runs automatically on first connection, per §3/§4)
+docker run -d --name airg-gateway --network airg-test \
+  -e DB_URL="jdbc:postgresql://airg-postgres:5432/review_gateway" \
+  -e DB_USER="review_gateway" \
+  -e DB_PASSWORD="change-me" \
+  -e CI_TOKEN="$(openssl rand -hex 32)" \
+  -e WORKER_TOKEN="$(openssl rand -hex 32)" \
+  -e ADMIN_TOKEN="$(openssl rand -hex 32)" \
+  -e GITLAB_BASE_URL="https://gitlab.example.com/api/v4" \
+  -e GITLAB_TOKEN="$(openssl rand -hex 32)" \
+  -p 18080:8080 \
+  review-gateway:latest
+# Save the actual generated WORKER_TOKEN value somewhere if you typed it above instead of
+# piping openssl directly -- the Worker below must be given the exact same value.
+
+# Wait for the container's own HEALTHCHECK to go green (Flyway + JPA startup takes ~30s):
+until [ "$(docker inspect --format '{{.State.Health.Status}}' airg-gateway)" = "healthy" ]; do sleep 3; done
+curl -s http://localhost:18080/health   # {"status":"UP"}
+
+# 3. Register a backend (§5 -- no REST endpoint, direct SQL only)
+docker exec airg-postgres psql -U review_gateway -d review_gateway -c \
+  "INSERT INTO backends (name, url, model, capacity) VALUES ('llama-01', 'http://127.0.0.1:8000', 'qwen2.5-coder', 1);"
+
+# 4. Worker -- --network host so GATEWAY_URL can be a real loopback address
+docker run -d --name airg-worker --network host \
+  -e GATEWAY_URL="http://127.0.0.1:18080" \
+  -e GATEWAY_API_KEY="<the WORKER_TOKEN value from step 2>" \
+  -e WORKER_ID="worker-test-1" \
+  -e BACKEND_ID="llama-01" \
+  -e LLAMA_MODEL="qwen2.5-coder" \
+  -e WORKER_ALLOW_INSECURE_GATEWAY="true" \
+  llm-worker:latest
+
+until [ "$(docker inspect --format '{{.State.Health.Status}}' airg-worker)" = "healthy" ]; do sleep 3; done
+docker exec airg-worker curl -s http://127.0.0.1:8081/actuator/prometheus | grep '^worker_'
+```
+
+What this actually proves (verified on this machine, not just healthchecks passing): a review created via
+`POST /reviews` against the containerized Gateway was picked up by the containerized Worker
+(`Claimed job (jobId=1)` in `docker logs airg-worker`), the Worker attempted the `llama-server` call
+(expected failure — no `llama-server` is running in this recipe), the Gateway's own review state flipped
+to `RUNNING`/`attempts:1`, and `worker_jobs_failed_total` incremented — genuine claim→attempt→failure
+round-tripping between two real containers, not two containers that merely started.
+
+Tear down with:
+
+```bash
+docker rm -f airg-gateway airg-worker airg-postgres
+docker network rm airg-test
 ```

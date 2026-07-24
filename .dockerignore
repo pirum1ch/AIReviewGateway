@@ -1,0 +1,10 @@
+worker/
+target/
+docs/
+.git/
+.github/
+.claude/
+*.md
+Dockerfile
+worker/Dockerfile
+.dockerignore

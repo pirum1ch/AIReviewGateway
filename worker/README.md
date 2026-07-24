@@ -136,7 +136,7 @@ this Worker does not otherwise call.
 | Network reachability to the Gateway | HTTPS (or loopback HTTP, dev-only) | See `gateway.url` in [§5](#5-configuration-reference). |
 | Network reachability to a `llama-server` | HTTP (loopback by default) | See `llama.url` in [§5](#5-configuration-reference). |
 | PostgreSQL | **not required** | The Worker has no JDBC dependency and no database access of any kind. |
-| Docker | **not required, anywhere** | Tests use real-socket `okhttp3:mockwebserver` instances standing in for both the Gateway and `llama-server` — no Testcontainers, no external services. This machine has no Docker installed either. |
+| Docker | **not required to build or test** | Tests use real-socket `okhttp3:mockwebserver` instances standing in for both the Gateway and `llama-server` — no Testcontainers, no external services. A `worker/Dockerfile` is provided as an *optional* containerized deployment path — see [§6.3](#63-containerization). |
 
 ## 4. Build
 
@@ -231,11 +231,11 @@ java -jar worker/target/llm-worker.jar
 
 ## 6. Deployment
 
-No `Dockerfile`/`docker-compose.yml` and no launchd `.plist`/systemd unit ship in this repository —
-`worker/` contains only the Maven project. The original spec doc (`LLM Worker (Executor)_ prompt.md`)
-calls for launchd deployment on a Mac mini as the primary target, with Docker mentioned as optional; the
-examples below follow that model but are illustrative configuration for an operator to adapt, not files
-present in this repository.
+No launchd `.plist`/systemd unit ships in this repository. A `worker/Dockerfile` **does** ship (see
+[§6.3](#63-containerization)) as an optional containerized path; the systemd/launchd examples below are
+still the primary target the original spec doc (`LLM Worker (Executor)_ prompt.md`) calls for (launchd on
+a Mac mini), and remain illustrative configuration for an operator to adapt, not files present in this
+repository.
 
 ### 6.1 systemd (Linux)
 
@@ -312,9 +312,56 @@ unit, run this under a dedicated non-root user and restrict the plist's file per
 
 ### 6.3 Containerization
 
-No `Dockerfile` exists in this repository (neither at the root nor under `worker/`). Building one
-(multi-stage, JRE 21 slim, as the original prompt doc suggests as an *optional* deployment path) is not
-something this codebase currently provides — do not assume a container image exists to pull.
+`worker/Dockerfile` is a multi-stage build: `maven:3.9-eclipse-temurin-21` compiles the fat jar
+(`RUN --mount=type=cache,target=/root/.m2 mvn -q -B -DskipTests package`), and the runtime stage is
+`eclipse-temurin:21-jre-jammy` running as a non-root `worker` user, with `curl` installed only so the
+image's own `HEALTHCHECK` (`GET http://127.0.0.1:${WORKER_HTTP_PORT}/actuator/health` every 15s) can
+probe itself. No image is published anywhere — build it locally:
+
+```bash
+docker build -t llm-worker:latest worker/
+```
+
+Run it with the five required variables from [§5.1](#51-required-no-default--startup-fails-without-them)
+(`GATEWAY_URL`, `GATEWAY_API_KEY`, `WORKER_ID`, `BACKEND_ID`, `LLAMA_MODEL`) plus whatever [§5.2](#52-everything-else-has-a-working-default)
+overrides you need — every one of those is already declared as an `ENV` in the image with the same
+default `application.yml` ships, so you only need `-e` for what you're actually changing:
+
+```bash
+docker run -d --name llm-worker \
+  -e GATEWAY_URL="https://review-gateway.internal" \
+  -e GATEWAY_API_KEY="<the Gateway's WORKER_TOKEN value>" \
+  -e WORKER_ID="worker-mac-mini-01" \
+  -e BACKEND_ID="mac-mini-01" \
+  -e LLAMA_MODEL="qwen2.5-coder" \
+  -e LLAMA_URL="http://192.168.1.50:8000" \
+  llm-worker:latest
+```
+
+**The `WORKER_HTTP_PORT`/Actuator port (default `8081`) is deliberately not meant to be published with
+`-p`.** `server.address: 127.0.0.1` is hardcoded (WSR-12/FW-01, [§5.3](#53-hardcoded-in-applicationyml-no-environment-variable-placeholder))
+and `WorkerProperties.validateServerBinding()` fails startup if that ever resolves to anything else — the
+container's own `HEALTHCHECK` runs `curl` *inside* the container's network namespace, so it can reach
+loopback without any port mapping; checking it from the host means `docker exec`, not `curl localhost:8081`:
+
+```bash
+docker exec llm-worker curl -s http://127.0.0.1:8081/actuator/health
+docker exec llm-worker curl -s http://127.0.0.1:8081/actuator/prometheus | grep '^worker_'
+docker inspect --format '{{.State.Health.Status}}' llm-worker   # starting / healthy / unhealthy
+```
+
+**The `GATEWAY_URL`/loopback interaction is the one real gotcha when containerizing this Worker.**
+`gateway.url` must be `https://` unless the host is loopback **and** `WORKER_ALLOW_INSECURE_GATEWAY=true`
+([§5.1](#51-required-no-default--startup-fails-without-them)) — a container-to-container hostname on a
+Docker bridge network (e.g. `http://review-gateway:8080` in a compose/user-defined-network setup) is
+**not** loopback, so that escape hatch does not apply there; a real deployment reaching the Gateway
+through its reverse-proxy `https://` endpoint ([root DEPLOYMENT.md §2](../DEPLOYMENT.md#2-prerequisites))
+needs no special handling at all. The only case that needs the flag is a same-host dev/smoke-test setup
+where the Gateway is reachable via an actual loopback address — for example, running both containers with
+`--network host` and pointing this Worker at the Gateway's own published loopback port
+(`GATEWAY_URL=http://127.0.0.1:8080`, `WORKER_ALLOW_INSECURE_GATEWAY=true`); see
+[root DEPLOYMENT.md](../DEPLOYMENT.md) for a full worked example of this local smoke-test topology, which
+was used to verify this image end-to-end against a real containerized Gateway.
 
 ## 7. Integration scheme
 
