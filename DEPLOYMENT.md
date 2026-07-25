@@ -829,3 +829,26 @@ Tear down with:
 docker rm -f airg-gateway airg-worker airg-postgres
 docker network rm airg-test
 ```
+
+### 11.3 Docker Compose (the same topology, one command)
+
+`docker-compose.yml` at the repo root automates exactly the §11.2 recipe above — Postgres, the Gateway,
+a one-shot backend-registration job, and the Worker — instead of four separate `docker run` calls. It
+uses the same `network_mode: "service:gateway"` trick for the Worker (so `GATEWAY_URL=http://127.0.0.1:8080`
+is genuinely loopback from the Worker's point of view) and an `ON CONFLICT (name) DO NOTHING` insert for
+the backend row, so it's safe to re-run.
+
+```bash
+export DB_PASSWORD=change-me CI_TOKEN=$(openssl rand -hex 32) WORKER_TOKEN=$(openssl rand -hex 32) \
+       ADMIN_TOKEN=$(openssl rand -hex 32) GITLAB_TOKEN=$(openssl rand -hex 32) LLAMA_MODEL=qwen2.5-coder
+# (or put the same variables in a `.env` file next to docker-compose.yml instead of exporting them)
+docker compose up --build
+```
+
+No defaults are set for the six required secrets (`DB_PASSWORD`, `CI_TOKEN`, `WORKER_TOKEN`,
+`ADMIN_TOKEN`, `GITLAB_TOKEN`, `LLAMA_MODEL`) — Compose refuses to start with a clear
+`required variable ... is missing a value` error if one is unset, rather than silently running with a
+blank/fake value. `LLAMA_URL` defaults to `http://127.0.0.1:8000` (a dev no-op, since no `llama-server`
+runs inside this stack) — override it to point at a real one. Verified end-to-end on this machine: the
+same claim→attempt→failure round-trip described in [§11.2](#112-local-single-host-smoke-test-this-is-the-exact-recipe-used-to-verify-both-images)
+was reproduced through `docker compose up` alone. Tear down with `docker compose down -v`.

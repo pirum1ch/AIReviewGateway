@@ -1,0 +1,124 @@
+# Local stack for the two images in this repo: review-gateway (root Dockerfile) + llm-worker
+# (worker/Dockerfile), backed by a real Postgres. This is the containerized equivalent of
+# DEPLOYMENT.md §11.2's verified local smoke test, wired up as a single `docker compose up`.
+#
+# Required secrets (no defaults on purpose -- same fail-fast behavior as the bare-jar deployment,
+# see DEPLOYMENT.md §2 "Token generation"). Export these before running, or put them in a `.env`
+# file next to this one:
+#
+#   export DB_PASSWORD=change-me-to-a-real-secret
+#   export CI_TOKEN=$(openssl rand -hex 32)
+#   export WORKER_TOKEN=$(openssl rand -hex 32)
+#   export ADMIN_TOKEN=$(openssl rand -hex 32)
+#   export GITLAB_TOKEN=$(openssl rand -hex 32)          # a real GitLab project/group token for actual use
+#   export LLAMA_MODEL=qwen2.5-coder
+#   export LLAMA_URL=http://192.168.1.101:8000           # your real llama-server; loopback-default is a dev no-op
+#
+# Then:
+#   docker compose up --build
+#
+# What you get: Postgres (Flyway migration runs automatically inside the Gateway on first connect),
+# the Gateway on http://localhost:8080, a one-shot job that registers a "llama-01" backend row once
+# the Gateway is healthy, and a Worker already paired 1:1 with that backend.
+#
+# The one real gotcha (documented in worker/README.md §6.3 and DEPLOYMENT.md §11.2): the Worker's
+# WorkerProperties refuses a plain-http GATEWAY_URL unless it resolves to an actual loopback address.
+# A compose service-name hostname (http://gateway:8080) does NOT count as loopback. The `worker`
+# service below works around this with `network_mode: "service:gateway"`, which makes it share the
+# Gateway container's network namespace outright -- so http://127.0.0.1:8080 is genuinely loopback
+# from the Worker's point of view, exactly like the manually-verified `--network host` recipe in
+# DEPLOYMENT.md, but without needing host networking. In a real (non-local) deployment, the Gateway
+# sits behind a reverse proxy over HTTPS and none of this applies (DEPLOYMENT.md §11.1).
+
+services:
+  postgres:
+    image: postgres:14-alpine
+    environment:
+      POSTGRES_DB: review_gateway
+      POSTGRES_USER: review_gateway
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U review_gateway"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - airg
+
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: review-gateway:local
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DB_URL: jdbc:postgresql://postgres:5432/review_gateway
+      DB_USER: review_gateway
+      DB_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD}
+      CI_TOKEN: ${CI_TOKEN:?set CI_TOKEN, e.g. openssl rand -hex 32}
+      WORKER_TOKEN: ${WORKER_TOKEN:?set WORKER_TOKEN, e.g. openssl rand -hex 32}
+      ADMIN_TOKEN: ${ADMIN_TOKEN:?set ADMIN_TOKEN, e.g. openssl rand -hex 32}
+      GITLAB_BASE_URL: ${GITLAB_BASE_URL:-https://gitlab.example.com/api/v4}
+      GITLAB_TOKEN: ${GITLAB_TOKEN:?set GITLAB_TOKEN, a GitLab project/group access token}
+      BACKEND_ALLOWED_HOST_PATTERN: ${BACKEND_ALLOWED_HOST_PATTERN:-.*}
+    ports:
+      - "8080:8080"
+    networks:
+      - airg
+    # HEALTHCHECK is baked into the image (curl GET /health); depends_on: condition: service_healthy
+    # elsewhere in this file relies on it.
+
+  backend-seed:
+    # One-shot job: registers the "llama-01" backend row (DEPLOYMENT.md §5 -- there is no REST
+    # endpoint for this, only a direct SQL insert). Runs once the Gateway is healthy, i.e. after
+    # Flyway has already created the `backends` table -- inserting any earlier would fail with
+    # "relation does not exist". Idempotent (ON CONFLICT on the UNIQUE `name` column), safe to
+    # re-run on every `docker compose up`.
+    image: postgres:14-alpine
+    depends_on:
+      gateway:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: ${DB_PASSWORD:?set DB_PASSWORD}
+      LLAMA_URL: ${LLAMA_URL:-http://127.0.0.1:8000}
+      LLAMA_MODEL: ${LLAMA_MODEL:?set LLAMA_MODEL}
+    entrypoint: ["sh", "-c"]
+    command:
+      - >
+        psql -h postgres -U review_gateway -d review_gateway -c
+        "INSERT INTO backends (name, url, model, capacity) VALUES ('llama-01', '$$LLAMA_URL', '$$LLAMA_MODEL', 1)
+         ON CONFLICT (name) DO NOTHING;"
+    networks:
+      - airg
+    restart: "no"
+
+  worker:
+    build:
+      context: ./worker
+      dockerfile: Dockerfile
+    image: llm-worker:local
+    depends_on:
+      backend-seed:
+        condition: service_completed_successfully
+    network_mode: "service:gateway"
+    environment:
+      GATEWAY_URL: http://127.0.0.1:8080
+      GATEWAY_API_KEY: ${WORKER_TOKEN:?set WORKER_TOKEN, must equal the Gateway's value}
+      WORKER_ID: ${WORKER_ID:-worker-local-1}
+      BACKEND_ID: llama-01
+      LLAMA_MODEL: ${LLAMA_MODEL:?set LLAMA_MODEL}
+      LLAMA_URL: ${LLAMA_URL:-http://127.0.0.1:8000}
+      WORKER_ALLOW_INSECURE_GATEWAY: "true"
+    # No `ports:` here -- forbidden alongside network_mode, and the Worker's Actuator
+    # (server.address: 127.0.0.1, hardcoded) is only ever meant to be reached via
+    # `docker compose exec worker curl http://127.0.0.1:8081/actuator/health` anyway.
+
+volumes:
+  postgres-data:
+
+networks:
+  airg:
