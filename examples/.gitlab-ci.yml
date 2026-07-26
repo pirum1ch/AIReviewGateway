@@ -11,6 +11,14 @@
 #                            different secret the Gateway itself uses to call back into GitLab).
 #
 # See the root README.md §7 and DEPLOYMENT.md §7 for the full integration reference this is based on.
+#
+# `review` is a custom stage name, not one of GitLab's built-in defaults (.pre/build/test/deploy/.post)
+# -- it must be declared explicitly, or GitLab rejects the pipeline with "chosen stage does not exist".
+# If you're merging `ai-review` into an existing .gitlab-ci.yml that already declares its own `stages:`,
+# add `review` to that list instead of duplicating the block below.
+
+stages:
+  - review
 
 ai-review:
   stage: review
