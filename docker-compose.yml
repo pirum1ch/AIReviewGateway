@@ -2,6 +2,12 @@
 # (worker/Dockerfile), backed by a real Postgres. This is the containerized equivalent of
 # DEPLOYMENT.md §11.2's verified local smoke test, wired up as a single `docker compose up`.
 #
+# Set up for TWO Workers, each paired 1:1 with its own real llama-server host, per this project's
+# architecture (README §1: "Running N llama-server instances means running N Worker processes,
+# each with its own backend.id/llama.url" -- there is no shared-backend scaling knob, a Worker
+# always talks to exactly one llama-server). Adding a third means copying the `worker2`/backend row
+# pattern below once more (worker3, llama-03, LLAMA_URL_3, WORKER_ID default worker-llama-03, ...).
+#
 # Required secrets (no defaults on purpose -- same fail-fast behavior as the bare-jar deployment,
 # see DEPLOYMENT.md §2 "Token generation"). Export these before running, or put them in a `.env`
 # file next to this one:
@@ -11,24 +17,31 @@
 #   export WORKER_TOKEN=$(openssl rand -hex 32)
 #   export ADMIN_TOKEN=$(openssl rand -hex 32)
 #   export GITLAB_TOKEN=$(openssl rand -hex 32)          # a real GitLab project/group token for actual use
-#   export LLAMA_MODEL=qwen2.5-coder
-#   export LLAMA_URL=http://192.168.1.101:8000           # your real llama-server; loopback-default is a dev no-op
+#   export LLAMA_MODEL=qwen2.5-coder                     # same model on both hosts per this setup
+#   export LLAMA_URL_1=http://192.168.1.101:8000         # first llama-server host
+#   export LLAMA_URL_2=http://192.168.1.102:8000         # second llama-server host
 #
 # Then:
 #   docker compose up --build
 #
 # What you get: Postgres (Flyway migration runs automatically inside the Gateway on first connect),
-# the Gateway on http://localhost:8080, a one-shot job that registers a "llama-01" backend row once
-# the Gateway is healthy, and a Worker already paired 1:1 with that backend.
+# the Gateway on http://localhost:8080, a one-shot job that registers two backend rows ("llama-01"
+# -> LLAMA_URL_1, "llama-02" -> LLAMA_URL_2), and two Workers, each claiming only its own backend's
+# jobs.
 #
-# The one real gotcha (documented in worker/README.md §6.3 and DEPLOYMENT.md §11.2): the Worker's
+# The one real gotcha (documented in worker/README.md §6.3 and DEPLOYMENT.md §11.2): each Worker's
 # WorkerProperties refuses a plain-http GATEWAY_URL unless it resolves to an actual loopback address.
-# A compose service-name hostname (http://gateway:8080) does NOT count as loopback. The `worker`
-# service below works around this with `network_mode: "service:gateway"`, which makes it share the
-# Gateway container's network namespace outright -- so http://127.0.0.1:8080 is genuinely loopback
-# from the Worker's point of view, exactly like the manually-verified `--network host` recipe in
-# DEPLOYMENT.md, but without needing host networking. In a real (non-local) deployment, the Gateway
-# sits behind a reverse proxy over HTTPS and none of this applies (DEPLOYMENT.md §11.1).
+# A compose service-name hostname (http://gateway:8080) does NOT count as loopback. Both `worker1`/
+# `worker2` services below work around this with `network_mode: "service:gateway"`, which makes each
+# one share the Gateway container's network namespace outright -- so http://127.0.0.1:8080 is
+# genuinely loopback from either Worker's point of view, exactly like the manually-verified
+# `--network host` recipe in DEPLOYMENT.md, but without needing host networking. Multiple containers
+# are allowed to share one container's network namespace simultaneously, so both Workers doing this
+# against the same `gateway` container is fine. This only matters for this local/plain-HTTP setup --
+# in a real deployment the Gateway sits behind a reverse proxy over HTTPS and none of this applies
+# (DEPLOYMENT.md §11.1); reaching each Worker's own remote llama-server (LLAMA_URL_1/2, a real LAN
+# host, not loopback) is unaffected either way -- that traffic just goes out through the shared
+# network namespace's normal outbound connectivity.
 
 services:
   postgres:
@@ -73,30 +86,33 @@ services:
     # elsewhere in this file relies on it.
 
   backend-seed:
-    # One-shot job: registers the "llama-01" backend row (DEPLOYMENT.md §5 -- there is no REST
-    # endpoint for this, only a direct SQL insert). Runs once the Gateway is healthy, i.e. after
-    # Flyway has already created the `backends` table -- inserting any earlier would fail with
-    # "relation does not exist". Idempotent (ON CONFLICT on the UNIQUE `name` column), safe to
-    # re-run on every `docker compose up`.
+    # One-shot job: registers both backend rows (DEPLOYMENT.md §5 -- there is no REST endpoint for
+    # this, only a direct SQL insert). Runs once the Gateway is healthy, i.e. after Flyway has
+    # already created the `backends` table -- inserting any earlier would fail with "relation does
+    # not exist". Idempotent (ON CONFLICT on the UNIQUE `name` column), safe to re-run on every
+    # `docker compose up`.
     image: postgres:14-alpine
     depends_on:
       gateway:
         condition: service_healthy
     environment:
       PGPASSWORD: ${DB_PASSWORD:?set DB_PASSWORD}
-      LLAMA_URL: ${LLAMA_URL:-http://127.0.0.1:8000}
+      LLAMA_URL_1: ${LLAMA_URL_1:?set LLAMA_URL_1, e.g. http://192.168.1.101:8000}
+      LLAMA_URL_2: ${LLAMA_URL_2:?set LLAMA_URL_2, e.g. http://192.168.1.102:8000}
       LLAMA_MODEL: ${LLAMA_MODEL:?set LLAMA_MODEL}
     entrypoint: ["sh", "-c"]
     command:
       - >
         psql -h postgres -U review_gateway -d review_gateway -c
-        "INSERT INTO backends (name, url, model, capacity) VALUES ('llama-01', '$$LLAMA_URL', '$$LLAMA_MODEL', 1)
+        "INSERT INTO backends (name, url, model, capacity) VALUES
+         ('llama-01', '$$LLAMA_URL_1', '$$LLAMA_MODEL', 1),
+         ('llama-02', '$$LLAMA_URL_2', '$$LLAMA_MODEL', 1)
          ON CONFLICT (name) DO NOTHING;"
     networks:
       - airg
     restart: "no"
 
-  worker:
+  worker1:
     build:
       context: ./worker
       dockerfile: Dockerfile
@@ -108,14 +124,40 @@ services:
     environment:
       GATEWAY_URL: http://127.0.0.1:8080
       GATEWAY_API_KEY: ${WORKER_TOKEN:?set WORKER_TOKEN, must equal the Gateway's value}
-      WORKER_ID: ${WORKER_ID:-worker-local-1}
+      WORKER_ID: ${WORKER_ID_1:-worker-llama-01}
       BACKEND_ID: llama-01
       LLAMA_MODEL: ${LLAMA_MODEL:?set LLAMA_MODEL}
-      LLAMA_URL: ${LLAMA_URL:-http://127.0.0.1:8000}
+      LLAMA_URL: ${LLAMA_URL_1:?set LLAMA_URL_1, e.g. http://192.168.1.101:8000}
       WORKER_ALLOW_INSECURE_GATEWAY: "true"
+      # Both workers share the Gateway's network namespace (network_mode: service:gateway below),
+      # so their Actuator ports would collide on the default 8081 -- pin distinct ports.
+      WORKER_HTTP_PORT: "8081"
     # No `ports:` here -- forbidden alongside network_mode, and the Worker's Actuator
     # (server.address: 127.0.0.1, hardcoded) is only ever meant to be reached via
-    # `docker compose exec worker curl http://127.0.0.1:8081/actuator/health` anyway.
+    # `docker compose exec worker1 curl http://127.0.0.1:8081/actuator/health` anyway.
+
+  worker2:
+    build:
+      context: ./worker
+      dockerfile: Dockerfile
+    image: llm-worker:local
+    depends_on:
+      backend-seed:
+        condition: service_completed_successfully
+    network_mode: "service:gateway"
+    environment:
+      GATEWAY_URL: http://127.0.0.1:8080
+      GATEWAY_API_KEY: ${WORKER_TOKEN:?set WORKER_TOKEN, must equal the Gateway's value}
+      WORKER_ID: ${WORKER_ID_2:-worker-llama-02}
+      BACKEND_ID: llama-02
+      LLAMA_MODEL: ${LLAMA_MODEL:?set LLAMA_MODEL}
+      LLAMA_URL: ${LLAMA_URL_2:?set LLAMA_URL_2, e.g. http://192.168.1.102:8000}
+      WORKER_ALLOW_INSECURE_GATEWAY: "true"
+      # Must differ from worker1's -- see the comment there; both share one network namespace.
+      WORKER_HTTP_PORT: "8082"
+    # Actuator check: `docker compose exec worker2 curl http://127.0.0.1:8082/actuator/health`.
+    # You can't tell the two Workers apart by connecting from outside either way (no ports are
+    # published) -- use `docker compose logs worker1`/`worker2` or `docker compose exec workerN ...`.
 
 volumes:
   postgres-data:
