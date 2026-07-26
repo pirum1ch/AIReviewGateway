@@ -1,0 +1,84 @@
+# Example GitLab CI pipeline for a project whose merge requests should be reviewed by this
+# Review Gateway. This file goes in the TARGET project being reviewed -- not in this repository --
+# copy it to that project's repo root as `.gitlab-ci.yml` (or merge the `ai-review`/`ai-review-wait`
+# jobs into an existing one).
+#
+# Required CI/CD variables (target project -> Settings -> CI/CD -> Variables, mark Masked + Protected):
+#   REVIEW_GATEWAY_URL       e.g. http://<gateway-host>:8080 (plain HTTP is fine only if the GitLab
+#                            Runner reaches the Gateway over a trusted local network -- otherwise put
+#                            a reverse-proxy HTTPS endpoint in front, see DEPLOYMENT.md §11.1).
+#   REVIEW_GATEWAY_CI_TOKEN  the Gateway's own CI_TOKEN value (NOT GITLAB_TOKEN -- that one is a
+#                            different secret the Gateway itself uses to call back into GitLab).
+#
+# See the root README.md §7 and DEPLOYMENT.md §7 for the full integration reference this is based on.
+
+ai-review:
+  stage: review
+  image: alpine:3.20
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+  before_script:
+    - apk add --no-cache git curl jq
+  script:
+    # Diff between the MR's merge-base and the current head commit.
+    - git diff "$CI_MERGE_REQUEST_DIFF_BASE_SHA" "$CI_COMMIT_SHA" > diff.txt
+
+    # Build the request body with jq (safe JSON string escaping for a multi-line diff).
+    - |
+      jq -n \
+        --argjson projectId "$CI_PROJECT_ID" \
+        --argjson mergeRequestId "$CI_MERGE_REQUEST_IID" \
+        --arg headSha "$CI_COMMIT_SHA" \
+        --arg baseSha "$CI_MERGE_REQUEST_DIFF_BASE_SHA" \
+        --arg promptVersion "v1" \
+        --rawfile diff diff.txt \
+        '{projectId:$projectId, mergeRequestId:$mergeRequestId, headSha:$headSha,
+          baseSha:$baseSha, diff:$diff, promptVersion:$promptVersion, priority:10}' \
+        > request.json
+
+    - |
+      http_code=$(curl -s -o response.json -w "%{http_code}" -X POST "$REVIEW_GATEWAY_URL/reviews" \
+        -H "Authorization: Bearer $REVIEW_GATEWAY_CI_TOKEN" \
+        -H "Content-Type: application/json" \
+        --data @request.json)
+      echo "HTTP $http_code:"; cat response.json
+
+      if [ "$http_code" = "422" ]; then
+        echo "Diff too large for the configured LLM context budget — review not queued."
+        exit 0   # informational only; change to `exit 1` to make an oversized diff a hard pipeline failure
+      elif [ "$http_code" != "200" ] && [ "$http_code" != "201" ]; then
+        echo "Review Gateway returned an unexpected status."
+        exit 1
+      fi
+
+      REVIEW_ID=$(jq -r '.reviewId' response.json)
+      echo "Review $REVIEW_ID queued (or already active for this head_sha)."
+      echo "REVIEW_ID=$REVIEW_ID" >> review.env
+
+  artifacts:
+    reports:
+      dotenv: review.env
+
+# Optional: block the pipeline until the review actually finishes. Without this job, the pipeline
+# does not wait -- POST /reviews returns as soon as the review is queued, and the Gateway publishes
+# comments to the MR on its own schedule (gateway.scheduler.publish-retry-interval, 60s default),
+# independent of this pipeline's lifetime.
+ai-review-wait:
+  stage: .post
+  image: alpine:3.20
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+  needs: ["ai-review"]
+  before_script:
+    - apk add --no-cache curl jq
+  script:
+    - |
+      for i in $(seq 1 30); do
+        status=$(curl -s "$REVIEW_GATEWAY_URL/reviews/$REVIEW_ID" \
+          -H "Authorization: Bearer $REVIEW_GATEWAY_CI_TOKEN" | jq -r '.status')
+        echo "Review $REVIEW_ID status: $status"
+        case "$status" in
+          PUBLISHED|FAILED|CANCELLED|OBSOLETE) break ;;
+        esac
+        sleep 20
+      done

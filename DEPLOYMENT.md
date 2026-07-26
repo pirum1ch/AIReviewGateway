@@ -479,7 +479,10 @@ reused as-is below.)
 ### 7.2 The pipeline job
 
 Taken verbatim from the root README's [§7](README.md#7-gitlab-ci-integration) (already verified against
-`CreateReviewRequest` and GitLab's predefined MR-pipeline variables), pointed at `https://gitlab.local`:
+`CreateReviewRequest` and GitLab's predefined MR-pipeline variables), pointed at `https://gitlab.local`.
+A ready-to-copy version (plus an optional job that blocks the pipeline until the review is actually
+`PUBLISHED`) is at [`examples/.gitlab-ci.yml`](examples/.gitlab-ci.yml) — copy it into the *target*
+project being reviewed, not into this repository:
 
 ```yaml
 ai-review:
@@ -686,6 +689,9 @@ WantedBy=multi-user.target
 ```
 
 ### 10.5 `.gitlab-ci.yml` snippet
+
+Same content as [`examples/.gitlab-ci.yml`](examples/.gitlab-ci.yml) (which also has the optional
+publish-wait job) — copy into the *target* project being reviewed, not into this repository.
 
 ```yaml
 ai-review:

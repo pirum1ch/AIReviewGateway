@@ -496,7 +496,10 @@ A working `.gitlab-ci.yml` job. It uses only fields that exist on `CreateReviewR
 predefined merge-request-pipeline variables (`CI_PROJECT_ID`, `CI_MERGE_REQUEST_IID`, `CI_COMMIT_SHA`,
 `CI_MERGE_REQUEST_DIFF_BASE_SHA`). Configure `REVIEW_GATEWAY_URL` and `REVIEW_GATEWAY_CI_TOKEN` as
 masked/protected CI/CD variables in the GitLab project (or group) settings — `REVIEW_GATEWAY_CI_TOKEN`
-must equal the Gateway's configured `CI_TOKEN`.
+must equal the Gateway's configured `CI_TOKEN`. A ready-to-copy version of this file (plus an optional
+job that blocks the pipeline until the review is actually `PUBLISHED`) is at
+[`examples/.gitlab-ci.yml`](examples/.gitlab-ci.yml) — copy it into the *target* project being
+reviewed, not into this repository.
 
 ```yaml
 ai-review:
