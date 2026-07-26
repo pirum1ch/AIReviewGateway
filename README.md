@@ -104,20 +104,24 @@ resolution — no custom secrets manager).
 ### 4.1 Required secrets (no default — startup fails without them)
 
 `GatewayProperties.validateOnStartup()` (a `@PostConstruct` hook) refuses to let the application start
-if any of the following is missing, blank, or **shorter than 32 characters**, and separately refuses to
-start if the GitLab base URL is not `https://`. The exception message never echoes the actual secret
-value, only the property name and, for the URL check, the scheme.
+if any of the following is missing or blank, and separately refuses to start if the GitLab base URL is
+not `https://`. The three bearer tokens (`CI_TOKEN`/`WORKER_TOKEN`/`ADMIN_TOKEN`) additionally must be
+**at least 32 characters** — `GITLAB_TOKEN` is checked for presence only, not length, since it is issued
+by GitLab itself in a fixed format (a project/group access token is exactly 26 characters, `glpat-` + 20)
+that the operator does not control; applying the same 32-character floor to it would reject every real
+GitLab token. The exception message never echoes the actual secret value, only the property name and,
+for the URL check, the scheme.
 
 | Environment variable | Bound property | Purpose |
 |---|---|---|
-| `CI_TOKEN` | `gateway.security.ci-token` | Bearer token for GitLab-CI-facing endpoints (`POST /reviews`, `GET /reviews/{id}`). |
-| `WORKER_TOKEN` | `gateway.security.worker-token` | Bearer token for Worker-facing endpoints (`POST /jobs/**`). |
-| `ADMIN_TOKEN` | `gateway.security.admin-token` | Bearer token for admin endpoints (`DELETE /reviews/{id}`, `GET /backends`, `GET /metrics`). |
-| `GITLAB_TOKEN` | `gateway.gitlab.token` | Token the Gateway itself uses to call the GitLab API when publishing comments (`PRIVATE-TOKEN` header). Never exposed to CI or Workers. |
+| `CI_TOKEN` | `gateway.security.ci-token` | Bearer token for GitLab-CI-facing endpoints (`POST /reviews`, `GET /reviews/{id}`). **≥32 chars.** |
+| `WORKER_TOKEN` | `gateway.security.worker-token` | Bearer token for Worker-facing endpoints (`POST /jobs/**`). **≥32 chars.** |
+| `ADMIN_TOKEN` | `gateway.security.admin-token` | Bearer token for admin endpoints (`DELETE /reviews/{id}`, `GET /backends`, `GET /metrics`). **≥32 chars.** |
+| `GITLAB_TOKEN` | `gateway.gitlab.token` | Token the Gateway itself uses to call the GitLab API when publishing comments (`PRIVATE-TOKEN` header). Never exposed to CI or Workers. **Presence-only check — a real `glpat-...` token (26 chars) is expected and accepted.** |
 | `DB_USER` | `spring.datasource.username` | PostgreSQL username. No default. |
 | `DB_PASSWORD` | `spring.datasource.password` | PostgreSQL password. No default. |
 
-All four bearer/API tokens should be random, high-entropy values (e.g. `openssl rand -hex 32`). The
+The three bearer/API tokens above should be random, high-entropy values (e.g. `openssl rand -hex 32`). The
 threat model recommends a least-privilege, expiring GitLab **project or group access token** scoped
 only to the projects under review for `GITLAB_TOKEN` — this is an operational choice made when the
 token is issued in GitLab, not something the application enforces.

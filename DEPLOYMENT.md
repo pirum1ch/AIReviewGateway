@@ -127,8 +127,9 @@ runbook uses `http://192.168.1.101:8000` throughout to match the Worker's own do
 
 ### Token generation
 
-The Gateway requires **four** secrets, each independently checked by `GatewayProperties.validateOnStartup()`
-to be **at least 32 characters** (startup fails otherwise, matching the code's own `MIN_SECRET_LENGTH = 32`):
+The Gateway requires **four** secrets, checked by `GatewayProperties.validateOnStartup()`. Three of them
+(`CI_TOKEN`/`WORKER_TOKEN`/`ADMIN_TOKEN`) are self-issued bearer tokens and must independently be **at
+least 32 characters** (startup fails otherwise, matching the code's own `MIN_SECRET_LENGTH = 32`):
 
 ```bash
 export CI_TOKEN=$(openssl rand -hex 32)
@@ -140,10 +141,12 @@ The fourth, `GITLAB_TOKEN`, is **not generated locally** — it is a GitLab proj
 you create in GitLab itself (`https://gitlab.local` → project/group → **Settings → Access Tokens**),
 scoped to the `api` scope (needed to call the Discussions API the Gateway uses —
 `GitLabClientImpl.postDiscussion`) with at least the **Developer** role on the projects under review (the
-minimum GitLab role that can create MR discussions). The root README's own recommendation (from the
-threat model) is to make this token **project- or group-scoped and expiring**, not a full personal access
-token — this is an operational choice made when the token is issued in GitLab, not something the
-application enforces.
+minimum GitLab role that can create MR discussions). Unlike the three tokens above, `GITLAB_TOKEN` is only
+checked for presence, not length: a real GitLab project/group access token is a fixed 26 characters
+(`glpat-` + 20), below the 32-character floor, so the Gateway does not — and cannot — apply the same check
+to it. The root README's own recommendation (from the threat model) is to make this token **project- or
+group-scoped and expiring**, not a full personal access token — this is an operational choice made when
+the token is issued in GitLab, not something the application enforces.
 
 **How the Worker gets the `WORKER_TOKEN` value.** There is no token-exchange mechanism — the Worker's own
 `GATEWAY_API_KEY` environment variable must simply be set to the **exact same value** as the Gateway's
@@ -241,8 +244,9 @@ GITLAB_TOKEN=<GitLab project/group access token, api scope>
 BACKEND_ALLOWED_HOST_PATTERN=^192\.168\.1\.101$
 ```
 
-`GatewayProperties.validateOnStartup()` will refuse to start if any of the four secrets above is missing
-or under 32 characters, or if `GITLAB_BASE_URL` doesn't start with `https://`.
+`GatewayProperties.validateOnStartup()` will refuse to start if any of the four secrets above is missing,
+if `CI_TOKEN`/`WORKER_TOKEN`/`ADMIN_TOKEN` is under 32 characters, or if `GITLAB_BASE_URL` doesn't start
+with `https://`. `GITLAB_TOKEN` itself is not length-checked — see [§2, Token generation](#2-prerequisites).
 
 ### 4.2 systemd unit
 

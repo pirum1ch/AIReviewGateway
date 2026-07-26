@@ -60,13 +60,34 @@ class GatewayPropertiesValidationTest {
     }
 
     @Test
-    void shortGitlabTokenFailsStartup() {
+    void blankGitlabTokenFailsStartup() {
         GatewayProperties properties = validProperties();
-        properties.getGitlab().setToken("short");
+        properties.getGitlab().setToken("");
 
         assertThatThrownBy(properties::validateOnStartup)
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("gitlab.token");
+    }
+
+    @Test
+    void nullGitlabTokenFailsStartup() {
+        GatewayProperties properties = validProperties();
+        properties.getGitlab().setToken(null);
+
+        assertThatThrownBy(properties::validateOnStartup)
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("gitlab.token");
+    }
+
+    @Test
+    void realisticLengthGitlabTokenPassesValidation() {
+        // A real GitLab project/group access token is exactly 26 characters (glpat- + 20) --
+        // shorter than MIN_SECRET_LENGTH (32), and unlike the three bearer tokens above, gitlab.token
+        // must accept this: its format/entropy is GitLab's to guarantee, not the operator's to weaken.
+        GatewayProperties properties = validProperties();
+        properties.getGitlab().setToken("glpat-xxxxxxxxxxxxxxxxxxxx");
+
+        assertThatCode(() -> properties.validateOnStartup()).doesNotThrowAnyException();
     }
 
     @Test

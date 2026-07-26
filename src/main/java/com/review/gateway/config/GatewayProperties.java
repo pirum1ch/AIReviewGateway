@@ -15,10 +15,14 @@ import java.time.Duration;
  * on a separate {@code @Configuration} class) so it is available for constructor injection into
  * services immediately.
  *
- * <p>{@link #validateOnStartup()} enforces SR-01 (the four secrets — CI/Worker/Admin bearer tokens
- * and the GitLab API token — must be present and at least 32 characters; a leaked/misconfigured short
- * token fails the Gateway's startup rather than silently authenticating with a guessable value) and
- * SR-15 (the GitLab base URL must be {@code https}). It runs via {@code @PostConstruct}, so it only
+ * <p>{@link #validateOnStartup()} enforces SR-01: the three self-issued bearer tokens (CI/Worker/
+ * Admin) must be present and at least 32 characters — a leaked/misconfigured short token fails the
+ * Gateway's startup rather than silently authenticating with a guessable value. {@code
+ * gateway.gitlab.token} is checked for presence only (no length floor): unlike the three tokens
+ * above, it is issued by GitLab itself in a fixed format the operator does not control — a GitLab
+ * project/group access token is exactly 26 characters ({@code glpat-} + 20), so applying the same
+ * 32-character floor would reject every real GitLab token unconditionally. Also enforces SR-15 (the
+ * GitLab base URL must be {@code https}). It runs via {@code @PostConstruct}, so it only
  * fires when this class is instantiated as a real Spring bean (production, {@code @SpringBootTest});
  * plain unit tests that do {@code new GatewayProperties()} never trigger it.
  */
@@ -79,7 +83,7 @@ public class GatewayProperties {
         requireSecret("gateway.security.ci-token", security.getCiToken());
         requireSecret("gateway.security.worker-token", security.getWorkerToken());
         requireSecret("gateway.security.admin-token", security.getAdminToken());
-        requireSecret("gateway.gitlab.token", gitlab.getToken());
+        requireGitLabToken("gateway.gitlab.token", gitlab.getToken());
 
         if (gitlab.getBaseUrl() == null || !gitlab.getBaseUrl().startsWith("https://")) {
             throw new IllegalStateException(
@@ -94,6 +98,18 @@ public class GatewayProperties {
         if (value.length() < MIN_SECRET_LENGTH) {
             throw new IllegalStateException(
                     propertyName + " must be at least " + MIN_SECRET_LENGTH + " characters (SR-01) — refusing to start");
+        }
+    }
+
+    /**
+     * gateway.gitlab.token is GitLab's own, not something an operator picks the entropy of the way
+     * they do the three bearer tokens above — a real project/group access token is a fixed 26
+     * characters ({@code glpat-} + 20), so only presence is checked here (SR-01's "missing/blank"
+     * half), not length.
+     */
+    private void requireGitLabToken(String propertyName, String value) {
+        if (value == null || value.isBlank()) {
+            throw new IllegalStateException(propertyName + " must be set (SR-01) — refusing to start");
         }
     }
 
