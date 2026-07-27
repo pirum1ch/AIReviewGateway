@@ -80,6 +80,18 @@ services:
       BACKEND_ALLOWED_HOST_PATTERN: ${BACKEND_ALLOWED_HOST_PATTERN:-.*}
     ports:
       - "8080:8080"
+    # GITLAB_BASE_URL uses the gitlab.local hostname (its self-signed cert's SAN is issued for
+    # that name, not for a bare IP -- TLS hostname verification would fail otherwise). gitlab.local
+    # is a .local/mDNS name that this container can't resolve on its own (no Avahi/nss-mdns in the
+    # minimal JRE image), so pin it to the real GitLab host statically instead.
+    extra_hosts:
+      - "gitlab.local:192.168.1.101"
+    # Overrides the JRE's default truststore with a copy that additionally trusts the mkcert-issued
+    # cert GitLab's nginx presents for gitlab.local -- that cert is signed by a local-only mkcert CA
+    # the JRE has no reason to trust otherwise. Regenerate certs/cacerts (see README/DEPLOYMENT.md)
+    # if that cert is ever rotated.
+    volumes:
+      - ./certs/cacerts:/opt/java/openjdk/lib/security/cacerts:ro
     networks:
       - airg
     # HEALTHCHECK is baked into the image (curl GET /health); depends_on: condition: service_healthy
