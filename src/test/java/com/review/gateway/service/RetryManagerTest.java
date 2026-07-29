@@ -146,4 +146,48 @@ class RetryManagerTest extends AbstractPostgresIntegrationTest {
         // Must not throw for a job id that doesn't exist.
         retryManager.requeueOrFail(999_999L, "heartbeat timeout");
     }
+
+    /**
+     * Sibling cancellation on chunk-job permanent failure (§4): once one chunk job exhausts its
+     * retries and lands FAILED, the parent Review transitions to FAILED and every other non-terminal
+     * sibling job (QUEUED or RUNNING) is cancelled in the same transaction (parent-then-child, CSR-17).
+     */
+    @Test
+    void permanentJobFailureCascadesToFailTheReviewAndCancelNonTerminalSiblings() {
+        Review review = persistRunningReview("sha-sibling-cancel");
+        Backend backend = backendRepository.saveAndFlush(
+                new Backend("backend-sibling-" + review.getId(), "https://backend-sibling.local", "model", 1));
+
+        ReviewJob failingJob = new ReviewJob(review.getId(), null, 0, 10, "worker-a", backend.getId());
+        failingJob.setStatus(JobStatus.RUNNING);
+        failingJob.setAttempts(3); // exhausted
+        failingJob = reviewJobRepository.saveAndFlush(failingJob);
+
+        ReviewJob runningSibling = new ReviewJob(review.getId(), null, 1, 10, "worker-b", backend.getId());
+        runningSibling.setStatus(JobStatus.RUNNING);
+        runningSibling = reviewJobRepository.saveAndFlush(runningSibling);
+
+        ReviewJob queuedSibling = new ReviewJob(review.getId(), null, 2, 10, null, null);
+        queuedSibling = reviewJobRepository.saveAndFlush(queuedSibling);
+
+        RetryManager retryManager = newRetryManager(3);
+        retryManager.requeueOrFail(failingJob.getId(), "llama error");
+
+        ReviewJob reloadedFailing = reviewJobRepository.findById(failingJob.getId()).orElseThrow();
+        assertThat(reloadedFailing.getStatus()).isEqualTo(JobStatus.FAILED);
+
+        ReviewJob reloadedRunningSibling = reviewJobRepository.findById(runningSibling.getId()).orElseThrow();
+        assertThat(reloadedRunningSibling.getStatus()).isEqualTo(JobStatus.CANCELLED);
+
+        ReviewJob reloadedQueuedSibling = reviewJobRepository.findById(queuedSibling.getId()).orElseThrow();
+        assertThat(reloadedQueuedSibling.getStatus()).isEqualTo(JobStatus.CANCELLED);
+
+        Review reloadedReview = reviewRepository.findById(review.getId()).orElseThrow();
+        assertThat(reloadedReview.getStatus()).isEqualTo(ReviewStatus.FAILED);
+
+        List<com.review.gateway.model.ReviewEvent> events =
+                reviewEventRepository.findByReviewIdOrderByCreatedAtAsc(review.getId());
+        long cancelledEventCount = events.stream().filter(e -> e.getEventType() == EventType.CANCELLED).count();
+        assertThat(cancelledEventCount).isEqualTo(2);
+    }
 }
