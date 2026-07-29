@@ -77,7 +77,7 @@ class LockTimeoutMappingTest {
             Future<?> lockHolder = executor.submit(() -> {
                 TransactionTemplate lockHoldingTransaction = new TransactionTemplate(transactionManager);
                 lockHoldingTransaction.executeWithoutResult(status -> {
-                    reviewRepository.findByIdForUpdate(reviewId).orElseThrow();
+                    reviewRepository.findByIdForNoKeyUpdate(reviewId).orElseThrow();
                     lockAcquired.countDown();
                     try {
                         // Longer than the 3s CSR-19 lock_timeout the DELETE call below is subject to.

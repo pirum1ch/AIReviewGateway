@@ -222,4 +222,45 @@ class DiffChunkerTest {
                 .isInstanceOf(DiffTooLargeException.class)
                 .hasMessageContaining("Huge.java");
     }
+
+    /**
+     * F-DC-01 (High, appsec-reproduced) regression test: {@code splitOversizedSection}'s header replay
+     * means one file whose header is just under the per-chunk budget, followed by thousands of tiny
+     * hunks, used to produce one full-budget-sized piece PER HUNK -- and the {@code maxChunks} cap was
+     * only checked once, after {@code binPack} had already materialized the entire list. Appsec measured
+     * ~2 GB / an {@code OutOfMemoryError} in ~2 seconds from a single ~190 KB request. This test
+     * reproduces the same shape (header one char under budget, a hunk count far beyond {@code
+     * maxChunks}) and asserts the fix: {@code DiffTooLargeException} is thrown almost immediately, well
+     * before anywhere near all the hunks are processed -- proven by an explicit wall-clock bound, which
+     * would fail (time out) under the old, unbounded-materialization behavior.
+     */
+    @Test
+    void headerReplayAmplificationIsBoundedByMaxChunksNotByHunkCount() {
+        int maxChunks = 5;
+        String header = "diff --git a/Big.java b/Big.java\nindex 111..222 100644\n--- a/Big.java\n+++ b/Big.java\n";
+        int perChunkBudgetChars = header.length() + 50; // header consumes almost the whole per-chunk budget
+        GatewayProperties properties = propertiesWithBudget(perChunkBudgetChars, 0, maxChunks);
+        DiffChunker chunker = newChunker(properties);
+
+        // Enough tiny hunks that, absent the fix, would require far more than maxChunks full-budget
+        // pieces (each replaying the ~90-char header) -- old code would materialize all of them before
+        // ever checking the cap. New code must throw after producing at most `maxChunks` pieces.
+        int hunkCount = 200_000;
+        StringBuilder diff = new StringBuilder(header);
+        for (int i = 0; i < hunkCount; i++) {
+            diff.append("@@ -1,1 +1,1 @@\n+x\n");
+        }
+
+        long start = System.nanoTime();
+        assertThatThrownBy(() -> chunker.split(diff.toString()))
+                .isInstanceOf(DiffTooLargeException.class)
+                .hasMessageContaining("max-chunks");
+        long elapsedMs = (System.nanoTime() - start) / 1_000_000;
+
+        // Processing all 200,000 hunks (as the pre-fix code would, to build 200,000 header-replayed
+        // pieces) takes multiple seconds and gigabytes; aborting after ~maxChunks pieces is near-instant.
+        assertThat(elapsedMs)
+                .as("must abort as soon as the maxChunks bound is exceeded, not after processing every hunk")
+                .isLessThan(2000L);
+    }
 }

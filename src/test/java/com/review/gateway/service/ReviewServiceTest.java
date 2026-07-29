@@ -134,6 +134,9 @@ class ReviewServiceTest {
         when(reviewRepository.findByProjectIdAndMergeRequestIdAndHeadShaNotAndStatusInOrderByIdAsc(
                 eq(1L), eq(2L), eq("sha-new"), eq(DeduplicationService.OBSOLETABLE_STATUSES)))
                 .thenReturn(List.of(stale));
+        // F-DC-03: sweepObsolete now locks each candidate individually (FOR NO KEY UPDATE) after the
+        // unlocked candidate read above, re-checking it's still obsoletable before acting on it.
+        when(reviewRepository.findByIdForNoKeyUpdate(100L)).thenReturn(Optional.of(stale));
         when(deduplicationService.findActiveReview(1L, 2L, "sha-new")).thenReturn(Optional.empty());
         when(reviewRepository.saveAndFlush(any(Review.class)))
                 .thenAnswer(inv -> ReviewTestSupport.withId(inv.getArgument(0), 200L));
@@ -202,7 +205,7 @@ class ReviewServiceTest {
     void cancelTransitionsACancellableReview() {
         Review review = new Review(1L, 2L, "sha-1", "base-sha", "v1", 10);
         review.setStatus(ReviewStatus.QUEUED);
-        when(reviewRepository.findByIdForUpdate(any())).thenReturn(Optional.of(review));
+        when(reviewRepository.findByIdForNoKeyUpdate(any())).thenReturn(Optional.of(review));
         when(reviewCommentRepository.countByReviewId(any())).thenReturn(0L);
 
         reviewService.cancel(1L);

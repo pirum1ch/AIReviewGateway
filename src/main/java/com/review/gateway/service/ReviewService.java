@@ -40,11 +40,14 @@ import java.util.stream.Collectors;
  * see the class-level javadoc history for the rationale, unchanged by V2.
  *
  * <p><b>CSR-17 (lock ordering):</b> {@link #cancel} and {@link #sweepObsolete} both lock the
- * <em>parent</em> {@code reviews} row first (or, for the multi-row sweep, are returned already locked
- * by the repository query, in a deterministic {@code ORDER BY id} — CSR-18), then cascade the same
- * transition to every non-terminal child {@code review_jobs} row. This is the parent-then-child-only
- * propagation direction the fix requires; no code path here waits on a job-row lock while still
- * holding the parent lock.
+ * <em>parent</em> {@code reviews} row first (individually, in a deterministic {@code ORDER BY id} for
+ * the multi-row sweep — CSR-18), then cascade the same transition to every non-terminal child
+ * {@code review_jobs} row. This is the parent-then-child-only propagation direction the fix requires;
+ * no code path here waits on a job-row lock while still holding the parent lock. <b>F-DC-03:</b> the
+ * parent lock itself is {@code FOR NO KEY UPDATE}, not {@code FOR UPDATE} — see
+ * {@link com.review.gateway.repository.ReviewRepository#findByIdForNoKeyUpdate} for why a plain
+ * {@code FOR UPDATE} here reintroduced a real deadlock via PostgreSQL's FK referential-integrity
+ * trigger.
  */
 @Service
 public class ReviewService {
@@ -179,15 +182,17 @@ public class ReviewService {
     /**
      * Admin cancel (req. 1.4, architecture §4 rows 13-16). Idempotent in spirit: cancelling an
      * already-terminal Review is rejected as an illegal transition rather than silently succeeding.
-     * CSR-17: locks the parent row first, then cascades {@code CANCELLED} to every non-terminal child
-     * job (parent-then-child). CSR-19: bounded {@code lock_timeout} so a contended row can never pin a
-     * Hikari connection indefinitely; a timeout surfaces as a clean {@code 409 LOCK_TIMEOUT} via
-     * {@code GlobalExceptionHandler}, not a raw {@code 500} or an indefinite hang.
+     * CSR-17: locks the parent row first (F-DC-03: {@code FOR NO KEY UPDATE}, not {@code FOR UPDATE} —
+     * see {@link ReviewRepository#findByIdForNoKeyUpdate} for why), then cascades {@code CANCELLED} to
+     * every non-terminal child job (parent-then-child). CSR-19: bounded {@code lock_timeout} so a
+     * contended row can never pin a Hikari connection indefinitely; a timeout surfaces as a clean
+     * {@code 409 LOCK_TIMEOUT} via {@code GlobalExceptionHandler}, not a raw {@code 500} or an
+     * indefinite hang.
      */
     @Transactional
     public ReviewStatusView cancel(Long reviewId) {
         applyLockTimeout();
-        Review review = reviewRepository.findByIdForUpdate(reviewId).orElseThrow(() -> new ReviewNotFoundException(reviewId));
+        Review review = reviewRepository.findByIdForNoKeyUpdate(reviewId).orElseThrow(() -> new ReviewNotFoundException(reviewId));
         if (!CANCELLABLE_STATUSES.contains(review.getStatus())) {
             throw new InvalidStateTransitionException(review.getStatus(), ReviewStatus.CANCELLED);
         }
@@ -202,21 +207,33 @@ public class ReviewService {
     /**
      * Marks every non-terminal, non-PUBLISHED Review of this MR that has a different head_sha as
      * OBSOLETE, each through {@link StateMachine} (req. 1.5/1.11), cascading to every non-terminal
-     * child job (CSR-17, parent-then-child). CSR-18: the repository query already locks each candidate
-     * row (in a deterministic {@code ORDER BY id}) before this loop runs.
+     * child job (CSR-17, parent-then-child).
      *
-     * <p>Runs inside {@link #requiresNewTransactionTemplate}: {@code @Lock}-annotated Spring Data query
-     * methods require an already-active transaction to issue {@code SELECT ... FOR UPDATE} (Spring Data
-     * does not implicitly wrap locking finder methods the way it does plain reads), and this method is
-     * called from {@link #createReview}, which is deliberately plain/non-{@code @Transactional} (see
-     * class javadoc).
+     * <p><b>F-DC-03 fix:</b> the candidate query itself is now a plain, unlocked read (see
+     * {@link ReviewRepository#findByProjectIdAndMergeRequestIdAndHeadShaNotAndStatusInOrderByIdAsc}'s
+     * javadoc for why {@code FOR UPDATE} there was unsafe); this method locks each candidate row
+     * individually, one at a time, in that same {@code ORDER BY id} order (CSR-18 determinism
+     * preserved), via {@link ReviewRepository#findByIdForNoKeyUpdate} ({@code FOR NO KEY UPDATE}, which
+     * does not conflict with the child-row-insert FK trigger's {@code FOR KEY SHARE}). Each row's status
+     * is re-checked against {@code OBSOLETABLE_STATUSES} immediately after it is locked, since it may
+     * have changed between the unlocked candidate read and this row actually being locked.
+     *
+     * <p>Runs inside {@link #requiresNewTransactionTemplate}: this method is called from
+     * {@link #createReview}, which is deliberately plain/non-{@code @Transactional} (see class javadoc).
      */
     private void sweepObsolete(Long projectId, Long mergeRequestId, String newHeadSha) {
         requiresNewTransactionTemplate.executeWithoutResult(status -> {
             applyLockTimeout();
-            List<Review> toObsolete = reviewRepository.findByProjectIdAndMergeRequestIdAndHeadShaNotAndStatusInOrderByIdAsc(
+            List<Review> candidates = reviewRepository.findByProjectIdAndMergeRequestIdAndHeadShaNotAndStatusInOrderByIdAsc(
                     projectId, mergeRequestId, newHeadSha, DeduplicationService.OBSOLETABLE_STATUSES);
-            for (Review review : toObsolete) {
+            for (Review candidate : candidates) {
+                Review review = reviewRepository.findByIdForNoKeyUpdate(candidate.getId()).orElse(null);
+                if (review == null || !DeduplicationService.OBSOLETABLE_STATUSES.contains(review.getStatus())) {
+                    // Already moved on (e.g. completed/published) between the unlocked read above and
+                    // this row actually being locked -- safe to skip, matches the idempotent-sweep
+                    // contract.
+                    continue;
+                }
                 stateMachine.transition(review, ReviewStatus.OBSOLETE, EventType.OBSOLETE,
                         "superseded by new head_sha for mr=" + mergeRequestId);
                 reviewRepository.save(review);

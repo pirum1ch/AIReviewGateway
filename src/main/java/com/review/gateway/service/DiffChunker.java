@@ -68,14 +68,9 @@ public class DiffChunker {
         int headerReserveTokens = Math.max(0, properties.getDiff().getChunkHeaderReserveTokens());
         int perChunkBudgetTokens = Math.max(1, wholeBudgetTokens - headerReserveTokens);
         int perChunkBudgetChars = perChunkBudgetTokens * charsPerToken;
-
-        List<DiffChunk> chunks = binPack(parsed.sections(), parsed.pathsTrusted(), perChunkBudgetChars);
-
         int maxChunks = Math.max(1, properties.getDiff().getMaxChunks());
-        if (chunks.size() > maxChunks) {
-            throw new DiffTooLargeException("Diff requires " + chunks.size() + " chunks, exceeding gateway.diff.max-chunks="
-                    + maxChunks);
-        }
+
+        List<DiffChunk> chunks = binPack(parsed.sections(), parsed.pathsTrusted(), perChunkBudgetChars, maxChunks);
 
         int total = chunks.stream().mapToInt(DiffChunk::estimatedTokens).sum();
         return new ChunkPlan(chunks, total);
@@ -83,7 +78,19 @@ public class DiffChunker {
 
     // ---- bin-packing (next-fit, original file order preserved) ----
 
-    private List<DiffChunk> binPack(List<Section> sections, boolean pathsTrusted, int perChunkBudgetChars) {
+    /**
+     * F-DC-01 fix: {@code maxChunks} is enforced <em>inside</em> this method, immediately at every point
+     * a {@link DiffChunk} is about to be added to {@code result} — never after the fact. Previously the
+     * {@code chunks.size() > maxChunks} check ran only once, after {@code binPack} had already returned
+     * a fully-materialized list; combined with {@link #splitOversizedSection}'s header-replay (which
+     * repeats a file's header on every emitted piece), a crafted input just under the token ceiling
+     * (CSR-01) but shaped as "one header, thousands of tiny hunks" could balloon into tens of thousands
+     * of full-budget-sized pieces — reproduced as a ~2 GB allocation / {@code OutOfMemoryError} in
+     * ~2 seconds on a 512 MB heap. Checking the running count on every single emission bounds peak
+     * allocation to at most {@code maxChunks} materialized pieces (worst case, a few hundred KB) plus
+     * the one in-flight piece being built when the limit is hit.
+     */
+    private List<DiffChunk> binPack(List<Section> sections, boolean pathsTrusted, int perChunkBudgetChars, int maxChunks) {
         List<DiffChunk> result = new ArrayList<>();
         StringBuilder currentText = new StringBuilder();
         Set<String> currentPaths = new LinkedHashSet<>();
@@ -96,21 +103,17 @@ public class DiffChunker {
 
             if (sectionChars > perChunkBudgetChars) {
                 if (currentChars > 0) {
-                    result.add(flush(chunkIndex, currentText, currentPaths));
+                    emitChunk(result, chunkIndex, maxChunks, currentText.toString(), currentPaths);
                     currentText = new StringBuilder();
                     currentPaths = new LinkedHashSet<>();
                     currentChars = 0;
                 }
-                for (String piece : splitOversizedSection(section, perChunkBudgetChars)) {
-                    result.add(new DiffChunk(chunkIndex[0]++, piece,
-                            diffSizeValidator.estimateTokens(piece),
-                            pathsTrusted ? List.copyOf(section.filePaths()) : List.of()));
-                }
+                splitOversizedSection(section, perChunkBudgetChars, maxChunks, pathsTrusted, result, chunkIndex);
                 continue;
             }
 
             if (currentChars > 0 && currentChars + sectionChars > perChunkBudgetChars) {
-                result.add(flush(chunkIndex, currentText, currentPaths));
+                emitChunk(result, chunkIndex, maxChunks, currentText.toString(), currentPaths);
                 currentText = new StringBuilder();
                 currentPaths = new LinkedHashSet<>();
                 currentChars = 0;
@@ -123,27 +126,47 @@ public class DiffChunker {
             }
         }
         if (currentChars > 0) {
-            result.add(flush(chunkIndex, currentText, currentPaths));
+            emitChunk(result, chunkIndex, maxChunks, currentText.toString(), currentPaths);
         }
         return result;
     }
 
-    private DiffChunk flush(int[] chunkIndex, StringBuilder text, Set<String> paths) {
-        String diffText = text.toString();
-        return new DiffChunk(chunkIndex[0]++, diffText, diffSizeValidator.estimateTokens(diffText), List.copyOf(paths));
+    /**
+     * Appends one materialized {@link DiffChunk} to {@code result}, after checking the {@code
+     * maxChunks} bound — this is the single choke point every emission path (normal packing and
+     * oversized-section splitting alike) goes through, which is what makes the F-DC-01 fix comprehensive
+     * rather than path-specific.
+     *
+     * @throws DiffTooLargeException as soon as one more chunk would exceed {@code maxChunks}, before any
+     *                                 further piece is built
+     */
+    private void emitChunk(List<DiffChunk> result, int[] chunkIndex, int maxChunks, String text, Set<String> paths) {
+        if (result.size() >= maxChunks) {
+            throw new DiffTooLargeException("Diff requires more than " + maxChunks
+                    + " chunks, exceeding gateway.diff.max-chunks=" + maxChunks);
+        }
+        result.add(new DiffChunk(chunkIndex[0]++, text, diffSizeValidator.estimateTokens(text), List.copyOf(paths)));
     }
 
     /**
      * Splits one oversized file section at {@code @@} hunk boundaries only (never inside a hunk),
      * replaying the section's header (everything up to the first hunk) at the top of each piece so
-     * every piece is a self-describing, valid-shaped unified diff.
+     * every piece is a self-describing, valid-shaped unified diff. Each piece is emitted via
+     * {@link #emitChunk} as soon as it is complete, so the {@code maxChunks} bound is enforced
+     * incrementally (F-DC-01) — this method never materializes more than one piece's worth of
+     * header-replayed text ahead of the bound check.
      *
      * @throws DiffTooLargeException naming the file if even one hunk plus the replayed header exceeds
-     *                                the per-chunk budget
+     *                                the per-chunk budget, or as soon as {@code maxChunks} would be
+     *                                exceeded by this section's own pieces
      */
-    private List<String> splitOversizedSection(Section section, int perChunkBudgetChars) {
+    private void splitOversizedSection(Section section, int perChunkBudgetChars, int maxChunks, boolean pathsTrusted,
+                                        List<DiffChunk> result, int[] chunkIndex) {
         String header = section.headerText();
         List<String> hunks = section.hunkTexts();
+        List<String> filePaths = pathsTrusted ? section.filePaths() : List.of();
+        Set<String> filePathSet = new LinkedHashSet<>(filePaths);
+
         if (hunks.isEmpty()) {
             // No hunk markers at all (e.g. a pure rename/mode-change with no content, or a single
             // indivisible blob with no recognizable diff structure at all) -- nothing to split on. If it
@@ -155,10 +178,10 @@ public class DiffChunker {
                         + "and its content alone exceeds the per-chunk budget (size=" + whole.length()
                         + " chars, budget=" + perChunkBudgetChars + " chars)");
             }
-            return List.of(whole);
+            emitChunk(result, chunkIndex, maxChunks, whole, filePathSet);
+            return;
         }
 
-        List<String> pieces = new ArrayList<>();
         StringBuilder current = new StringBuilder(header);
         boolean currentHasHunk = false;
 
@@ -169,7 +192,10 @@ public class DiffChunker {
                         + " chars, budget=" + perChunkBudgetChars + " chars)");
             }
             if (currentHasHunk && current.length() + hunk.length() > perChunkBudgetChars) {
-                pieces.add(current.toString());
+                // Bound check happens HERE, per piece, before building the next header-replayed buffer --
+                // the crafted-input amplification (thousands of tiny hunks) throws after at most
+                // maxChunks pieces from this section alone, never materializing a 25,984-piece list.
+                emitChunk(result, chunkIndex, maxChunks, current.toString(), filePathSet);
                 current = new StringBuilder(header);
                 currentHasHunk = false;
             }
@@ -177,9 +203,8 @@ public class DiffChunker {
             currentHasHunk = true;
         }
         if (currentHasHunk) {
-            pieces.add(current.toString());
+            emitChunk(result, chunkIndex, maxChunks, current.toString(), filePathSet);
         }
-        return pieces;
     }
 
     // ---- section parsing (line-scan only) ----

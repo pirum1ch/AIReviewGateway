@@ -89,7 +89,7 @@ class ReviewServiceAdditionalTest {
     void cancelOnATerminalReviewIsRejectedWithoutMutatingStateOrEmittingAnEvent(ReviewStatus terminalStatus) {
         Review review = new Review(1L, 2L, "sha-1", "base-sha", "v1", 10);
         review.setStatus(terminalStatus);
-        when(reviewRepository.findByIdForUpdate(5L)).thenReturn(Optional.of(review));
+        when(reviewRepository.findByIdForNoKeyUpdate(5L)).thenReturn(Optional.of(review));
 
         assertThatThrownBy(() -> reviewService.cancel(5L))
                 .isInstanceOf(InvalidStateTransitionException.class);
@@ -104,7 +104,7 @@ class ReviewServiceAdditionalTest {
     void cancelOnANonTerminalReviewIsAccepted(ReviewStatus cancellableStatus) {
         Review review = new Review(1L, 2L, "sha-1", "base-sha", "v1", 10);
         review.setStatus(cancellableStatus);
-        when(reviewRepository.findByIdForUpdate(6L)).thenReturn(Optional.of(review));
+        when(reviewRepository.findByIdForNoKeyUpdate(6L)).thenReturn(Optional.of(review));
         when(reviewCommentRepository.countByReviewId(6L)).thenReturn(0L);
 
         reviewService.cancel(6L);

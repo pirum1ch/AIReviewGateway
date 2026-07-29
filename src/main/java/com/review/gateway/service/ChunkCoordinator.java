@@ -33,12 +33,22 @@ import java.util.Set;
  * the full rationale).
  *
  * <p><b>CSR-17 (lock ordering):</b> every method here locks the <em>parent</em> {@code reviews} row
- * first (via {@link ReviewRepository#findByIdForUpdate}), in its own {@code REQUIRES_NEW} transaction,
- * and is always called <em>after</em> whatever child-job transaction triggered it has already
- * committed (releasing the job-row lock) — never nested inside a job-row lock. This is the "parent →
- * child, independently" direction the fix requires: no code path here waits on a job-row lock while
- * still holding the parent lock in reverse of some other path's ordering, because nothing here is ever
- * invoked while a job-row lock from the same logical operation is still held.
+ * first (via {@link ReviewRepository#findByIdForNoKeyUpdate}), in its own {@code REQUIRES_NEW}
+ * transaction, and is always called <em>after</em> whatever child-job transaction triggered it has
+ * already committed (releasing the job-row lock) — never nested inside a job-row lock. This is the
+ * "parent → child, independently" direction the fix requires: no code path here waits on a job-row
+ * lock while still holding the parent lock in reverse of some other path's ordering, because nothing
+ * here is ever invoked while a job-row lock from the same logical operation is still held.
+ *
+ * <p><b>F-DC-03:</b> the parent lock is {@code FOR NO KEY UPDATE}, not a plain {@code FOR UPDATE} —
+ * PostgreSQL's own FK referential-integrity trigger takes a {@code FOR KEY SHARE} lock on {@code
+ * reviews} for every child-row insert ({@code review_events}/{@code review_results}/
+ * {@code review_comments}/{@code review_jobs}), which conflicts with {@code FOR UPDATE} but not with
+ * {@code FOR NO KEY UPDATE}. Holding a plain {@code FOR UPDATE} here let a child-first writer (e.g.
+ * {@code RetryManager}, holding a job-row lock while its own event INSERT waits on this parent lock)
+ * and this class (holding the parent lock while cascading an UPDATE to that same job row) form a real,
+ * reproducible two-cycle deadlock on PostgreSQL (SQLSTATE 40P01) — see
+ * {@link ReviewRepository#findByIdForNoKeyUpdate} for the full mechanism.
  *
  * <p>Derivation rule (applied only while the Review is not yet terminal/PUBLISHED):
  * <pre>
@@ -105,7 +115,7 @@ public class ChunkCoordinator {
     public ReviewStatus recomputeAndApply(Long reviewId) {
         return requiresNewTransactionTemplate.execute(status -> {
             applyLockTimeout();
-            Review review = reviewRepository.findByIdForUpdate(reviewId).orElse(null);
+            Review review = reviewRepository.findByIdForNoKeyUpdate(reviewId).orElse(null);
             if (review == null) {
                 log.warn("recomputeAndApply called for missing reviewId={}", reviewId);
                 return null;
@@ -123,7 +133,7 @@ public class ChunkCoordinator {
     public ReviewStatus completeChunkAndRecompute(Long reviewId, Integer chunkIndex, List<ParsedComment> parsedComments) {
         return requiresNewTransactionTemplate.execute(status -> {
             applyLockTimeout();
-            Review review = reviewRepository.findByIdForUpdate(reviewId).orElse(null);
+            Review review = reviewRepository.findByIdForNoKeyUpdate(reviewId).orElse(null);
             if (review == null) {
                 log.warn("completeChunkAndRecompute called for missing reviewId={}", reviewId);
                 return null;
