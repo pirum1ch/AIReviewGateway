@@ -138,9 +138,12 @@ token is issued in GitLab, not something the application enforces.
 | `gateway.diff.context-window` | `16384` | Assumed LLM context window, in tokens, for the diff-size budget heuristic. |
 | `gateway.diff.prompt-reserve` | `2000` | Tokens reserved for prompt scaffolding. |
 | `gateway.diff.answer-reserve` | `4000` | Tokens reserved for the model's answer. |
-| `gateway.diff.max-diff-tokens` | `10000` | Explicit cap; the enforced budget is `min(max-diff-tokens, context-window - prompt-reserve - answer-reserve)` — 10000 with the stock defaults. |
+| `gateway.diff.max-diff-tokens` | `10000` | Explicit cap; the enforced budget is `min(max-diff-tokens, context-window - prompt-reserve - answer-reserve)` — 10000 with the stock defaults. **As of diff chunking (V2), this is the per-chunk budget**, not a whole-diff reject threshold — see [§6.1a](#61a-diff-chunking). |
 | `gateway.diff.chars-per-token` | `4` | Heuristic characters-per-token ratio (no real tokenizer is used); diff size is estimated as `ceil(chars / chars-per-token)`. |
-| `gateway.diff.max-request-body-bytes` | `100000` | Hard byte cap on the whole `POST /reviews` body, enforced by a servlet filter **before** Spring/Jackson reads it (see [§6.9](#69-body-size-limits)). |
+| `gateway.diff.max-chunks` | `5` | **V2.** Maximum number of chunks `DiffChunker` may split one diff into; a diff needing more is rejected with `422 DIFF_TOO_LARGE` rather than dispatched. Deliberately conservative (see the javadoc on `GatewayProperties.Diff.maxChunks` for the pool-starvation compute-cost math: `max-chunks × job.max-duration × retry.max-attempts` is the worst-case aggregate Worker time one MR can occupy). |
+| `gateway.diff.chunk-header-reserve-tokens` | `256` | **V2.** Tokens reserved per chunk for the injected cross-chunk context header (§6.1a); subtracted from the per-chunk budget during bin-packing. |
+| `gateway.diff.max-chunk-context-chars` | `1000` | **V2.** Hard cap (characters) on the rendered cross-chunk context header text; excess other-file paths collapse to `"... and N more"`. |
+| `gateway.diff.max-request-body-bytes` | `320000` | Hard byte cap on the whole `POST /reviews` body, enforced by a servlet filter **before** Spring/Jackson reads it (see [§6.9](#69-body-size-limits)). **V2:** derived from `max-chunks × max-diff-tokens × chars-per-token × 1.5 (JSON-escaping safety factor) + 20000 (fixed overhead)` — see `GatewayProperties.Diff.maxRequestBodyBytes` javadoc (CSR-02); if you change `max-chunks`/`max-diff-tokens`/`chars-per-token`, recompute and update this value too, it is not auto-derived. |
 | `gateway.heartbeat.timeout` | `180s` | A `RUNNING` job is considered stale if `now - heartbeat_at` exceeds this; it is then requeued or failed. |
 | `gateway.heartbeat.interval` | `60s` | **Documents** the expected Worker heartbeat cadence; as of this codebase it is not bound to any `GatewayProperties` field (only `gateway.heartbeat.timeout` is read by the application), so changing it has no runtime effect — it exists purely as the value Worker implementations should target for `POST /jobs/{id}/heartbeat` frequency. |
 | `gateway.retry.max-attempts` | `3` | Max claim attempts before a Review is marked `FAILED` instead of requeued. |
@@ -282,22 +285,67 @@ optional — defaults to `10`; higher values are claimed first).
 
 - **`201 Created`** — a genuinely new Review was queued:
   ```json
-  { "reviewId": 123, "status": "QUEUED" }
+  { "reviewId": 123, "status": "QUEUED", "chunkCount": 1 }
   ```
+  `chunkCount` (additive, V2) is the number of file-based chunks the diff was split into — `1` for the
+  overwhelming majority of MRs, see [§6.1a](#61a-diff-chunking).
 - **`200 OK`** — an existing, still-active Review for the same `(projectId, mergeRequestId, headSha)`
   key was returned instead (dedup, [§8](#8-review-lifecycle)); the body has the same shape, with
   whatever the existing Review's current status is (e.g. `"RUNNING"`).
-- **`422 Unprocessable Entity`** — the diff's estimated size exceeds the configured token budget
-  (`gateway.diff.*`, default ~10,000 tokens ≈ 40,000 characters at the default 4-chars/token estimate):
+- **`422 Unprocessable Entity`** — one of three things: the diff couldn't be split into `gateway.diff.max-chunks`
+  chunks or fewer, one file's diff is too large to fit a chunk even split at hunk boundaries, or the diff
+  is absurdly large (bigger than `max-chunks` chunks could ever hold, rejected before any chunking is
+  attempted, CSR-01) — all three use the same response shape:
   ```json
-  { "error": "DIFF_TOO_LARGE", "message": "Diff too large: estimated 12500 tokens exceeds budget of 10000 tokens" }
+  { "error": "DIFF_TOO_LARGE", "message": "Diff requires 7 chunks, exceeding gateway.diff.max-chunks=5" }
+  ```
+  Also returned (unchanged from pre-chunking behavior) when `promptVersion` isn't one the Gateway
+  recognizes as chunk-context-aware and the diff needs more than one chunk — see
+  [§6.1a](#61a-diff-chunking):
+  ```json
+  { "error": "PROMPT_VERSION_INCOMPATIBLE_WITH_CHUNKING", "message": "promptVersion 'v1' is not chunk-context-aware; this diff requires chunking. Use one of [v2] or submit a smaller diff." }
   ```
 - **`400 Bad Request`** — a required field is missing/blank (e.g. empty `diff`):
   ```json
   { "error": "VALIDATION_ERROR", "message": "diff: must not be blank" }
   ```
 - **`413 Payload Too Large`** — the whole request body exceeds `gateway.diff.max-request-body-bytes`
-  (default 100,000 bytes); see [§6.9](#69-body-size-limits).
+  (default 320,000 bytes); see [§6.9](#69-body-size-limits).
+
+### 6.1a Diff chunking
+
+**A diff that exceeds `gateway.diff.max-diff-tokens` is no longer rejected outright — it is split into
+file-based chunks and dispatched as one `review_jobs` row per chunk**, each independently claimable by a
+Worker/backend, up to `gateway.diff.max-chunks` (default 5) chunks. This closes the gap where ~41% of
+real feature-branch MRs used to get `422 DIFF_TOO_LARGE` outright.
+
+- **Splitting** (`DiffChunker`) is file-based: it groups by `diff --git` sections (falling back to plain
+  `--- `/`+++ ` unified-diff markers, or treating the whole diff as one indivisible unit if neither is
+  present) and bin-packs them next-fit, preserving original file order. A single file whose own diff
+  exceeds one chunk's budget is split further at `@@` hunk boundaries, with that file's header replayed
+  at the top of each piece.
+- **A single-chunk Review (the common case) behaves byte-for-byte identically to pre-chunking releases**:
+  same request/response shapes, same prompt, same state-transition timeline, same retry/publish
+  behavior. `chunkCount` in the create-Review response is the only new, additive signal.
+- **`reviews.status` is derived, not directly set, once a Review has more than one chunk**: the Gateway
+  computes it from the set of the Review's job statuses (any chunk `FAILED` → Review `FAILED`; all
+  `COMPLETED` → Review `COMPLETED`; any `RUNNING` (or some `COMPLETED`, rest `QUEUED`) → Review
+  `RUNNING`; all `QUEUED` → Review `QUEUED`). If one chunk exhausts its retries and fails permanently,
+  every other non-terminal sibling chunk is cancelled in the same step — a Worker still running one
+  learns to stop via its next heartbeat (`shouldContinue: false`), within `gateway.heartbeat.timeout`.
+- **Prompt-version allowlist**: a Review that needs more than one chunk must use a `promptVersion` the
+  Gateway knows contains the cross-chunk context placeholder (currently just `"v2"`) — see the `422`
+  response above. A single-chunk Review is unaffected and may keep using any existing `promptVersion`.
+- **Comment cap stays review-wide, not per-chunk-multiplied**: `gateway.publish.max-comment-count`
+  bounds the total comments across all of a Review's chunks combined (a fair per-chunk share is used
+  while parsing, then the actual persisted count is capped review-wide at write time), and a comment
+  that exactly duplicates one from another chunk (only possible in the rare same-file hunk-split case)
+  is not persisted twice.
+- **CI polling timeout**: a multi-chunk Review can legitimately take several times longer than a
+  single-chunk one to reach a terminal status (up to `chunkCount` chunks worth of queue wait + run time,
+  though chunks usually run in parallel across your Worker pool). If your CI job polls `GET
+  /reviews/{id}` with a fixed timeout (see [`examples/.gitlab-ci.yml`](examples/.gitlab-ci.yml)), consider
+  raising it for large MRs — this repository does not change the example CI script's timeout for you.
 
 ### 6.2 `GET /reviews/{id}` — status
 

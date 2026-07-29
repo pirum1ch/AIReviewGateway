@@ -131,7 +131,7 @@ public class ReviewService {
             Review created = requiresNewTransactionTemplate.execute(status -> persistNewReview(command, plan));
             log.info("Review created: reviewId={} projectId={} mrId={} headSha={} chunks={}",
                     created.getId(), command.projectId(), command.mergeRequestId(), command.headSha(), plan.chunks().size());
-            return toResult(created, false);
+            return new CreateReviewResult(created.getId(), created.getStatus(), false, plan.chunks().size());
         } catch (DataIntegrityViolationException race) {
             log.info("Review create race detected (unique-violation), re-reading existing: projectId={} mrId={} headSha={}",
                     command.projectId(), command.mergeRequestId(), command.headSha());
@@ -278,6 +278,7 @@ public class ReviewService {
     }
 
     private CreateReviewResult toResult(Review review, boolean deduplicated) {
-        return new CreateReviewResult(review.getId(), review.getStatus(), deduplicated);
+        int chunkCount = reviewChunkRepository.findByReviewIdOrderByChunkIndexAsc(review.getId()).size();
+        return new CreateReviewResult(review.getId(), review.getStatus(), deduplicated, Math.max(1, chunkCount));
     }
 }
