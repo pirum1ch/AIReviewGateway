@@ -18,7 +18,7 @@ class SensitiveDtoToStringMaskingTest {
 
     @Test
     void jobPayloadToStringNeverContainsTheRawDiff() {
-        JobPayload payload = new JobPayload(SECRET_DIFF, "v1");
+        JobPayload payload = new JobPayload(SECRET_DIFF, "v1", null);
 
         String rendered = payload.toString();
 
@@ -32,7 +32,7 @@ class SensitiveDtoToStringMaskingTest {
     @Test
     void jobPayloadAccessorStillReturnsTheFullDiffUnmasked() {
         // The masking is toString()-only; the actual field/accessor (what Jackson serializes) must be untouched.
-        JobPayload payload = new JobPayload(SECRET_DIFF, "v1");
+        JobPayload payload = new JobPayload(SECRET_DIFF, "v1", null);
 
         assertThat(payload.diff()).isEqualTo(SECRET_DIFF);
     }
@@ -60,7 +60,7 @@ class SensitiveDtoToStringMaskingTest {
 
     @Test
     void claimResponseToStringNeverContainsTheRawDiffEvenViaNestedPayload() {
-        ClaimResponse response = new ClaimResponse(1L, 2L, new JobPayload(SECRET_DIFF, "v1"));
+        ClaimResponse response = new ClaimResponse(1L, 2L, new JobPayload(SECRET_DIFF, "v1", null));
 
         String rendered = response.toString();
 
@@ -72,7 +72,20 @@ class SensitiveDtoToStringMaskingTest {
 
     @Test
     void toStringMaskingHandlesNullContentGracefully() {
-        assertThat(new JobPayload(null, "v1").toString()).contains("0 chars");
+        assertThat(new JobPayload(null, "v1", null).toString()).contains("0 chars");
         assertThat(new ResultRequest("w", null, null, null, null, null).toString()).contains("0 chars");
+    }
+
+    /** V2 (diff chunking): {@code chunkContext} is just as sensitive (MR-author-controlled file names/prompt text) as {@code diff}. */
+    @Test
+    void jobPayloadToStringNeverContainsTheRawChunkContext() {
+        String secretChunkContext = "part 2 of 6\nSECRET-FILE-PATH-CONTENT.java";
+        JobPayload payload = new JobPayload("small diff", "v2", secretChunkContext);
+
+        String rendered = payload.toString();
+
+        assertThat(rendered).doesNotContain(secretChunkContext);
+        assertThat(rendered).doesNotContain("SECRET-FILE-PATH-CONTENT");
+        assertThat(rendered).contains("chunkContext=<masked, " + secretChunkContext.length() + " chars>");
     }
 }

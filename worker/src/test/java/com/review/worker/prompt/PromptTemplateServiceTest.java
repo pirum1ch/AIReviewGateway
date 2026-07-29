@@ -103,6 +103,84 @@ class PromptTemplateServiceTest {
         assertThatThrownBy(() -> service.resolve(null, "diff")).isInstanceOf(AbandonJobException.class);
     }
 
+    // ---- V2 (diff chunking): chunkContext substitution ----
+
+    @Test
+    void resolvesV2TemplateAndSubstitutesChunkContextAndDiff() {
+        ResolvedPrompt resolved = service.resolve("v2", "diff --git a/A.java b/A.java\n+x();", "part 2 of 5\nA.java");
+
+        ChatMessage userMessage = resolved.messages().get(resolved.messages().size() - 1);
+        assertThat(userMessage.content()).contains("part 2 of 5");
+        assertThat(userMessage.content()).contains("diff --git a/A.java b/A.java");
+        assertThat(userMessage.content()).doesNotContain("{{CHUNK_CONTEXT}}");
+        assertThat(userMessage.content()).doesNotContain("{{DIFF}}");
+    }
+
+    @Test
+    void nullChunkContextSubstitutesToEmptyString() {
+        ResolvedPrompt resolved = service.resolve("v2", "some diff", null);
+
+        ChatMessage userMessage = resolved.messages().get(resolved.messages().size() - 1);
+        assertThat(userMessage.content()).doesNotContain("{{CHUNK_CONTEXT}}");
+    }
+
+    /**
+     * CSR-08 (MUST): two sequential {@code String.replace} calls would be unsafe -- a file literally
+     * named {@code {{DIFF}}} inside the chunk context, or a diff containing the literal text
+     * {@code {{CHUNK_CONTEXT}}}, must resolve each placeholder EXACTLY once from the original template
+     * text, with no cross-substitution in either direction.
+     */
+    @Test
+    void placeholdersResolveExactlyOnceWithNoCrossSubstitutionEvenWhenContentContainsTheOtherPlaceholderLiterally() {
+        String diffContainingChunkContextLiteral = "diff --git a/{{CHUNK_CONTEXT}}.java b/{{CHUNK_CONTEXT}}.java\n+ real diff content";
+        String chunkContextContainingDiffLiteral = "part 1 of 2, file {{DIFF}}.java";
+
+        ResolvedPrompt resolved = service.resolve("v2", diffContainingChunkContextLiteral, chunkContextContainingDiffLiteral);
+
+        ChatMessage userMessage = resolved.messages().get(resolved.messages().size() - 1);
+        String content = userMessage.content();
+
+        // The diff's literal "{{CHUNK_CONTEXT}}" text is DIFF content (substituted via {{DIFF}}, not a
+        // template placeholder itself) and must survive unresolved/unexpanded. The chunkContext's literal
+        // "{{DIFF}}" text has its brace characters stripped by the CSR-08 defense-in-depth pass (applied
+        // to chunkContext before substitution) but must NOT have been replaced with the actual diff text.
+        assertThat(content).contains("diff --git a/{{CHUNK_CONTEXT}}.java b/{{CHUNK_CONTEXT}}.java");
+        assertThat(content).contains("part 1 of 2, file DIFF.java");
+        // The template's own two real placeholders must each have been substituted exactly once.
+        assertThat(content).contains("real diff content");
+        // No cross-substitution: the count of "real diff content" must be exactly 1 (not duplicated by a
+        // second, accidental substitution pass), and the same for the chunk-context text.
+        assertThat(countOccurrences(content, "real diff content")).isEqualTo(1);
+        assertThat(countOccurrences(content, "part 1 of 2, file")).isEqualTo(1);
+    }
+
+    /** CSR-08 defense in depth: literal {@code {{}}} sequences are stripped from chunkContext before substitution. */
+    @Test
+    void literalBraceSequencesAreStrippedFromChunkContextBeforeSubstitution() {
+        ResolvedPrompt resolved = service.resolve("v2", "a diff", "part 1 of 2 {{INJECTED}}");
+
+        ChatMessage userMessage = resolved.messages().get(resolved.messages().size() - 1);
+        assertThat(userMessage.content()).doesNotContain("{{INJECTED}}");
+        assertThat(userMessage.content()).contains("part 1 of 2 INJECTED");
+    }
+
+    /** CSR-12 (MUST): fail closed if chunkContext is supplied but the resolved template has no placeholder for it. */
+    @Test
+    void chunkContextSuppliedForATemplateWithNoPlaceholderIsAbandoned() {
+        assertThatThrownBy(() -> service.resolve("v1", "some diff", "part 1 of 2"))
+                .isInstanceOf(AbandonJobException.class);
+    }
+
+    private int countOccurrences(String haystack, String needle) {
+        int count = 0;
+        int index = 0;
+        while ((index = haystack.indexOf(needle, index)) != -1) {
+            count++;
+            index += needle.length();
+        }
+        return count;
+    }
+
     @Test
     void oversizedDiffIsAbandonedBeforeTemplateResolution() {
         WorkerProperties properties = new WorkerProperties("127.0.0.1", "8081", "", "");
@@ -116,6 +194,24 @@ class PromptTemplateServiceTest {
         PromptTemplateService smallLimitService = new PromptTemplateService(properties);
 
         assertThatThrownBy(() -> smallLimitService.resolve("v1", "a diff that is definitely too long"))
+                .isInstanceOf(AbandonJobException.class);
+    }
+
+    /** Extends {@code worker.limits.max-diff-bytes} to cover {@code diff bytes + chunkContext bytes} combined. */
+    @Test
+    void combinedDiffAndChunkContextSizeIsBoundedTogether() {
+        WorkerProperties properties = new WorkerProperties("127.0.0.1", "8081", "", "");
+        properties.getGateway().setUrl("https://gateway.internal");
+        properties.getGateway().setApiKey("a".repeat(40));
+        properties.getWorker().setId("worker-1");
+        properties.getWorker().getLimits().setMaxDiffBytes(20);
+        properties.getBackend().setId("backend-1");
+        properties.getLlama().setUrl("http://127.0.0.1:8000");
+        properties.getLlama().setModel("default-model");
+        PromptTemplateService smallLimitService = new PromptTemplateService(properties);
+
+        // Neither the diff nor the chunkContext alone exceeds 20 bytes, but their sum does.
+        assertThatThrownBy(() -> smallLimitService.resolve("v2", "12345678901", "1234567890"))
                 .isInstanceOf(AbandonJobException.class);
     }
 }
