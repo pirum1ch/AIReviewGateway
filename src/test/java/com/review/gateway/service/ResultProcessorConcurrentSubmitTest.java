@@ -88,7 +88,7 @@ class ResultProcessorConcurrentSubmitTest extends AbstractPostgresIntegrationTes
         ChunkCoordinator chunkCoordinator = new ChunkCoordinator(reviewRepository, reviewJobRepository,
                 reviewChunkRepository, reviewCommentRepository, stateMachine, jobStateMachine, properties, entityManager, transactionManager);
         return new ResultProcessor(reviewRepository, reviewJobRepository, reviewResultRepository,
-                commentParser, jobStateMachine, chunkCoordinator, properties, transactionManager);
+                commentParser, jobStateMachine, chunkCoordinator, properties, entityManager, transactionManager);
     }
 
     @Test

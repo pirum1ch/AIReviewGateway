@@ -4,6 +4,8 @@ import com.review.gateway.config.GatewayProperties;
 import com.review.gateway.exception.DiffTooLargeException;
 import org.junit.jupiter.api.Test;
 
+import java.util.List;
+
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
@@ -26,7 +28,7 @@ class DiffChunkerTest {
     }
 
     private DiffChunker newChunker(GatewayProperties properties) {
-        return new DiffChunker(properties, new DiffSizeValidator(properties));
+        return new DiffChunker(properties, new DiffSizeValidator(properties), new ChunkContextRenderer(properties));
     }
 
     private String gitSection(String path, String... hunkLines) {
@@ -221,6 +223,87 @@ class DiffChunkerTest {
         assertThatThrownBy(() -> chunker.split(section))
                 .isInstanceOf(DiffTooLargeException.class)
                 .hasMessageContaining("Huge.java");
+    }
+
+    /**
+     * F-DC-06 (Low, appsec-reproduced): the file path embedded in a {@code DiffTooLargeException}
+     * message reaches the {@code 422} HTTP response body verbatim (unlike log lines, which are already
+     * clean, SR-14/CSR-15). A raw, attacker-controlled path containing bidi-override/control characters
+     * must be sanitized (same {@code ChunkContextRenderer.sanitizePath} used before any path is
+     * persisted/rendered elsewhere) and length-capped before it lands in that message.
+     */
+    @Test
+    void oversizedFileErrorMessageSanitizesTheAttackerControlledPathName() {
+        String maliciousName = "A‮gnp.js"; // U+202E RIGHT-TO-LEFT OVERRIDE (Cf) -- bidi-override attack
+        String header = "diff --git a/" + maliciousName + " b/" + maliciousName + "\n--- a/" + maliciousName
+                + "\n+++ b/" + maliciousName + "\n";
+        String hunk = "@@ -1,1 +1,1 @@\n+" + "z".repeat(500) + "\n";
+        String section = header + hunk;
+
+        GatewayProperties properties = propertiesWithBudget(header.length() + 10, 0, 5);
+        DiffChunker chunker = newChunker(properties);
+
+        assertThatThrownBy(() -> chunker.split(section))
+                .isInstanceOf(DiffTooLargeException.class)
+                .hasMessageNotContaining("‮")
+                .hasMessageContaining("Agnp.js");
+    }
+
+    // ---- F-DC-07: masked toString() on DiffChunk/ChunkPlan ----
+
+    @Test
+    void diffChunkToStringNeverContainsTheRawDiffOrFilePaths() {
+        String secretDiff = "diff --git a/Secret.java\n+String apiKey = \"THE-SECRET-DIFF-CONTENT\";";
+        DiffChunker.DiffChunk chunk = new DiffChunker.DiffChunk(0, secretDiff, 42, List.of("Secret.java"));
+
+        String rendered = chunk.toString();
+
+        assertThat(rendered).doesNotContain(secretDiff);
+        assertThat(rendered).doesNotContain("THE-SECRET-DIFF-CONTENT");
+        assertThat(rendered).contains("masked");
+        assertThat(rendered).contains(String.valueOf(secretDiff.length()));
+        assertThat(rendered).contains("index=0");
+        // filePaths content itself is also masked (only a count), not just the diff.
+        assertThat(rendered).doesNotContain("Secret.java");
+    }
+
+    @Test
+    void diffChunkAccessorsStillReturnFullContentUnmasked() {
+        String secretDiff = "diff --git a/Secret.java\n+content";
+        DiffChunker.DiffChunk chunk = new DiffChunker.DiffChunk(0, secretDiff, 42, List.of("Secret.java"));
+
+        assertThat(chunk.diff()).isEqualTo(secretDiff);
+        assertThat(chunk.filePaths()).containsExactly("Secret.java");
+    }
+
+    @Test
+    void chunkPlanToStringNeverDumpsItsChunks() {
+        String secretDiff = "diff --git a/Secret.java\n+String apiKey = \"THE-SECRET-DIFF-CONTENT\";";
+        DiffChunker.ChunkPlan plan = new DiffChunker.ChunkPlan(
+                List.of(new DiffChunker.DiffChunk(0, secretDiff, 42, List.of())), 42);
+
+        String rendered = plan.toString();
+
+        assertThat(rendered).doesNotContain(secretDiff);
+        assertThat(rendered).doesNotContain("THE-SECRET-DIFF-CONTENT");
+        assertThat(rendered).contains("masked");
+        assertThat(rendered).contains("totalEstimatedTokens=42");
+    }
+
+    @Test
+    void oversizedFileErrorMessageCapsAnExtremelyLongPathName() {
+        String longName = "a/".repeat(500) + "File.java";
+        String header = "diff --git a/" + longName + " b/" + longName + "\n--- a/" + longName
+                + "\n+++ b/" + longName + "\n";
+        String hunk = "@@ -1,1 +1,1 @@\n+" + "z".repeat(500) + "\n";
+        String section = header + hunk;
+
+        GatewayProperties properties = propertiesWithBudget(header.length() + 10, 0, 5);
+        DiffChunker chunker = newChunker(properties);
+
+        assertThatThrownBy(() -> chunker.split(section))
+                .isInstanceOf(DiffTooLargeException.class)
+                .satisfies(ex -> assertThat(ex.getMessage().length()).isLessThan(header.length()));
     }
 
     /**

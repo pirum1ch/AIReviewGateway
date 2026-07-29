@@ -25,20 +25,49 @@ import java.util.Set;
 @Service
 public class DiffChunker {
 
-    /** One file-based slice of the diff being split, plus its (already header-region-restricted) file paths. */
+    /**
+     * One file-based slice of the diff being split, plus its (already header-region-restricted, but
+     * NOT YET CSR-09/CSR-10-sanitized — that happens in {@code ReviewService}) file paths.
+     */
     public record DiffChunk(int index, String diff, int estimatedTokens, List<String> filePaths) {
+
+        /**
+         * F-DC-07: masked {@code toString()} — {@code diff} is the (possibly proprietary) chunk content
+         * and {@code filePaths} is raw, pre-sanitization, attacker-controlled path data; neither should
+         * ever be dumped whole into a log/exception-message rendering. Mirrors the pattern already
+         * applied to {@code dto.JobPayload}/{@code service.dto.ClaimedJob} (CSR-14).
+         */
+        @Override
+        public String toString() {
+            int diffChars = diff == null ? 0 : diff.length();
+            return "DiffChunk[index=" + index + ", diff=<masked, " + diffChars + " chars>, estimatedTokens="
+                    + estimatedTokens + ", filePaths=<masked, " + filePaths.size() + " paths>]";
+        }
     }
 
     /** The full result of {@link #split}. */
     public record ChunkPlan(List<DiffChunk> chunks, int totalEstimatedTokens) {
+
+        /** F-DC-07: the default {@code toString()} would dump every {@link DiffChunk} in {@code chunks}. */
+        @Override
+        public String toString() {
+            return "ChunkPlan[chunks=<" + chunks.size() + " chunk(s), masked>, totalEstimatedTokens="
+                    + totalEstimatedTokens + "]";
+        }
     }
+
+    /** Short, fixed cap on any file path embedded in a {@code DiffTooLargeException} message (F-DC-06). */
+    private static final int ERROR_MESSAGE_PATH_CAP = 120;
 
     private final GatewayProperties properties;
     private final DiffSizeValidator diffSizeValidator;
+    private final ChunkContextRenderer chunkContextRenderer;
 
-    public DiffChunker(GatewayProperties properties, DiffSizeValidator diffSizeValidator) {
+    public DiffChunker(GatewayProperties properties, DiffSizeValidator diffSizeValidator,
+                        ChunkContextRenderer chunkContextRenderer) {
         this.properties = properties;
         this.diffSizeValidator = diffSizeValidator;
+        this.chunkContextRenderer = chunkContextRenderer;
     }
 
     /**
@@ -174,8 +203,8 @@ public class DiffChunker {
             // case the fallback guard must reject rather than silently dispatch an oversized chunk.
             String whole = section.fullText();
             if (whole.length() > perChunkBudgetChars) {
-                throw new DiffTooLargeException("File '" + section.primaryPath() + "' has no hunk markers to split on "
-                        + "and its content alone exceeds the per-chunk budget (size=" + whole.length()
+                throw new DiffTooLargeException("File '" + sanitizedPathForError(section) + "' has no hunk markers to "
+                        + "split on and its content alone exceeds the per-chunk budget (size=" + whole.length()
                         + " chars, budget=" + perChunkBudgetChars + " chars)");
             }
             emitChunk(result, chunkIndex, maxChunks, whole, filePathSet);
@@ -187,9 +216,9 @@ public class DiffChunker {
 
         for (String hunk : hunks) {
             if (header.length() + hunk.length() > perChunkBudgetChars) {
-                throw new DiffTooLargeException("File '" + section.primaryPath() + "' has a hunk that exceeds the "
-                        + "per-chunk budget even with its header replayed (size=" + (header.length() + hunk.length())
-                        + " chars, budget=" + perChunkBudgetChars + " chars)");
+                throw new DiffTooLargeException("File '" + sanitizedPathForError(section) + "' has a hunk that "
+                        + "exceeds the per-chunk budget even with its header replayed (size="
+                        + (header.length() + hunk.length()) + " chars, budget=" + perChunkBudgetChars + " chars)");
             }
             if (currentHasHunk && current.length() + hunk.length() > perChunkBudgetChars) {
                 // Bound check happens HERE, per piece, before building the next header-replayed buffer --
@@ -281,6 +310,25 @@ public class DiffChunker {
             all.addAll(section.filePaths());
         }
         return List.copyOf(all);
+    }
+
+    /**
+     * F-DC-06: {@code section.primaryPath()} is the raw, attacker-controlled (MR-author-controlled) file
+     * path — never safe to embed verbatim in an exception message that reaches an HTTP response body
+     * (unlike log lines, which SR-14/CSR-15 already keep clean of raw paths). Runs it through the same
+     * {@link ChunkContextRenderer#sanitizePath} used before any path is persisted/rendered elsewhere
+     * (stripping Cc/Cf/Zl/Zp control/format characters and {@code '<'}/{@code '>'}), then applies a
+     * short, fixed length cap independent of {@code sanitizePath}'s own (more generous) cap, since an
+     * error message should stay compact.
+     */
+    private String sanitizedPathForError(Section section) {
+        String sanitized = chunkContextRenderer.sanitizePath(section.primaryPath());
+        if (sanitized == null) {
+            return "(unnamed file)";
+        }
+        return sanitized.length() > ERROR_MESSAGE_PATH_CAP
+                ? sanitized.substring(0, ERROR_MESSAGE_PATH_CAP) + "..."
+                : sanitized;
     }
 
     /** One file-based section of the diff being parsed: header lines + hunk lines, plus extracted paths. */

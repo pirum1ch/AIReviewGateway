@@ -12,6 +12,7 @@ import com.review.gateway.repository.ReviewRepository;
 import com.review.gateway.repository.ReviewResultRepository;
 import com.review.gateway.service.dto.ParsedComment;
 import com.review.gateway.service.dto.SubmitResultCommand;
+import jakarta.persistence.EntityManager;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
@@ -44,6 +45,7 @@ public class ResultProcessor {
     private final JobStateMachine jobStateMachine;
     private final ChunkCoordinator chunkCoordinator;
     private final GatewayProperties properties;
+    private final EntityManager entityManager;
     private final TransactionTemplate requiresNewTransactionTemplate;
 
     public ResultProcessor(ReviewRepository reviewRepository,
@@ -53,6 +55,7 @@ public class ResultProcessor {
                             JobStateMachine jobStateMachine,
                             ChunkCoordinator chunkCoordinator,
                             GatewayProperties properties,
+                            EntityManager entityManager,
                             PlatformTransactionManager transactionManager) {
         this.reviewRepository = reviewRepository;
         this.reviewJobRepository = reviewJobRepository;
@@ -61,6 +64,7 @@ public class ResultProcessor {
         this.jobStateMachine = jobStateMachine;
         this.chunkCoordinator = chunkCoordinator;
         this.properties = properties;
+        this.entityManager = entityManager;
         this.requiresNewTransactionTemplate = new TransactionTemplate(transactionManager);
         this.requiresNewTransactionTemplate.setPropagationBehavior(TransactionTemplate.PROPAGATION_REQUIRES_NEW);
         this.requiresNewTransactionTemplate.setName("ResultProcessor");
@@ -115,6 +119,7 @@ public class ResultProcessor {
      */
     private JobPhaseOutcome processJobPhase(Long jobId, String workerId, Long backendId,
                                              SubmitResultCommand command, CappedRawResponse capped) {
+        applyLockTimeout();
         ReviewJob job = reviewJobRepository.findByIdForUpdate(jobId).orElse(null);
         if (job == null || job.getStatus() != JobStatus.RUNNING) {
             log.debug("Job {} no longer RUNNING when processing result, skipping", jobId);
@@ -201,5 +206,15 @@ public class ResultProcessor {
 
     private void finishJob(ReviewJob job) {
         job.setFinishedAt(Instant.now());
+    }
+
+    /**
+     * F-DC-05: bounds how long this transaction can wait for the job-row lock, so a lock wait can never
+     * pin a Hikari connection indefinitely (pool size 20). Previously missing here — this class had no
+     * {@code EntityManager} injected at all — unlike the other {@code FOR UPDATE} sites
+     * ({@code QueueManager}, {@code RetryManager}, {@code ChunkCoordinator}, {@code ReviewService}).
+     */
+    private void applyLockTimeout() {
+        entityManager.createNativeQuery("SET LOCAL lock_timeout = '3s'").executeUpdate();
     }
 }

@@ -546,8 +546,9 @@ at-capacity backend. This mapping is dead code kept for forward-compatibility; d
 ### 6.9 Body size limits
 
 A servlet filter (`RequestBodySizeLimitFilter`, registered ahead of Spring Security) rejects an
-oversized body based on the `Content-Length` header, before authentication or JSON parsing: `100,000`
-bytes for `POST /reviews` (`gateway.diff.max-request-body-bytes`) and `500,000` bytes for
+oversized body based on the `Content-Length` header, before authentication or JSON parsing: `320,000`
+bytes for `POST /reviews` (`gateway.diff.max-request-body-bytes`, CSR-02 — see [§4.2](#42-everything-else-has-a-working-default))
+and `500,000` bytes for
 `POST /jobs/{id}/result` (`gateway.publish.max-request-body-bytes`). `POST /jobs/claim` and
 `POST /jobs/{id}/heartbeat` bodies are not size-capped (their DTOs are small and Worker-authenticated
 only — a documented, accepted low-risk gap, see the SAST report's F03-03 finding). This
@@ -823,9 +824,9 @@ non-terminal chunk job in the same step for a multi-chunk Review.
   a `CI` token calling `DELETE /reviews/{id}`, which needs `ADMIN`), or — for `/jobs/{id}/heartbeat` and
   `/jobs/{id}/result` specifically — the `workerId` in the request body doesn't match the `workerId` that
   originally claimed that job.
-- **`413 Payload Too Large`.** The request body exceeds `gateway.diff.max-request-body-bytes` (100,000
-  bytes default, `POST /reviews`) or `gateway.publish.max-request-body-bytes` (500,000 bytes default,
-  `POST /jobs/{id}/result`). Either the diff/response is genuinely too large (consider sending only
+- **`413 Payload Too Large`.** The request body exceeds `gateway.diff.max-request-body-bytes` (320,000
+  bytes default, `POST /reviews`, CSR-02) or `gateway.publish.max-request-body-bytes` (500,000 bytes
+  default, `POST /jobs/{id}/result`). Either the diff/response is genuinely too large (consider sending only
   changed hunks, not whole files) or raise the corresponding property (together with the matching
   token-budget property, so the two limits stay consistent).
 - **`422 DIFF_TOO_LARGE`.** The diff's estimated token count exceeds the configured budget. Either

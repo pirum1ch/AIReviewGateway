@@ -41,9 +41,14 @@ gateway:
     context-window: 16384
     prompt-reserve: 2000
     answer-reserve: 4000
-    max-diff-tokens: 10000          # derived cap; DIFF_TOO_LARGE above this
+    max-diff-tokens: 10000          # derived cap; per-chunk budget as of V2 diff chunking (CSR-05)
     chars-per-token: 4              # heuristic for the token estimator
-    max-request-body-bytes: 100000  # SR-11 edge cap for POST /reviews
+    # F-DC-04 fix: this MUST match the CSR-02 formula (max-chunks * max-diff-tokens * chars-per-token
+    # * 1.5 safety-factor + 20000 fixed overhead) -- 5 * 10000 * 4 * 1.5 + 20000 = 320000 with the
+    # stock defaults below. This value previously stayed at the pre-chunking 100000, silently capping
+    # every chunked Review at ~2 chunks regardless of gateway.diff.max-chunks. Recompute and update
+    # this (and MAX_REQUEST_BODY_BYTES if set) if max-chunks/max-diff-tokens/chars-per-token change.
+    max-request-body-bytes: ${MAX_REQUEST_BODY_BYTES:320000}  # SR-11/CSR-02 edge cap for POST /reviews
   heartbeat:
     interval: 60s                   # expected worker ping cadence
     timeout: 180s                   # stuck if now - heartbeat_at exceeds this

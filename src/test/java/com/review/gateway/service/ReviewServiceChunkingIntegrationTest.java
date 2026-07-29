@@ -68,8 +68,8 @@ class ReviewServiceChunkingIntegrationTest extends AbstractPostgresIntegrationTe
         JobStateMachine jobStateMachine = new JobStateMachine(eventService);
         DeduplicationService deduplicationService = new DeduplicationService(reviewRepository);
         DiffSizeValidator diffSizeValidator = new DiffSizeValidator(properties);
-        DiffChunker diffChunker = new DiffChunker(properties, diffSizeValidator);
         ChunkContextRenderer chunkContextRenderer = new ChunkContextRenderer(properties);
+        DiffChunker diffChunker = new DiffChunker(properties, diffSizeValidator, chunkContextRenderer);
         return new ReviewService(reviewRepository, reviewInputRepository, reviewChunkRepository,
                 reviewJobRepository, reviewCommentRepository, deduplicationService, diffSizeValidator,
                 diffChunker, chunkContextRenderer, stateMachine, jobStateMachine, entityManager, transactionManager);

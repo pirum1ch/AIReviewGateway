@@ -223,9 +223,14 @@ public class QueueManager {
     /**
      * Marks a "doomed" job (parent already CANCELLED/OBSOLETE) with the matching status instead of
      * dispatching it to the Worker. Its own small transaction, job-row lock only.
+     *
+     * <p>F-DC-05: applies its own {@code lock_timeout} — this is a genuinely separate {@code
+     * REQUIRES_NEW} transaction from {@link #claimJobRow}, so the {@code SET LOCAL} that transaction
+     * applied does not carry over; every transaction that takes a lock needs its own.
      */
     private void markDoomedJob(Long jobId, ReviewStatus reviewStatus) {
         requiresNewTransactionTemplate.executeWithoutResult(status -> {
+            applyLockTimeout();
             ReviewJob job = reviewJobRepository.findByIdForUpdate(jobId).orElse(null);
             if (job == null || job.getStatus() != JobStatus.RUNNING) {
                 return;

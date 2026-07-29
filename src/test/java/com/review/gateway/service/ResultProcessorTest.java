@@ -99,7 +99,7 @@ class ResultProcessorTest extends AbstractPostgresIntegrationTest {
         ChunkCoordinator chunkCoordinator = new ChunkCoordinator(reviewRepository, reviewJobRepository,
                 reviewChunkRepository, reviewCommentRepository, stateMachine, jobStateMachine, properties, entityManager, transactionManager);
         return new ResultProcessor(reviewRepository, reviewJobRepository, reviewResultRepository,
-                commentParser, jobStateMachine, chunkCoordinator, properties, transactionManager);
+                commentParser, jobStateMachine, chunkCoordinator, properties, entityManager, transactionManager);
     }
 
     private Review persistRunningReview(String headSha) {
