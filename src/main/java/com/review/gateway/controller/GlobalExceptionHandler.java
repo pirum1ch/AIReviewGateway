@@ -9,6 +9,7 @@ import com.review.gateway.exception.ReviewNotFoundException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.dao.CannotAcquireLockException;
+import org.springframework.dao.DeadlockLoserDataAccessException;
 import org.springframework.dao.PessimisticLockingFailureException;
 import org.springframework.dao.QueryTimeoutException;
 import org.springframework.http.HttpStatus;
@@ -61,10 +62,30 @@ public class GlobalExceptionHandler {
     }
 
     /**
+     * F-DC-08: a genuine Postgres deadlock (SQLSTATE 40P01, one transaction chosen as the "deadlock
+     * loser" and rolled back) surfaces via Spring's {@link DeadlockLoserDataAccessException} — which
+     * extends {@link PessimisticLockingFailureException}, so before this handler existed it fell into
+     * the same generic {@code LOCK_TIMEOUT} bucket as a benign {@code SET LOCAL lock_timeout} expiry
+     * (SQLSTATE 55P03). Both remain a bounded {@code 409} (Postgres has already rolled the loser back,
+     * so this is always safe to retry, never a {@code 500}) but are now distinguishable by error code —
+     * letting a test (or an operator dashboard) tell "a real deadlock cycle was detected and broken" (a
+     * signal that should be rare/zero post F-DC-03) apart from "this request simply waited too long for
+     * a busy row" (an expected, load-dependent outcome). Declared before the broader handler below so
+     * Spring's exception-hierarchy resolution picks this one first for the subtype.
+     */
+    @ExceptionHandler(DeadlockLoserDataAccessException.class)
+    public ResponseEntity<ErrorResponse> handleDeadlock(DeadlockLoserDataAccessException ex) {
+        log.warn("Deadlock detected while processing request; transaction rolled back as the deadlock loser", ex);
+        return ResponseEntity.status(HttpStatus.CONFLICT)
+                .body(new ErrorResponse("DEADLOCK_DETECTED", "The operation was rolled back after a database deadlock; please retry"));
+    }
+
+    /**
      * CSR-17: a bounded {@code SET LOCAL lock_timeout} on the claim/cancel/retry transactions can
      * surface as any of these three exception types depending on exactly where Postgres's 55P03 error
      * is translated. Mapped to a clean {@code 409}, never a raw {@code 500} — the caller should simply
-     * retry shortly.
+     * retry shortly. ({@link DeadlockLoserDataAccessException}, a subtype of {@link
+     * PessimisticLockingFailureException}, is handled separately above with its own error code — F-DC-08.)
      */
     @ExceptionHandler({QueryTimeoutException.class, PessimisticLockingFailureException.class, CannotAcquireLockException.class})
     public ResponseEntity<ErrorResponse> handleLockTimeout(Exception ex) {
