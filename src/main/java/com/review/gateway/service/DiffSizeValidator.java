@@ -45,6 +45,9 @@ public class DiffSizeValidator {
 
     /**
      * @throws DiffTooLargeException if the diff's estimated token count exceeds {@link #budgetTokens()}
+     *         (the single-chunk budget). Retained for direct unit coverage of the underlying budget
+     *         math; {@code ReviewService}'s request path no longer calls this directly (a diff over
+     *         this budget is now chunked, not rejected outright) — see {@link #rejectIfAbsurdlyLarge}.
      */
     public void validate(String diff) {
         int estimated = estimateTokens(diff);
@@ -54,5 +57,34 @@ public class DiffSizeValidator {
             throw new DiffTooLargeException(
                     "Diff too large: estimated " + estimated + " tokens exceeds budget of " + budget + " tokens");
         }
+    }
+
+    /**
+     * CSR-01: cheap, pre-chunking fail-fast guard. Diffs within this (much larger) absolute ceiling are
+     * candidates for {@code DiffChunker} to split; anything beyond it is rejected with the existing
+     * {@code 422 DIFF_TOO_LARGE} before {@code DiffChunker.split} ever runs, so an absurdly large
+     * request can't be fully line-scanned first. The ceiling is
+     * {@code max-chunks * (budgetTokens() - chunk-header-reserve-tokens)} — the maximum number of
+     * tokens {@code DiffChunker} could ever successfully pack into {@code max-chunks} chunks.
+     *
+     * @throws DiffTooLargeException if the diff's estimated token count exceeds that ceiling
+     */
+    public void rejectIfAbsurdlyLarge(String diff) {
+        int estimated = estimateTokens(diff);
+        long ceiling = absurdlyLargeCeilingTokens();
+        if (estimated > ceiling) {
+            log.info("Rejecting diff before chunking: estimated {} tokens exceeds the absolute max of {} tokens "
+                    + "(max-chunks={})", estimated, ceiling, properties.getDiff().getMaxChunks());
+            throw new DiffTooLargeException("Diff too large: estimated " + estimated
+                    + " tokens exceeds the absolute max of " + ceiling + " tokens (max-chunks="
+                    + properties.getDiff().getMaxChunks() + ")");
+        }
+    }
+
+    /** @return {@code max-chunks * (budgetTokens() - chunk-header-reserve-tokens)}, floored at {@code max-chunks}. */
+    public long absurdlyLargeCeilingTokens() {
+        GatewayProperties.Diff cfg = properties.getDiff();
+        int perChunkBudget = Math.max(1, budgetTokens() - cfg.getChunkHeaderReserveTokens());
+        return (long) Math.max(1, cfg.getMaxChunks()) * perChunkBudget;
     }
 }

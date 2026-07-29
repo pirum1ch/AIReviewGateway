@@ -12,4 +12,9 @@ public class InvalidStateTransitionException extends RuntimeException {
     public InvalidStateTransitionException(ReviewStatus from, ReviewStatus to) {
         super("Illegal Review state transition: " + from + " -> " + to);
     }
+
+    /** V2 (diff chunking): used by {@code JobStateMachine} for job-level (not Review-level) transitions. */
+    public InvalidStateTransitionException(String message) {
+        super(message);
+    }
 }

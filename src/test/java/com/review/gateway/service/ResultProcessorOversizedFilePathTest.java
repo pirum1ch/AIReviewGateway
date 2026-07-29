@@ -6,14 +6,17 @@ import com.review.gateway.model.Backend;
 import com.review.gateway.model.Review;
 import com.review.gateway.model.ReviewComment;
 import com.review.gateway.model.ReviewJob;
+import com.review.gateway.model.enums.JobStatus;
 import com.review.gateway.model.enums.ReviewStatus;
 import com.review.gateway.repository.BackendRepository;
+import com.review.gateway.repository.ReviewChunkRepository;
 import com.review.gateway.repository.ReviewCommentRepository;
 import com.review.gateway.repository.ReviewEventRepository;
 import com.review.gateway.repository.ReviewJobRepository;
 import com.review.gateway.repository.ReviewResultRepository;
 import com.review.gateway.repository.ReviewRepository;
 import com.review.gateway.service.dto.SubmitResultCommand;
+import jakarta.persistence.EntityManager;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -50,6 +53,8 @@ class ResultProcessorOversizedFilePathTest extends AbstractPostgresIntegrationTe
     @Autowired
     private ReviewJobRepository reviewJobRepository;
     @Autowired
+    private ReviewChunkRepository reviewChunkRepository;
+    @Autowired
     private ReviewResultRepository reviewResultRepository;
     @Autowired
     private ReviewCommentRepository reviewCommentRepository;
@@ -59,6 +64,8 @@ class ResultProcessorOversizedFilePathTest extends AbstractPostgresIntegrationTe
     private BackendRepository backendRepository;
     @Autowired
     private PlatformTransactionManager transactionManager;
+    @Autowired
+    private EntityManager entityManager;
 
     @AfterEach
     void cleanUpCommittedRows() {
@@ -69,8 +76,12 @@ class ResultProcessorOversizedFilePathTest extends AbstractPostgresIntegrationTe
     private ResultProcessor newResultProcessor(CommentParser commentParser) {
         EventService eventService = new EventService(reviewEventRepository);
         StateMachine stateMachine = new StateMachine(eventService);
+        JobStateMachine jobStateMachine = new JobStateMachine(eventService);
+        GatewayProperties properties = new GatewayProperties();
+        ChunkCoordinator chunkCoordinator = new ChunkCoordinator(reviewRepository, reviewJobRepository,
+                reviewChunkRepository, reviewCommentRepository, stateMachine, jobStateMachine, properties, entityManager, transactionManager);
         return new ResultProcessor(reviewRepository, reviewJobRepository, reviewResultRepository,
-                reviewCommentRepository, commentParser, stateMachine, new GatewayProperties(), transactionManager);
+                commentParser, jobStateMachine, chunkCoordinator, properties, transactionManager);
     }
 
     private Review persistRunningReview(String headSha) {
@@ -84,6 +95,7 @@ class ResultProcessorOversizedFilePathTest extends AbstractPostgresIntegrationTe
         Backend backend = backendRepository.saveAndFlush(
                 new Backend("backend-fp-" + review.getId(), "https://backend-fp.local", "model", 1));
         ReviewJob job = new ReviewJob(review.getId(), backend.getId(), "worker-1");
+        job.setStatus(JobStatus.RUNNING);
         job.setStartedAt(Instant.now());
         return reviewJobRepository.saveAndFlush(job);
     }
@@ -106,7 +118,7 @@ class ResultProcessorOversizedFilePathTest extends AbstractPostgresIntegrationTe
                         + "review_comments.file_path VARCHAR(1024)")
                 .doesNotThrowAnyException();
 
-        assertThat(reviewResultRepository.existsByReviewId(review.getId())).isTrue();
+        assertThat(reviewResultRepository.existsByReviewIdAndChunkIndex(review.getId(), 0)).isTrue();
 
         Review reloaded = reviewRepository.findById(review.getId()).orElseThrow();
         assertThat(reloaded.getStatus()).isEqualTo(ReviewStatus.COMPLETED);

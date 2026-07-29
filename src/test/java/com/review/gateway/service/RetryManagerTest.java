@@ -1,101 +1,149 @@
 package com.review.gateway.service;
 
+import com.review.gateway.AbstractPostgresIntegrationTest;
 import com.review.gateway.config.GatewayProperties;
+import com.review.gateway.model.Backend;
 import com.review.gateway.model.Review;
 import com.review.gateway.model.ReviewJob;
 import com.review.gateway.model.enums.EventType;
+import com.review.gateway.model.enums.JobStatus;
 import com.review.gateway.model.enums.ReviewStatus;
+import com.review.gateway.repository.BackendRepository;
+import com.review.gateway.repository.ReviewChunkRepository;
+import com.review.gateway.repository.ReviewCommentRepository;
+import com.review.gateway.repository.ReviewEventRepository;
 import com.review.gateway.repository.ReviewJobRepository;
 import com.review.gateway.repository.ReviewRepository;
-import org.junit.jupiter.api.BeforeEach;
+import jakarta.persistence.EntityManager;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
-import org.mockito.Mockito;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.annotation.Propagation;
+import org.springframework.transaction.annotation.Transactional;
 
-import java.util.Optional;
+import java.util.List;
 
-import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.eq;
-import static org.mockito.Mockito.never;
-import static org.mockito.Mockito.verify;
-import static org.mockito.Mockito.when;
+import static org.assertj.core.api.Assertions.assertThat;
 
-class RetryManagerTest {
+/**
+ * V2 (diff chunking) rewrite: {@link RetryManager} now operates at the job level, locking the job row
+ * first (CSR-18) and updating the parent review's derived status independently afterward (via
+ * {@link ChunkCoordinator}, CSR-17). Both phases open genuinely separate, committed transactions, so
+ * this is a real-database integration test (like {@code ResultProcessorTest}) rather than a pure
+ * Mockito unit test.
+ */
+@Transactional(propagation = Propagation.NOT_SUPPORTED)
+class RetryManagerTest extends AbstractPostgresIntegrationTest {
 
+    @Autowired
     private ReviewRepository reviewRepository;
+    @Autowired
     private ReviewJobRepository reviewJobRepository;
-    private StateMachine stateMachine;
-    private GatewayProperties properties;
-    private RetryManager retryManager;
+    @Autowired
+    private ReviewChunkRepository reviewChunkRepository;
+    @Autowired
+    private ReviewCommentRepository reviewCommentRepository;
+    @Autowired
+    private ReviewEventRepository reviewEventRepository;
+    @Autowired
+    private BackendRepository backendRepository;
+    @Autowired
+    private PlatformTransactionManager transactionManager;
+    @Autowired
+    private EntityManager entityManager;
 
-    @BeforeEach
-    void setUp() {
-        reviewRepository = Mockito.mock(ReviewRepository.class);
-        reviewJobRepository = Mockito.mock(ReviewJobRepository.class);
-        stateMachine = Mockito.mock(StateMachine.class);
-        properties = new GatewayProperties();
-        properties.getRetry().setMaxAttempts(3);
-        retryManager = new RetryManager(reviewRepository, reviewJobRepository, stateMachine, properties);
+    @AfterEach
+    void cleanUpCommittedRows() {
+        reviewRepository.deleteAll();
+        backendRepository.deleteAll();
     }
 
-    private Review runningReviewWithAttempts(int attempts) {
-        Review review = new Review(1L, 2L, "sha", "base", "v1", 10);
+    private RetryManager newRetryManager(int maxAttempts) {
+        EventService eventService = new EventService(reviewEventRepository);
+        StateMachine stateMachine = new StateMachine(eventService);
+        JobStateMachine jobStateMachine = new JobStateMachine(eventService);
+        GatewayProperties properties = new GatewayProperties();
+        properties.getRetry().setMaxAttempts(maxAttempts);
+        ChunkCoordinator chunkCoordinator = new ChunkCoordinator(reviewRepository, reviewJobRepository,
+                reviewChunkRepository, reviewCommentRepository, stateMachine, jobStateMachine, properties, entityManager, transactionManager);
+        return new RetryManager(reviewJobRepository, jobStateMachine, chunkCoordinator, properties, entityManager, transactionManager);
+    }
+
+    private Review persistRunningReview(String headSha) {
+        Review review = new Review(1L, 2L, headSha, "base", "v1", 10);
         review.setStatus(ReviewStatus.RUNNING);
-        review.setAttempts(attempts);
-        return review;
+        return reviewRepository.saveAndFlush(review);
+    }
+
+    private ReviewJob persistRunningJob(Review review, int attempts) {
+        Backend backend = backendRepository.saveAndFlush(
+                new Backend("backend-retry-" + review.getId(), "https://backend-retry.local", "model", 1));
+        ReviewJob job = new ReviewJob(review.getId(), backend.getId(), "worker-7");
+        job.setStatus(JobStatus.RUNNING);
+        job.setAttempts(attempts);
+        return reviewJobRepository.saveAndFlush(job);
     }
 
     @Test
-    void belowMaxAttemptsRequeues() {
-        Review review = runningReviewWithAttempts(2); // 2 < 3 -> still has another try
-        when(reviewRepository.findById(10L)).thenReturn(Optional.of(review));
-        when(reviewJobRepository.findByReviewId(10L)).thenReturn(Optional.empty());
+    void belowMaxAttemptsRequeuesTheJobAndKeepsTheReviewRunning() {
+        Review review = persistRunningReview("sha-below-max");
+        ReviewJob job = persistRunningJob(review, 2); // 2 < 3 -> still has another try
 
-        retryManager.requeueOrFail(10L, "heartbeat timeout");
+        RetryManager retryManager = newRetryManager(3);
+        retryManager.requeueOrFail(job.getId(), "heartbeat timeout");
 
-        verify(stateMachine).transition(eq(review), eq(ReviewStatus.QUEUED), eq(EventType.RETRY), any(), any(), any());
+        ReviewJob reloadedJob = reviewJobRepository.findById(job.getId()).orElseThrow();
+        assertThat(reloadedJob.getStatus()).isEqualTo(JobStatus.QUEUED);
+
+        Review reloadedReview = reviewRepository.findById(review.getId()).orElseThrow();
+        assertThat(reloadedReview.getStatus()).isEqualTo(ReviewStatus.QUEUED);
+
+        List<com.review.gateway.model.ReviewEvent> events =
+                reviewEventRepository.findByReviewIdOrderByCreatedAtAsc(review.getId());
+        assertThat(events).extracting(com.review.gateway.model.ReviewEvent::getEventType).contains(EventType.RETRY);
     }
 
     @Test
-    void atMaxAttemptsFails() {
-        Review review = runningReviewWithAttempts(3); // 3 >= 3 -> exhausted
-        when(reviewRepository.findById(11L)).thenReturn(Optional.of(review));
-        when(reviewJobRepository.findByReviewId(11L)).thenReturn(Optional.empty());
+    void atMaxAttemptsFailsTheJobAndTheReview() {
+        Review review = persistRunningReview("sha-at-max");
+        ReviewJob job = persistRunningJob(review, 3); // 3 >= 3 -> exhausted
 
-        retryManager.requeueOrFail(11L, "heartbeat timeout");
+        RetryManager retryManager = newRetryManager(3);
+        retryManager.requeueOrFail(job.getId(), "heartbeat timeout");
 
-        verify(stateMachine).transition(eq(review), eq(ReviewStatus.FAILED), eq(EventType.FAILED), any(), any(), any());
+        ReviewJob reloadedJob = reviewJobRepository.findById(job.getId()).orElseThrow();
+        assertThat(reloadedJob.getStatus()).isEqualTo(JobStatus.FAILED);
+
+        Review reloadedReview = reviewRepository.findById(review.getId()).orElseThrow();
+        assertThat(reloadedReview.getStatus()).isEqualTo(ReviewStatus.FAILED);
     }
 
     @Test
-    void reviewNoLongerRunningIsANoOp() {
-        Review review = runningReviewWithAttempts(1);
-        review.setStatus(ReviewStatus.COMPLETED);
-        when(reviewRepository.findById(12L)).thenReturn(Optional.of(review));
+    void jobNoLongerRunningIsANoOp() {
+        Review review = persistRunningReview("sha-not-running");
+        ReviewJob job = persistRunningJob(review, 1);
+        job.setStatus(JobStatus.COMPLETED);
+        reviewJobRepository.saveAndFlush(job);
 
-        retryManager.requeueOrFail(12L, "heartbeat timeout");
+        Review completedReview = reviewRepository.findById(review.getId()).orElseThrow();
+        completedReview.setStatus(ReviewStatus.COMPLETED);
+        reviewRepository.saveAndFlush(completedReview);
 
-        verify(stateMachine, never()).transition(any(), any(), any(), any(), any(), any());
+        RetryManager retryManager = newRetryManager(3);
+        retryManager.requeueOrFail(job.getId(), "heartbeat timeout");
+
+        ReviewJob reloadedJob = reviewJobRepository.findById(job.getId()).orElseThrow();
+        assertThat(reloadedJob.getStatus()).isEqualTo(JobStatus.COMPLETED);
+        Review reloadedReview = reviewRepository.findById(review.getId()).orElseThrow();
+        assertThat(reloadedReview.getStatus()).isEqualTo(ReviewStatus.COMPLETED);
     }
 
     @Test
-    void missingReviewIsANoOp() {
-        when(reviewRepository.findById(13L)).thenReturn(Optional.empty());
+    void missingJobIsANoOp() {
+        RetryManager retryManager = newRetryManager(3);
 
-        retryManager.requeueOrFail(13L, "heartbeat timeout");
-
-        verify(stateMachine, never()).transition(any(), any(), any(), any(), any(), any());
-    }
-
-    @Test
-    void attributionIsPulledFromTheCurrentJobWhenPresent() {
-        Review review = runningReviewWithAttempts(1);
-        ReviewJob job = new ReviewJob(10L, 99L, "worker-7");
-        when(reviewRepository.findById(20L)).thenReturn(Optional.of(review));
-        when(reviewJobRepository.findByReviewId(20L)).thenReturn(Optional.of(job));
-
-        retryManager.requeueOrFail(20L, "heartbeat timeout");
-
-        verify(stateMachine).transition(eq(review), eq(ReviewStatus.QUEUED), eq(EventType.RETRY),
-                eq("worker-7"), eq(99L), any());
+        // Must not throw for a job id that doesn't exist.
+        retryManager.requeueOrFail(999_999L, "heartbeat timeout");
     }
 }

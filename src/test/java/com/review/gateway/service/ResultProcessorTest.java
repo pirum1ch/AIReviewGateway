@@ -5,14 +5,17 @@ import com.review.gateway.config.GatewayProperties;
 import com.review.gateway.model.Backend;
 import com.review.gateway.model.Review;
 import com.review.gateway.model.ReviewJob;
+import com.review.gateway.model.enums.JobStatus;
 import com.review.gateway.model.enums.ReviewStatus;
 import com.review.gateway.repository.BackendRepository;
+import com.review.gateway.repository.ReviewChunkRepository;
 import com.review.gateway.repository.ReviewCommentRepository;
 import com.review.gateway.repository.ReviewEventRepository;
 import com.review.gateway.repository.ReviewJobRepository;
 import com.review.gateway.repository.ReviewResultRepository;
 import com.review.gateway.repository.ReviewRepository;
 import com.review.gateway.service.dto.SubmitResultCommand;
+import jakarta.persistence.EntityManager;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
@@ -25,6 +28,8 @@ import java.time.Instant;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.when;
 
 /**
@@ -54,6 +59,8 @@ class ResultProcessorTest extends AbstractPostgresIntegrationTest {
     @Autowired
     private ReviewJobRepository reviewJobRepository;
     @Autowired
+    private ReviewChunkRepository reviewChunkRepository;
+    @Autowired
     private ReviewResultRepository reviewResultRepository;
     @Autowired
     private ReviewCommentRepository reviewCommentRepository;
@@ -63,6 +70,8 @@ class ResultProcessorTest extends AbstractPostgresIntegrationTest {
     private BackendRepository backendRepository;
     @Autowired
     private PlatformTransactionManager transactionManager;
+    @Autowired
+    private EntityManager entityManager;
 
     /**
      * With {@code @Transactional(NOT_SUPPORTED)} disabling {@code @DataJpaTest}'s default per-test
@@ -86,8 +95,11 @@ class ResultProcessorTest extends AbstractPostgresIntegrationTest {
     private ResultProcessor newResultProcessor(CommentParser commentParser, GatewayProperties properties) {
         EventService eventService = new EventService(reviewEventRepository);
         StateMachine stateMachine = new StateMachine(eventService);
+        JobStateMachine jobStateMachine = new JobStateMachine(eventService);
+        ChunkCoordinator chunkCoordinator = new ChunkCoordinator(reviewRepository, reviewJobRepository,
+                reviewChunkRepository, reviewCommentRepository, stateMachine, jobStateMachine, properties, entityManager, transactionManager);
         return new ResultProcessor(reviewRepository, reviewJobRepository, reviewResultRepository,
-                reviewCommentRepository, commentParser, stateMachine, properties, transactionManager);
+                commentParser, jobStateMachine, chunkCoordinator, properties, transactionManager);
     }
 
     private Review persistRunningReview(String headSha) {
@@ -101,6 +113,7 @@ class ResultProcessorTest extends AbstractPostgresIntegrationTest {
         Backend backend = backendRepository.saveAndFlush(
                 new Backend("backend-rp-" + review.getId(), "https://backend-rp.local", "model", 1));
         ReviewJob job = new ReviewJob(review.getId(), backend.getId(), "worker-1");
+        job.setStatus(JobStatus.RUNNING);
         job.setStartedAt(Instant.now());
         return reviewJobRepository.saveAndFlush(job);
     }
@@ -111,15 +124,15 @@ class ResultProcessorTest extends AbstractPostgresIntegrationTest {
         ReviewJob job = persistJob(review);
 
         CommentParser commentParser = Mockito.mock(CommentParser.class);
-        when(commentParser.parse("raw-broken")).thenThrow(new RuntimeException("boom"));
+        when(commentParser.parse(eq("raw-broken"), anyInt())).thenThrow(new RuntimeException("boom"));
 
         ResultProcessor processor = newResultProcessor(commentParser);
         ReviewStatus finalStatus = processor.process(review.getId(), job.getId(), "worker-1", job.getBackendId(),
                 new SubmitResultCommand("raw-broken", 10, 5, 1000L, "model-x"));
 
         assertThat(finalStatus).isEqualTo(ReviewStatus.FAILED);
-        assertThat(reviewResultRepository.existsByReviewId(review.getId())).isTrue();
-        assertThat(reviewResultRepository.findByReviewId(review.getId()).orElseThrow().getRawResponse())
+        assertThat(reviewResultRepository.existsByReviewIdAndChunkIndex(review.getId(), 0)).isTrue();
+        assertThat(reviewResultRepository.findByReviewIdAndChunkIndex(review.getId(), 0).orElseThrow().getRawResponse())
                 .isEqualTo("raw-broken");
         assertThat(reviewCommentRepository.findByReviewId(review.getId())).isEmpty();
 
@@ -140,7 +153,7 @@ class ResultProcessorTest extends AbstractPostgresIntegrationTest {
                 new SubmitResultCommand(raw, 10, 5, 1000L, "model-x"));
 
         assertThat(finalStatus).isEqualTo(ReviewStatus.COMPLETED);
-        assertThat(reviewResultRepository.existsByReviewId(review.getId())).isTrue();
+        assertThat(reviewResultRepository.existsByReviewIdAndChunkIndex(review.getId(), 0)).isTrue();
         assertThat(reviewCommentRepository.findByReviewId(review.getId())).hasSize(1);
         assertThat(reviewCommentRepository.findByReviewId(review.getId()).get(0).getComment()).contains("Fix this");
 
@@ -163,7 +176,7 @@ class ResultProcessorTest extends AbstractPostgresIntegrationTest {
         processor.process(review.getId(), job.getId(), "worker-1", job.getBackendId(),
                 new SubmitResultCommand("first raw response", 1, 1, 10L, "model-x"));
 
-        long resultCountAfterFirst = reviewResultRepository.findByReviewId(review.getId()).stream().count();
+        long resultCountAfterFirst = reviewResultRepository.findByReviewIdAndChunkIndex(review.getId(), 0).stream().count();
 
         // Simulate a retried delivery of the exact same result after the Review already moved on
         // (ResultProcessor itself doesn't re-check RUNNING -- that's QueueManager's job -- but its
@@ -171,7 +184,7 @@ class ResultProcessorTest extends AbstractPostgresIntegrationTest {
         processor.process(review.getId(), job.getId(), "worker-1", job.getBackendId(),
                 new SubmitResultCommand("first raw response", 1, 1, 10L, "model-x"));
 
-        assertThat(reviewResultRepository.findByReviewId(review.getId()).orElseThrow().getRawResponse())
+        assertThat(reviewResultRepository.findByReviewIdAndChunkIndex(review.getId(), 0).orElseThrow().getRawResponse())
                 .isEqualTo("first raw response");
         assertThat(resultCountAfterFirst).isEqualTo(1);
     }
@@ -195,7 +208,7 @@ class ResultProcessorTest extends AbstractPostgresIntegrationTest {
         assertThat(finalStatus).isEqualTo(ReviewStatus.COMPLETED);
 
         // Stored raw_response must be capped, never the full 1000-char payload (SR-21).
-        String storedRaw = reviewResultRepository.findByReviewId(review.getId()).orElseThrow().getRawResponse();
+        String storedRaw = reviewResultRepository.findByReviewIdAndChunkIndex(review.getId(), 0).orElseThrow().getRawResponse();
         assertThat(storedRaw).hasSizeLessThanOrEqualTo(100);
         assertThat(storedRaw).contains("TRUNCATED");
         assertThat(storedRaw).doesNotContain("x".repeat(200)); // the full-length run of x's must not survive intact
@@ -225,7 +238,7 @@ class ResultProcessorTest extends AbstractPostgresIntegrationTest {
         processor.process(review.getId(), job.getId(), "worker-1", job.getBackendId(),
                 new SubmitResultCommand(withinCapRaw, 10, 5, 1000L, "model-x"));
 
-        String storedRaw = reviewResultRepository.findByReviewId(review.getId()).orElseThrow().getRawResponse();
+        String storedRaw = reviewResultRepository.findByReviewIdAndChunkIndex(review.getId(), 0).orElseThrow().getRawResponse();
         assertThat(storedRaw).isEqualTo(withinCapRaw);
 
         List<com.review.gateway.model.ReviewEvent> events = reviewEventRepository.findByReviewIdOrderByCreatedAtAsc(review.getId());

@@ -184,7 +184,8 @@ public class WorkerLoop {
         AbortSignal abortSignal = new AbortSignal();
         currentAbortSignal = abortSignal;
         try {
-            ResolvedPrompt prompt = promptTemplateService.resolve(job.payload().promptVersion(), job.payload().diff());
+            ResolvedPrompt prompt = promptTemplateService.resolve(
+                    job.payload().promptVersion(), job.payload().diff(), job.payload().chunkContext());
 
             heartbeatScheduler.start(job.jobId(), workerId, abortSignal);
             try {

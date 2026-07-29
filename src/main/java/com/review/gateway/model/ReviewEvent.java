@@ -40,6 +40,14 @@ public class ReviewEvent {
     @Column(name = "backend_id", updatable = false)
     private Long backendId;
 
+    /** Audit/debug only (V2, diff chunking) — no constraint, nullable. */
+    @Column(name = "chunk_index", updatable = false)
+    private Integer chunkIndex;
+
+    /** Audit/debug only (V2, diff chunking) — no constraint, nullable. */
+    @Column(name = "job_id", updatable = false)
+    private Long jobId;
+
     @Column(name = "details", updatable = false)
     private String details;
 
@@ -52,10 +60,17 @@ public class ReviewEvent {
 
     public ReviewEvent(Long reviewId, EventType eventType, String workerId, Long backendId,
                        String details) {
+        this(reviewId, eventType, workerId, backendId, null, null, details);
+    }
+
+    public ReviewEvent(Long reviewId, EventType eventType, String workerId, Long backendId,
+                       Integer chunkIndex, Long jobId, String details) {
         this.reviewId = Objects.requireNonNull(reviewId, "reviewId");
         this.eventType = Objects.requireNonNull(eventType, "eventType");
         this.workerId = workerId;
         this.backendId = backendId;
+        this.chunkIndex = chunkIndex;
+        this.jobId = jobId;
         this.details = details;
     }
 
@@ -82,6 +97,14 @@ public class ReviewEvent {
 
     public Long getBackendId() {
         return backendId;
+    }
+
+    public Integer getChunkIndex() {
+        return chunkIndex;
+    }
+
+    public Long getJobId() {
+        return jobId;
     }
 
     public String getDetails() {

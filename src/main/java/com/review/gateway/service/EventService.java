@@ -45,11 +45,22 @@ public class EventService {
      */
     @Transactional
     public ReviewEvent record(Long reviewId, EventType eventType, String workerId, Long backendId, String details) {
+        return record(reviewId, eventType, workerId, backendId, null, null, details);
+    }
+
+    /**
+     * V2 (diff chunking) overload: same as {@link #record(Long, EventType, String, Long, String)} but
+     * additionally attributes the event to a specific chunk/job (audit/debug only — {@code
+     * chunk_index}/{@code job_id} carry no constraint and are never used for dedup/business logic).
+     */
+    @Transactional
+    public ReviewEvent record(Long reviewId, EventType eventType, String workerId, Long backendId,
+                               Integer chunkIndex, Long jobId, String details) {
         String scrubbed = scrub(details);
-        ReviewEvent event = new ReviewEvent(reviewId, eventType, workerId, backendId, scrubbed);
+        ReviewEvent event = new ReviewEvent(reviewId, eventType, workerId, backendId, chunkIndex, jobId, scrubbed);
         ReviewEvent saved = reviewEventRepository.save(event);
-        log.debug("review_events: reviewId={} type={} workerId={} backendId={} details={}",
-                reviewId, eventType, workerId, backendId, scrubbed);
+        log.debug("review_events: reviewId={} type={} workerId={} backendId={} chunkIndex={} jobId={} details={}",
+                reviewId, eventType, workerId, backendId, chunkIndex, jobId, scrubbed);
         return saved;
     }
 

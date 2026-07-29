@@ -1,7 +1,10 @@
 package com.review.gateway.model;
 
+import com.review.gateway.model.enums.JobStatus;
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
+import jakarta.persistence.EnumType;
+import jakarta.persistence.Enumerated;
 import jakarta.persistence.GeneratedValue;
 import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
@@ -13,10 +16,12 @@ import java.time.Instant;
 import java.util.Objects;
 
 /**
- * Current execution record for a {@link Review} → {@code review_jobs}, 1:1 with {@code reviews}.
- * Carries no status/priority/dedup columns — {@code reviews.status} is the sole status owner; per-
- * attempt history lives in {@code review_events}. Re-claimed on retry via {@code ON CONFLICT
- * (review_id) DO UPDATE} at the repository layer (see architecture §5).
+ * Execution record for one chunk of a {@link Review} → {@code review_jobs} (V2, diff chunking:
+ * 1:N per review, one row per {@link ReviewChunk}). <b>The queue owner</b> as of V2 — {@code status}/
+ * {@code priority}/{@code attempts} live here now, not on {@code reviews}; {@code reviews.status} is
+ * instead derived from the set of a review's job statuses by {@code ChunkCoordinator} and applied
+ * through the existing {@code StateMachine}. Every transition of {@link #status} happens only through
+ * {@code JobStateMachine}.
  */
 @Entity
 @Table(name = "review_jobs")
@@ -26,8 +31,24 @@ public class ReviewJob {
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
 
-    @Column(name = "review_id", nullable = false, unique = true, updatable = false)
+    @Column(name = "review_id", nullable = false, updatable = false)
     private Long reviewId;
+
+    @Column(name = "chunk_id", updatable = false)
+    private Long chunkId;
+
+    @Column(name = "chunk_index", nullable = false, updatable = false)
+    private Integer chunkIndex;
+
+    @Enumerated(EnumType.STRING)
+    @Column(name = "status", nullable = false, length = 16)
+    private JobStatus status;
+
+    @Column(name = "priority", nullable = false)
+    private Integer priority;
+
+    @Column(name = "attempts", nullable = false)
+    private Integer attempts;
 
     @Column(name = "backend_id")
     private Long backendId;
@@ -60,8 +81,22 @@ public class ReviewJob {
     protected ReviewJob() {
     }
 
+    /**
+     * Convenience constructor for the (still-common, single-chunk) case: {@code chunkId=null},
+     * {@code chunkIndex=0}, default {@code priority=10}, {@code attempts=0}, {@code status=QUEUED}.
+     * Callers that create multiple chunks per review should use the full constructor instead.
+     */
     public ReviewJob(Long reviewId, Long backendId, String workerId) {
+        this(reviewId, null, 0, 10, workerId, backendId);
+    }
+
+    public ReviewJob(Long reviewId, Long chunkId, Integer chunkIndex, Integer priority, String workerId, Long backendId) {
         this.reviewId = Objects.requireNonNull(reviewId, "reviewId");
+        this.chunkId = chunkId;
+        this.chunkIndex = chunkIndex != null ? chunkIndex : 0;
+        this.status = JobStatus.QUEUED;
+        this.priority = priority != null ? priority : 10;
+        this.attempts = 0;
         this.backendId = backendId;
         this.workerId = workerId;
     }
@@ -84,6 +119,42 @@ public class ReviewJob {
 
     public Long getReviewId() {
         return reviewId;
+    }
+
+    public Long getChunkId() {
+        return chunkId;
+    }
+
+    public Integer getChunkIndex() {
+        return chunkIndex;
+    }
+
+    public JobStatus getStatus() {
+        return status;
+    }
+
+    public void setStatus(JobStatus status) {
+        this.status = Objects.requireNonNull(status, "status");
+    }
+
+    public Integer getPriority() {
+        return priority;
+    }
+
+    public void setPriority(Integer priority) {
+        this.priority = Objects.requireNonNull(priority, "priority");
+    }
+
+    public Integer getAttempts() {
+        return attempts;
+    }
+
+    public void setAttempts(Integer attempts) {
+        this.attempts = Objects.requireNonNull(attempts, "attempts");
+    }
+
+    public void incrementAttempts() {
+        this.attempts = this.attempts + 1;
     }
 
     public Long getBackendId() {

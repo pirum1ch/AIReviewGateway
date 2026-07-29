@@ -117,7 +117,7 @@ class SchemaConstraintsTest extends AbstractPostgresIntegrationTest {
         Long backendId = insertBackend("cascade-backend");
 
         jdbc().update("INSERT INTO review_inputs (review_id, diff, prompt_version, head_sha, base_sha) VALUES (?, 'diff', 'v1', 'sha-cascade', 'base')", reviewId);
-        jdbc().update("INSERT INTO review_jobs (review_id, backend_id, worker_id) VALUES (?, ?, 'worker-1')", reviewId, backendId);
+        jdbc().update("INSERT INTO review_jobs (review_id, backend_id, worker_id, status) VALUES (?, ?, 'worker-1', 'RUNNING')", reviewId, backendId);
         jdbc().update("INSERT INTO review_results (review_id, raw_response) VALUES (?, 'raw')", reviewId);
         jdbc().update("INSERT INTO review_comments (review_id, comment) VALUES (?, 'a comment')", reviewId);
         jdbc().update("INSERT INTO review_events (review_id, event_type) VALUES (?, 'CREATED')", reviewId);

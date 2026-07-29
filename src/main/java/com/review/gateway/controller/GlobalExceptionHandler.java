@@ -2,11 +2,15 @@ package com.review.gateway.controller;
 
 import com.review.gateway.dto.ErrorResponse;
 import com.review.gateway.exception.DiffTooLargeException;
+import com.review.gateway.exception.IncompatiblePromptVersionException;
 import com.review.gateway.exception.InvalidStateTransitionException;
 import com.review.gateway.exception.JobNotClaimableException;
 import com.review.gateway.exception.ReviewNotFoundException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.dao.CannotAcquireLockException;
+import org.springframework.dao.PessimisticLockingFailureException;
+import org.springframework.dao.QueryTimeoutException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
@@ -48,6 +52,25 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ErrorResponse> handleJobNotClaimable(JobNotClaimableException ex) {
         return ResponseEntity.status(HttpStatus.CONFLICT)
                 .body(new ErrorResponse("JOB_NOT_CLAIMABLE", ex.getMessage()));
+    }
+
+    @ExceptionHandler(IncompatiblePromptVersionException.class)
+    public ResponseEntity<ErrorResponse> handleIncompatiblePromptVersion(IncompatiblePromptVersionException ex) {
+        return ResponseEntity.status(HttpStatus.UNPROCESSABLE_ENTITY)
+                .body(new ErrorResponse("PROMPT_VERSION_INCOMPATIBLE_WITH_CHUNKING", ex.getMessage()));
+    }
+
+    /**
+     * CSR-17: a bounded {@code SET LOCAL lock_timeout} on the claim/cancel/retry transactions can
+     * surface as any of these three exception types depending on exactly where Postgres's 55P03 error
+     * is translated. Mapped to a clean {@code 409}, never a raw {@code 500} — the caller should simply
+     * retry shortly.
+     */
+    @ExceptionHandler({QueryTimeoutException.class, PessimisticLockingFailureException.class, CannotAcquireLockException.class})
+    public ResponseEntity<ErrorResponse> handleLockTimeout(Exception ex) {
+        log.warn("Lock-timeout while processing request: {}", ex.getClass().getSimpleName());
+        return ResponseEntity.status(HttpStatus.CONFLICT)
+                .body(new ErrorResponse("LOCK_TIMEOUT", "The operation timed out waiting for a database lock; please retry"));
     }
 
     @ExceptionHandler(MethodArgumentNotValidException.class)

@@ -88,8 +88,14 @@ public interface ReviewRepository extends JpaRepository<Review, Long> {
      * through {@code StateMachine} individually — which is what produces one {@code OBSOLETE}
      * {@code review_events} row per affected Review (req. 1.11), rather than a single silent bulk
      * UPDATE with no per-row audit trail.
+     *
+     * <p>CSR-18: locked ({@code FOR UPDATE}, via {@link Lock}) and returned in a deterministic
+     * {@code ORDER BY id} so that two genuinely concurrent multi-row sweeps (e.g. two new head_shas
+     * racing for overlapping MRs) always acquire row locks in the same order and can never deadlock
+     * against each other.
      */
-    List<Review> findByProjectIdAndMergeRequestIdAndHeadShaNotAndStatusIn(
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    List<Review> findByProjectIdAndMergeRequestIdAndHeadShaNotAndStatusInOrderByIdAsc(
             Long projectId, Long mergeRequestId, String headSha, Collection<ReviewStatus> obsoletableStatuses);
 
     /**

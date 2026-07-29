@@ -54,16 +54,16 @@ class MiscRepositoriesTest extends AbstractPostgresIntegrationTest {
     }
 
     @Test
-    void reviewResultRepositoryExistsByReviewIdSupportsIdempotencyCheck() {
+    void reviewResultRepositoryExistsByReviewIdAndChunkIndexSupportsIdempotencyCheck() {
         Review review = persistReview(1L, 2L, "sha-result");
 
-        assertThat(reviewResultRepository.existsByReviewId(review.getId())).isFalse();
+        assertThat(reviewResultRepository.existsByReviewIdAndChunkIndex(review.getId(), 0)).isFalse();
 
-        entityManager.persistAndFlush(new ReviewResult(review.getId(), "raw", "summary",
+        entityManager.persistAndFlush(new ReviewResult(review.getId(), 0, null, "raw", "summary",
                 10, 20, 30, 1000L, "model", null));
 
-        assertThat(reviewResultRepository.existsByReviewId(review.getId())).isTrue();
-        assertThat(reviewResultRepository.findByReviewId(review.getId())).isPresent();
+        assertThat(reviewResultRepository.existsByReviewIdAndChunkIndex(review.getId(), 0)).isTrue();
+        assertThat(reviewResultRepository.findByReviewIdAndChunkIndex(review.getId(), 0)).isPresent();
     }
 
     @Test

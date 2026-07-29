@@ -35,7 +35,7 @@ class TimeoutManagerTest {
 
     @Test
     void sweepStaleHeartbeatsDelegatesEachCandidateToRetryManager() {
-        when(reviewJobRepository.findReviewIdsWithStaleHeartbeat(any())).thenReturn(List.of(1L, 2L, 3L));
+        when(reviewJobRepository.findJobIdsWithStaleHeartbeat(any())).thenReturn(List.of(1L, 2L, 3L));
 
         int count = timeoutManager.sweepStaleHeartbeats();
 
@@ -47,7 +47,7 @@ class TimeoutManagerTest {
 
     @Test
     void sweepStaleHeartbeatsIsANoOpWhenNothingIsStale() {
-        when(reviewJobRepository.findReviewIdsWithStaleHeartbeat(any())).thenReturn(List.of());
+        when(reviewJobRepository.findJobIdsWithStaleHeartbeat(any())).thenReturn(List.of());
 
         int count = timeoutManager.sweepStaleHeartbeats();
 
@@ -57,7 +57,7 @@ class TimeoutManagerTest {
 
     @Test
     void enforceMaxDurationDelegatesEachCandidateToRetryManager() {
-        when(reviewJobRepository.findReviewIdsExceedingMaxDuration(any())).thenReturn(List.of(5L));
+        when(reviewJobRepository.findJobIdsExceedingMaxDuration(any())).thenReturn(List.of(5L));
 
         int count = timeoutManager.enforceMaxDuration();
 
@@ -68,7 +68,7 @@ class TimeoutManagerTest {
     @Test
     void sweepStaleHeartbeatsUsesConfiguredTimeoutAsCutoff() {
         Instant before = Instant.now();
-        when(reviewJobRepository.findReviewIdsWithStaleHeartbeat(any())).thenReturn(List.of());
+        when(reviewJobRepository.findJobIdsWithStaleHeartbeat(any())).thenReturn(List.of());
 
         timeoutManager.sweepStaleHeartbeats();
 

@@ -37,7 +37,7 @@ class JobControllerTest {
     @Test
     void claimReturns200WithPayloadWhenAJobIsAvailable() throws Exception {
         when(queueManager.claim(eq("mac-mini-1"), eq("worker-1")))
-                .thenReturn(Optional.of(new ClaimedJob(10L, 20L, "diff content", "v1")));
+                .thenReturn(Optional.of(new ClaimedJob(10L, 20L, "diff content", "v1", null)));
 
         mockMvc.perform(post("/jobs/claim")
                         .header("Authorization", "Bearer " + SecurityTestTokens.WORKER_TOKEN)

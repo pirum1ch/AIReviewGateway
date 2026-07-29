@@ -1,35 +1,45 @@
 package com.review.gateway.service;
 
 import com.review.gateway.AbstractPostgresIntegrationTest;
+import com.review.gateway.config.GatewayProperties;
 import com.review.gateway.model.Backend;
 import com.review.gateway.model.Review;
+import com.review.gateway.model.ReviewChunk;
 import com.review.gateway.model.ReviewInput;
+import com.review.gateway.model.ReviewJob;
 import com.review.gateway.model.enums.BackendStatus;
 import com.review.gateway.model.enums.ReviewStatus;
 import com.review.gateway.repository.BackendRepository;
+import com.review.gateway.repository.ReviewChunkRepository;
+import com.review.gateway.repository.ReviewCommentRepository;
 import com.review.gateway.repository.ReviewEventRepository;
 import com.review.gateway.repository.ReviewInputRepository;
 import com.review.gateway.repository.ReviewJobRepository;
 import com.review.gateway.repository.ReviewRepository;
 import com.review.gateway.service.dto.ClaimedJob;
+import jakarta.persistence.EntityManager;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.boot.test.autoconfigure.orm.jpa.TestEntityManager;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.annotation.Propagation;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
-import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
  * Fills a coverage gap in {@link QueueManagerIntegrationTest}: that suite proves claim's capacity/
  * status/payload behavior but never exercises the ordering guarantee itself (architecture §5 step 2:
- * {@code ORDER BY priority DESC, created_at ASC}). {@code ReviewRepositoryConcurrentClaimTest}
- * (feature/01-data-model) proves {@code SKIP LOCKED} concurrency safety at the raw-SQL level; this
- * test proves the same ordering holds end-to-end through {@link QueueManager#claim}.
+ * {@code ORDER BY priority DESC, created_at ASC}, now on {@code review_jobs} as of V2 diff chunking).
+ *
+ * <p>{@code @Transactional(NOT_SUPPORTED)}: see {@code QueueManagerIntegrationTest}'s javadoc for why.
  */
+@Transactional(propagation = Propagation.NOT_SUPPORTED)
 class QueueManagerPriorityOrderingIntegrationTest extends AbstractPostgresIntegrationTest {
 
     @Autowired
@@ -39,40 +49,64 @@ class QueueManagerPriorityOrderingIntegrationTest extends AbstractPostgresIntegr
     @Autowired
     private ReviewInputRepository reviewInputRepository;
     @Autowired
+    private ReviewChunkRepository reviewChunkRepository;
+    @Autowired
+    private ReviewCommentRepository reviewCommentRepository;
+    @Autowired
     private BackendRepository backendRepository;
     @Autowired
     private ReviewEventRepository reviewEventRepository;
     @Autowired
-    private TestEntityManager entityManager;
+    private EntityManager entityManager;
+    @Autowired
+    private PlatformTransactionManager transactionManager;
+
+    @AfterEach
+    void cleanUpCommittedRows() {
+        reviewRepository.deleteAll();
+        backendRepository.deleteAll();
+    }
 
     private QueueManager newQueueManager() {
         EventService eventService = new EventService(reviewEventRepository);
         StateMachine stateMachine = new StateMachine(eventService);
+        JobStateMachine jobStateMachine = new JobStateMachine(eventService);
         BackendDispatcher backendDispatcher = new BackendDispatcher(backendRepository, reviewJobRepository);
-        return new QueueManager(reviewRepository, reviewJobRepository, reviewInputRepository,
-                backendDispatcher, stateMachine, eventService, Mockito.mock(ResultProcessor.class));
+        GatewayProperties properties = new GatewayProperties();
+        ChunkCoordinator chunkCoordinator = new ChunkCoordinator(reviewRepository, reviewJobRepository,
+                reviewChunkRepository, reviewCommentRepository, stateMachine, jobStateMachine, properties,
+                entityManager, transactionManager);
+        ChunkContextRenderer chunkContextRenderer = new ChunkContextRenderer(properties);
+        return new QueueManager(reviewRepository, reviewJobRepository, reviewChunkRepository, backendDispatcher,
+                jobStateMachine, chunkCoordinator, eventService, Mockito.mock(ResultProcessor.class),
+                chunkContextRenderer, entityManager, transactionManager);
     }
 
     private Review persistQueuedReview(long mrId, String headSha, int priority, Instant createdAt) {
         Review review = new Review(1L, mrId, headSha, "base", "v1", priority);
         review.setStatus(ReviewStatus.QUEUED);
-        Review saved = entityManager.persistFlushFind(review);
-        entityManager.persistAndFlush(new ReviewInput(saved.getId(), "diff-" + headSha, "v1", headSha, "base", 10));
-        // createdAt is DB-defaulted (now()) at insert time; force the intended ordering with a direct update
-        // so the test can express "arrived earlier" deterministically regardless of wall-clock granularity.
-        entityManager.getEntityManager()
-                .createNativeQuery("UPDATE reviews SET created_at = ?1 WHERE id = ?2")
-                .setParameter(1, createdAt)
-                .setParameter(2, saved.getId())
-                .executeUpdate();
-        entityManager.getEntityManager().clear();
-        return saved;
+        review = reviewRepository.saveAndFlush(review);
+        reviewInputRepository.saveAndFlush(new ReviewInput(review.getId(), "diff-" + headSha, "v1", headSha, "base", 10));
+        ReviewChunk chunk = reviewChunkRepository.saveAndFlush(
+                new ReviewChunk(review.getId(), 0, 1, "diff-" + headSha, 10, 0, "[]"));
+        ReviewJob job = reviewJobRepository.saveAndFlush(new ReviewJob(review.getId(), chunk.getId(), 0, priority, null, null));
+
+        // created_at is DB-defaulted (now()) at insert time; force the intended ordering with a direct
+        // update (in its own genuine transaction, since NOT_SUPPORTED disables the ambient one) so the
+        // test can express "arrived earlier" deterministically regardless of wall-clock granularity. As
+        // of V2 the claim query orders review_jobs.created_at, not reviews.created_at.
+        new TransactionTemplate(transactionManager).executeWithoutResult(status ->
+                entityManager.createNativeQuery("UPDATE review_jobs SET created_at = ?1 WHERE id = ?2")
+                        .setParameter(1, createdAt)
+                        .setParameter(2, job.getId())
+                        .executeUpdate());
+        return review;
     }
 
     private void persistBackend(String name, int capacity) {
         Backend backend = new Backend(name, "https://" + name + ".local", "model-x", capacity);
         backend.setStatus(BackendStatus.ACTIVE);
-        entityManager.persistFlushFind(backend);
+        backendRepository.saveAndFlush(backend);
     }
 
     @Test

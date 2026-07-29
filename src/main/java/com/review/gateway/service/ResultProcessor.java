@@ -2,12 +2,11 @@ package com.review.gateway.service;
 
 import com.review.gateway.config.GatewayProperties;
 import com.review.gateway.model.Review;
-import com.review.gateway.model.ReviewComment;
 import com.review.gateway.model.ReviewJob;
 import com.review.gateway.model.ReviewResult;
 import com.review.gateway.model.enums.EventType;
+import com.review.gateway.model.enums.JobStatus;
 import com.review.gateway.model.enums.ReviewStatus;
-import com.review.gateway.repository.ReviewCommentRepository;
 import com.review.gateway.repository.ReviewJobRepository;
 import com.review.gateway.repository.ReviewRepository;
 import com.review.gateway.repository.ReviewResultRepository;
@@ -15,7 +14,6 @@ import com.review.gateway.service.dto.ParsedComment;
 import com.review.gateway.service.dto.SubmitResultCommand;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
@@ -24,11 +22,15 @@ import java.time.Instant;
 import java.util.List;
 
 /**
- * Handles the "job finished, now what" half of req. 1.9: stores the raw model response first, in its
- * own committed transaction, then parses it and either completes or fails the Review. Each phase is
- * its own {@code REQUIRES_NEW} transaction (via {@link TransactionTemplate} — see {@code ReviewService}
- * javadoc for why a self-invoked {@code @Transactional} method would not work here) so that a crash or
- * exception during parsing can never lose the already-stored raw response.
+ * Handles the "job finished, now what" half of req. 1.9 (V2, diff chunking: this now operates at the
+ * per-chunk JOB level, not the Review level). Phase 1 (this class) locks only the {@code review_jobs}
+ * row for this chunk, stores the raw response, parses it, and transitions the JOB to
+ * {@code COMPLETED}/{@code FAILED} — all in one committed transaction. Phase 2 ({@link
+ * ChunkCoordinator}) is a strictly separate, independent transaction that locks the <em>parent</em>
+ * {@code reviews} row, persists any parsed comments under the review-level cap (CSR-21), and re-derives
+ * the parent's status. This two-phase split is CSR-17's lock-ordering fix: phase 1's job-row lock is
+ * always released (transaction committed) before phase 2 ever asks for the parent-row lock, so no
+ * transaction here ever holds a job lock while waiting on the parent lock.
  */
 @Service
 public class ResultProcessor {
@@ -38,26 +40,26 @@ public class ResultProcessor {
     private final ReviewRepository reviewRepository;
     private final ReviewJobRepository reviewJobRepository;
     private final ReviewResultRepository reviewResultRepository;
-    private final ReviewCommentRepository reviewCommentRepository;
     private final CommentParser commentParser;
-    private final StateMachine stateMachine;
+    private final JobStateMachine jobStateMachine;
+    private final ChunkCoordinator chunkCoordinator;
     private final GatewayProperties properties;
     private final TransactionTemplate requiresNewTransactionTemplate;
 
     public ResultProcessor(ReviewRepository reviewRepository,
                             ReviewJobRepository reviewJobRepository,
                             ReviewResultRepository reviewResultRepository,
-                            ReviewCommentRepository reviewCommentRepository,
                             CommentParser commentParser,
-                            StateMachine stateMachine,
+                            JobStateMachine jobStateMachine,
+                            ChunkCoordinator chunkCoordinator,
                             GatewayProperties properties,
                             PlatformTransactionManager transactionManager) {
         this.reviewRepository = reviewRepository;
         this.reviewJobRepository = reviewJobRepository;
         this.reviewResultRepository = reviewResultRepository;
-        this.reviewCommentRepository = reviewCommentRepository;
         this.commentParser = commentParser;
-        this.stateMachine = stateMachine;
+        this.jobStateMachine = jobStateMachine;
+        this.chunkCoordinator = chunkCoordinator;
         this.properties = properties;
         this.requiresNewTransactionTemplate = new TransactionTemplate(transactionManager);
         this.requiresNewTransactionTemplate.setPropagationBehavior(TransactionTemplate.PROPAGATION_REQUIRES_NEW);
@@ -65,60 +67,99 @@ public class ResultProcessor {
     }
 
     /**
-     * @return the Review's final status after processing ({@code COMPLETED} or {@code FAILED})
+     * @return the Review's status after this chunk's contribution has been applied (may still be
+     *         {@code RUNNING} if sibling chunks are not yet done)
      */
     public ReviewStatus process(Long reviewId, Long jobId, String workerId, Long backendId, SubmitResultCommand command) {
         // F02-01/SR-21: cap the raw response BEFORE it is persisted and BEFORE it is handed to
         // CommentParser (which otherwise runs indexOf/lastIndexOf/substring + a full JSON parse over
         // the whole blob) -- an oversized response (compromised worker, or a prompt-injected model,
         // T-19) would otherwise cause unbounded storage growth and CPU/heap pressure on the single
-        // Gateway (SPOF). The architecture doc is silent on reject-vs-truncate for this cap, so we
-        // truncate with a marker and let the Review continue processing normally (COMPLETED/FAILED as
-        // the truncated content dictates) rather than failing an otherwise-usable result outright.
+        // Gateway (SPOF).
         CappedRawResponse capped = capRawResponseIfNeeded(command.rawResponse());
         SubmitResultCommand effectiveCommand = capped.truncated()
                 ? new SubmitResultCommand(capped.value(), command.promptTokens(), command.completionTokens(),
                         command.durationMs(), command.model())
                 : command;
 
-        // F02-02 follow-up: the try/catch for a concurrent duplicate insert must wrap the call to
-        // executeWithoutResult from OUTSIDE that transaction, not be nested inside storeRawResult
-        // itself. Hibernate marks its Session (and therefore the enclosing Spring transaction)
-        // rollback-only the instant a flush hits the unique-constraint violation, even though the
-        // DataIntegrityViolationException is caught immediately in application code -- so attempting to
-        // let that same transaction commit afterward throws UnexpectedRollbackException instead of
-        // quietly succeeding. Letting the whole small (single-insert) REQUIRES_NEW transaction roll back
-        // is harmless and correct here: it contains nothing but this one insert attempt, and a
-        // concurrent winner has already durably stored an equivalent raw result.
-        try {
-            requiresNewTransactionTemplate.executeWithoutResult(status ->
-                    storeRawResult(reviewId, backendId, effectiveCommand));
-        } catch (DataIntegrityViolationException alreadyStoredByAConcurrentSubmission) {
-            log.debug("Concurrent review_results insert for reviewId={}, ignoring", reviewId);
+        JobPhaseOutcome outcome = requiresNewTransactionTemplate.execute(status ->
+                processJobPhase(jobId, workerId, backendId, effectiveCommand, capped));
+
+        if (outcome == null) {
+            // Job already left RUNNING concurrently (or vanished). Idempotent no-op for THIS job, but
+            // still worth attempting the parent recompute: the transaction that actually won the race
+            // may not have reached its own phase 2 yet, and recomputeAndApply is itself lock-guarded and
+            // safe to call redundantly (a second call for an already-applied target is a no-op).
+            ReviewStatus result = chunkCoordinator.recomputeAndApply(reviewId);
+            return result != null ? result : currentReviewStatus(reviewId);
+        }
+        if (outcome.parsedComments() != null) {
+            ReviewStatus result = chunkCoordinator.completeChunkAndRecompute(reviewId, outcome.chunkIndex(), outcome.parsedComments());
+            return result != null ? result : currentReviewStatus(reviewId);
+        }
+        // Parse failed -> the job already transitioned to FAILED in phase 1; just recompute/cascade.
+        ReviewStatus result = chunkCoordinator.recomputeAndApply(reviewId);
+        return result != null ? result : currentReviewStatus(reviewId);
+    }
+
+    private ReviewStatus currentReviewStatus(Long reviewId) {
+        return reviewRepository.findById(reviewId).map(Review::getStatus).orElse(ReviewStatus.FAILED);
+    }
+
+    /**
+     * Phase 1: locks the job row (CSR-17 — never the parent), stores the raw response idempotently
+     * per {@code (review_id, chunk_index)}, parses it, and transitions the job to
+     * {@code COMPLETED}/{@code FAILED}. Runs inside {@link #requiresNewTransactionTemplate}.
+     *
+     * @return {@code null} if the job was no longer {@code RUNNING} (idempotent no-op)
+     */
+    private JobPhaseOutcome processJobPhase(Long jobId, String workerId, Long backendId,
+                                             SubmitResultCommand command, CappedRawResponse capped) {
+        ReviewJob job = reviewJobRepository.findByIdForUpdate(jobId).orElse(null);
+        if (job == null || job.getStatus() != JobStatus.RUNNING) {
+            log.debug("Job {} no longer RUNNING when processing result, skipping", jobId);
+            return null;
+        }
+        Long reviewId = job.getReviewId();
+        Integer chunkIndex = job.getChunkIndex();
+
+        if (!reviewResultRepository.existsByReviewIdAndChunkIndex(reviewId, chunkIndex)) {
+            storeRawResult(reviewId, chunkIndex, jobId, backendId, command);
+        } else {
+            log.debug("review_results already present for reviewId={} chunkIndex={}, skipping insert", reviewId, chunkIndex);
         }
 
         List<ParsedComment> parsed;
         try {
-            parsed = commentParser.parse(effectiveCommand.rawResponse());
+            parsed = commentParser.parse(command.rawResponse(), fairShareCommentCap(reviewId));
         } catch (RuntimeException parseError) {
-            // F02-03/SR-14: log only the exception class, never parseError.toString() -- the message
-            // of a parse failure over untrusted input can itself echo a fragment of raw_response.
-            log.warn("Comment parsing failed for reviewId={}: {}", reviewId, parseError.getClass().getSimpleName());
-            requiresNewTransactionTemplate.executeWithoutResult(status ->
-                    markFailed(reviewId, jobId, workerId, backendId, parseError, capped));
-            return ReviewStatus.FAILED;
+            // F02-03/SR-14: log only the exception class, never parseError.toString().
+            log.warn("Comment parsing failed for reviewId={} chunkIndex={}: {}",
+                    reviewId, chunkIndex, parseError.getClass().getSimpleName());
+            jobStateMachine.transition(job, JobStatus.FAILED, EventType.FAILED, workerId, backendId,
+                    "parse error: " + parseError.getClass().getSimpleName() + capped.auditNote());
+            finishJob(job);
+            reviewJobRepository.save(job);
+            return new JobPhaseOutcome(chunkIndex, null);
         }
 
-        requiresNewTransactionTemplate.executeWithoutResult(status ->
-                persistCommentsAndComplete(reviewId, jobId, workerId, backendId, parsed, capped));
-        return ReviewStatus.COMPLETED;
+        jobStateMachine.transition(job, JobStatus.COMPLETED, EventType.COMPLETED, workerId, backendId,
+                "parsed=" + parsed.size() + capped.auditNote());
+        finishJob(job);
+        reviewJobRepository.save(job);
+        return new JobPhaseOutcome(chunkIndex, parsed);
+    }
+
+    /** {@code max(1, floor(maxCommentCount / chunkCount))} — see {@link CommentParser#parse(String, int)}. */
+    private int fairShareCommentCap(Long reviewId) {
+        int maxTotal = Math.max(0, properties.getPublish().getMaxCommentCount());
+        int chunkCount = Math.max(1, reviewJobRepository.findByReviewIdOrderByChunkIndexAsc(reviewId).size());
+        return Math.max(1, maxTotal / chunkCount);
     }
 
     /**
      * F02-01/SR-21: truncates {@code rawResponse} to {@code gateway.publish.max-raw-response-length}
-     * (already configured, previously unused anywhere — SAST F02-01) if it exceeds the cap, appending a
-     * clearly-identifiable marker. Never rejects: an oversized-but-otherwise-valid result should still
-     * complete the Review rather than burning a retry attempt.
+     * if it exceeds the cap, appending a clearly-identifiable marker. Never rejects.
      */
     private CappedRawResponse capRawResponseIfNeeded(String rawResponse) {
         int max = Math.max(0, properties.getPublish().getMaxRawResponseLength());
@@ -134,71 +175,19 @@ public class ResultProcessor {
         return new CappedRawResponse(truncated, true, originalLength, max);
     }
 
-    /**
-     * Idempotent: a pre-existing row (e.g. a retried delivery after a mid-process crash, or a
-     * genuinely concurrent submission that reaches the insert first) is left untouched. Does NOT
-     * catch a unique-violation itself: see the caller ({@link #process}) for why that must happen
-     * outside this method's transaction.
-     */
-    private void storeRawResult(Long reviewId, Long backendId, SubmitResultCommand command) {
-        if (reviewResultRepository.existsByReviewId(reviewId)) {
-            log.debug("review_results already present for reviewId={}, skipping insert", reviewId);
-            return;
-        }
+    private void storeRawResult(Long reviewId, Integer chunkIndex, Long jobId, Long backendId, SubmitResultCommand command) {
         Integer totalTokens = (command.promptTokens() != null && command.completionTokens() != null)
                 ? command.promptTokens() + command.completionTokens()
                 : null;
-        ReviewResult result = new ReviewResult(reviewId, command.rawResponse(), null,
+        ReviewResult result = new ReviewResult(reviewId, chunkIndex, jobId, command.rawResponse(), null,
                 command.promptTokens(), command.completionTokens(), totalTokens,
                 command.durationMs(), command.model(), backendId);
         reviewResultRepository.save(result);
     }
 
-    private void markFailed(Long reviewId, Long jobId, String workerId, Long backendId, Exception cause, CappedRawResponse capped) {
-        // F02-02: pessimistic row lock (see ReviewRepository#findByIdForUpdate) -- serializes this
-        // phase against a genuinely concurrent submitResult call for the same Review, so at most one
-        // of them can ever see status == RUNNING and actually transition/insert.
-        Review review = reviewRepository.findByIdForUpdate(reviewId)
-                .orElseThrow(() -> new IllegalStateException("Review " + reviewId + " vanished during result processing"));
-        if (review.getStatus() != ReviewStatus.RUNNING) {
-            log.debug("Review {} no longer RUNNING ({}) when marking parse-failure FAILED, skipping", reviewId, review.getStatus());
-            return;
-        }
-        stateMachine.transition(review, ReviewStatus.FAILED, EventType.FAILED, workerId, backendId,
-                "parse error: " + cause.getClass().getSimpleName() + capped.auditNote());
-        reviewRepository.save(review);
-        finishJob(jobId);
-    }
-
-    private void persistCommentsAndComplete(Long reviewId, Long jobId, String workerId, Long backendId,
-                                             List<ParsedComment> parsed, CappedRawResponse capped) {
-        // F02-02: same pessimistic-lock rationale as markFailed above. A second, truly concurrent
-        // submitResult for this reviewId blocks here until the first commits (or rolls back), then
-        // observes status != RUNNING and safely no-ops -- closing the duplicate-comments/duplicate-
-        // publish race the SAST report flagged (review_comments has no unique constraint to fall back
-        // on, and Review carries no @Version since the V1 schema is frozen).
-        Review review = reviewRepository.findByIdForUpdate(reviewId)
-                .orElseThrow(() -> new IllegalStateException("Review " + reviewId + " vanished during result processing"));
-        if (review.getStatus() != ReviewStatus.RUNNING) {
-            log.debug("Review {} no longer RUNNING ({}) when completing, skipping", reviewId, review.getStatus());
-            return;
-        }
-        for (ParsedComment comment : parsed) {
-            reviewCommentRepository.save(new ReviewComment(reviewId, comment.filePath(), comment.lineNumber(),
-                    comment.severity(), comment.text()));
-        }
-        stateMachine.transition(review, ReviewStatus.COMPLETED, EventType.COMPLETED, workerId, backendId,
-                "comments=" + parsed.size() + capped.auditNote());
-        reviewRepository.save(review);
-        finishJob(jobId);
-    }
-
     /**
      * F02-01/SR-21: carries whether {@link #capRawResponseIfNeeded} truncated the raw response, so the
-     * fact (never the content — SR-14) can be recorded in the audit trail. The frozen V1 {@code
-     * EventType} enum has no dedicated "truncated" event type, so the note is appended to whichever
-     * transition event actually fires ({@code COMPLETED}/{@code FAILED}) rather than inventing a new
-     * event write path.
+     * fact (never the content — SR-14) can be recorded in the audit trail.
      */
     private record CappedRawResponse(String value, boolean truncated, int originalLength, int limit) {
         String auditNote() {
@@ -206,10 +195,11 @@ public class ResultProcessor {
         }
     }
 
-    private void finishJob(Long jobId) {
-        reviewJobRepository.findById(jobId).ifPresent(job -> {
-            job.setFinishedAt(Instant.now());
-            reviewJobRepository.save(job);
-        });
+    /** Outcome of {@link #processJobPhase}: {@code parsedComments == null} means "parse failed, job FAILED". */
+    private record JobPhaseOutcome(Integer chunkIndex, List<ParsedComment> parsedComments) {
+    }
+
+    private void finishJob(ReviewJob job) {
+        job.setFinishedAt(Instant.now());
     }
 }
