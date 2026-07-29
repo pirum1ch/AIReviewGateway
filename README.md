@@ -389,8 +389,14 @@ curl -s -X DELETE http://localhost:8080/reviews/123 -H "Authorization: Bearer $A
   ```json
   { "error": "INVALID_STATE_TRANSITION", "message": "Illegal Review state transition: PUBLISHED -> CANCELLED" }
   ```
+  Also `409` (different body) if a lock-timeout occurred acquiring the Review row (CSR-17, contended
+  with a concurrent claim/sweep) — `{"error": "LOCK_TIMEOUT", "message": "..."}`; retry shortly.
 - **`404 Not Found`** — same shape as §6.2.
 - **`403 Forbidden`** — a `CI` (or `WORKER`) token was used instead of `ADMIN`.
+
+Cancelling a multi-chunk Review (V2) cascades: every non-terminal chunk job is cancelled in the same
+step, and a Worker running any of them learns to stop via its next heartbeat, same as the single-chunk
+case.
 
 ### 6.4 `POST /jobs/claim` — claim the next queued job (Worker)
 
@@ -411,12 +417,23 @@ heartbeat/result call for this job).
   {
     "jobId": 456,
     "reviewId": 123,
-    "payload": { "diff": "diff --git a/Foo.java b/Foo.java\n...", "promptVersion": "v1" }
+    "payload": { "diff": "diff --git a/Foo.java b/Foo.java\n...", "promptVersion": "v1", "chunkContext": null }
   }
   ```
-- **`204 No Content`** — nothing to claim right now. This covers three indistinguishable situations by
-  design: the queue is empty, the named backend is not `ACTIVE`, or the backend is already at capacity.
-  A Worker should treat `204` as "wait and poll again" in all three cases.
+  As of diff chunking (V2), `jobId` identifies one **chunk** of the Review (`review_jobs` is now 1:N per
+  Review), and `payload.diff` is that chunk's slice of the original diff, not necessarily the whole
+  thing — see [§6.1a](#61a-diff-chunking). `payload.chunkContext` (additive) is the rendered cross-chunk
+  header text (`null` for the common single-chunk case); the Worker substitutes it into the resolved
+  prompt template's `{{CHUNK_CONTEXT}}` placeholder exactly like `diff`/`{{DIFF}}`, with no other
+  chunk-awareness required on its side (it stays a fully stateless, chunk-ignorant HTTP client).
+- **`204 No Content`** — nothing to claim right now. This covers five indistinguishable situations by
+  design: the queue is empty, the named backend is not `ACTIVE`, the backend is already at capacity, a
+  claimed job turned out to belong to a Review that had already gone `CANCELLED`/`OBSOLETE` moments
+  earlier (the lock-free "doomed job" courtesy check, CSR-17 — best-effort only; a genuinely in-flight
+  claim that misses this check still gets cancelled via its next heartbeat, at worst one heartbeat
+  interval later), or the claim's job-row lock timed out waiting on a concurrent claim/cancel (mapped to
+  `204`, not an error, since it means exactly the same thing to the Worker as "nothing available right
+  now"). A Worker should treat `204` as "wait and poll again" in all cases.
 
 ### 6.5 `POST /jobs/{id}/heartbeat` — liveness ping (Worker)
 
@@ -664,6 +681,15 @@ Retry and timeout parameters (defaults; see [§4](#4-configuration) to change th
 `GET /reviews/{id}` exposes exactly the current `status` value from this table, plus `attempts` (so a
 caller can tell "will retry" from "exhausted retries" once a Review reaches `FAILED`).
 
+**V2 (diff chunking) note:** the table above describes per-**job** transitions (each chunk job has its
+own independent `QUEUED → RUNNING → COMPLETED/FAILED` lifecycle, including its own retry/timeout
+handling). The **Review's** `status` — what `GET /reviews/{id}` actually returns — is *derived* from the
+set of its jobs' statuses (any `FAILED` → `FAILED`; all `COMPLETED` → `COMPLETED`; any `RUNNING` (or some
+`COMPLETED`, rest `QUEUED`) → `RUNNING`; all `QUEUED` → `QUEUED`), applied through the same
+`StateMachine`/audit-event mechanism. `attempts` in the response is the max across the Review's jobs. For
+the common single-chunk case this collapses exactly onto the table above — one job, one status, no
+observable difference from pre-chunking behavior.
+
 ## 9. Worker protocol
 
 This section is a guide for implementing a Worker (this repository does not ship a Worker
@@ -672,11 +698,15 @@ access at all.
 
 1. **Claim.** `POST /jobs/claim` with your registered backend's `name` (as `backendId`) and a
    self-chosen `workerId` string.
-   - `200` → you have `jobId`, `reviewId`, and a `payload` with `diff` + `promptVersion`. Build your
-     prompt from these two fields only.
-   - `204` → nothing to claim right now (empty queue, or your backend isn't `ACTIVE`/is at capacity).
-     Wait (e.g. a few seconds) and poll again.
-2. **Run inference** against your local `llama-server` using the claimed `diff`/`promptVersion`.
+   - `200` → you have `jobId`, `reviewId`, and a `payload` with `diff` + `promptVersion` +
+     `chunkContext` (V2, diff chunking — `null` unless this job is one chunk of a larger, split diff).
+     Build your prompt from these three fields only; substitute `chunkContext` into the resolved
+     template's `{{CHUNK_CONTEXT}}` placeholder exactly like `diff`/`{{DIFF}}` if the template has one.
+     You never need to know whether `jobId` represents a whole Review or one chunk of it — treat every
+     claimed job identically.
+   - `204` → nothing to claim right now (empty queue, your backend isn't `ACTIVE`/is at capacity, or a
+     transient lock contention). Wait (e.g. a few seconds) and poll again.
+2. **Run inference** against your local `llama-server` using the claimed `diff`/`promptVersion`/`chunkContext`.
 3. **Heartbeat roughly every 60 seconds** while generating: `POST /jobs/{id}/heartbeat` with the *same*
    `workerId` you claimed with.
    - `shouldContinue: false` → **stop generating immediately** and move on to claiming the next job; the
@@ -734,11 +764,19 @@ Every state transition (and every heartbeat) writes an append-only row to `revie
 `CANCELLED`), with the worker/backend attribution when applicable. There is no query endpoint for this
 table in the current API surface — inspect it directly in PostgreSQL for incident investigation. Its
 `details` column is deliberately scrubbed of anything that looks like a token/secret and hard-capped in
-length; it never contains a diff or raw model response.
+length; it never contains a diff, chunk-context text, or raw model response.
+
+**V2 (diff chunking):** `review_events` gained nullable `chunk_index`/`job_id` columns (audit/debug
+only, no constraint). A chunked Review now typically has *two* rows per lifecycle event of the same
+type — one attributed to the specific job/chunk (`chunk_index`/`job_id` set) and one for the Review's
+own derived-status transition (`chunk_index`/`job_id` null) — for the still-common single-chunk case
+this is unchanged in spirit but does mean two `COMPLETED` rows (one per level) rather than one; both are
+expected, not a bug.
 
 ### Cancelling a review
 
-`DELETE /reviews/{id}` with the `ADMIN` token ([§6.3](#63-delete-reviewsid--admin-cancel)).
+`DELETE /reviews/{id}` with the `ADMIN` token ([§6.3](#63-delete-reviewsid--admin-cancel)). Cancels every
+non-terminal chunk job in the same step for a multi-chunk Review.
 
 ## 11. Security
 

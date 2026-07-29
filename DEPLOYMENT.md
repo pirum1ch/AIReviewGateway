@@ -28,6 +28,7 @@ illustrative hostnames chosen for this runbook, not values baked into the code.
 6. [Step 4: Deploy the Worker](#6-step-4-deploy-the-worker)
 7. [Step 5: GitLab integration](#7-step-5-gitlab-integration)
 8. [Step 6: End-to-end smoke test](#8-step-6-end-to-end-smoke-test)
+   - [8a. Upgrading to V2 (diff chunking)](#8a-upgrading-to-v2-diff-chunking)
 9. [Operations quick reference](#9-operations-quick-reference)
 10. [Config file appendix](#10-config-file-appendix)
 11. [Docker deployment (verified, both images)](#11-docker-deployment-verified-both-images)
@@ -600,6 +601,65 @@ Ordered checklist, using the tokens/hosts from the sections above:
    - **Any state, for the full history:** query `review_events` directly in PostgreSQL —
      `SELECT * FROM review_events WHERE review_id = <N> ORDER BY created_at;` — every transition (and
      every heartbeat) is recorded there, including `worker_id`/`backend_id` attribution where applicable.
+
+## 8a. Upgrading to V2 (diff chunking)
+
+`V2__diff_chunking.sql` moves queue ownership from `reviews` to `review_jobs` (1:N per review, one row
+per diff chunk) and adds the `review_chunks` table. Read this section fully before deploying it against
+a live system.
+
+### Forward-only — no rollback path
+
+**Do not roll back the application JAR after this migration has run.** The pre-V2 Gateway code claims
+jobs by querying `reviews.status` directly; it has no notion of `review_jobs.status` at all. If you
+deploy the old JAR against a V2-migrated database, any `RUNNING` chunk job would be silently invisible
+to the old claim query's assumptions, and — worse — a review whose `reviews.status` the old code still
+reads as `QUEUED`/`RUNNING` could be re-claimed and **double-executed** by the old code path racing
+against jobs the new code already dispatched. If you need to revert, revert forward (fix and re-deploy
+V2-aware code), not backward to a pre-V2 JAR.
+
+### Recommended downtime budget: **< 150 seconds**
+
+This is derived from the two liveness timers already in the system, not an arbitrary number:
+
+- The Worker's `HeartbeatScheduler` aborts a job after **3 consecutive heartbeat failures** at its
+  default 60s interval → ≈180s before a Worker gives up on a Gateway that's unreachable mid-deploy.
+- The Gateway's own `gateway.heartbeat.timeout` (default 180s) is the outer bound before a stuck
+  `RUNNING` job is swept and requeued/failed.
+
+Staying under ~150s of Gateway unavailability during the deploy means neither of those failure paths
+triggers spuriously just because the Gateway was momentarily down for the migration, not because
+anything is actually wrong.
+
+### Recommended procedure
+
+1. **If feasible, drain to zero `RUNNING` reviews before deploying.** Stop accepting new CI-triggered
+   reviews (or just let the queue drain naturally — `NEW`/`QUEUED` reviews are unaffected either way,
+   they aren't mid-flight) and wait for in-flight `RUNNING` reviews to finish. This is the safest path:
+   the backfill has nothing in-flight to reconcile.
+2. **If you can't drain (long-running reviews, time pressure):** the backfill is still safe to run
+   against a live database with `RUNNING` reviews in flight — `review_jobs.id` is always preserved
+   (the migration only ever `UPDATE`s existing job rows, never deletes and re-inserts them), so an
+   in-flight job's identity survives the migration. The Worker executing it keeps heartbeating the same
+   `jobId` throughout; it will simply start seeing `review_jobs.status`-aware behavior (parent-derived
+   `reviews.status`, chunk-level fields) on its *next* claim, not the in-flight one.
+3. Run the migration (automatic at Gateway startup, same as any other Flyway migration — see
+   [§4](#4-step-2-deploy-the-gateway)). Expect it to run in well under a second for realistic data
+   volumes at this project's scale (20-30 MRs/day).
+4. Deploy the V2-aware Gateway JAR. Workers need **no changes** to keep working with single-chunk
+   Reviews (byte-identical behavior, §8 of `README.md`); upgrade Workers whenever convenient to pick up
+   `chunkContext` support (`v2.yml` prompt template) for chunked Reviews. An un-upgraded Worker is still
+   safe against a chunked Review: it would fail `promptVersion` resolution for `v2` (unknown template)
+   the same way it would for any other unrecognized version, abandoning that one job cleanly rather than
+   mishandling it — see architecture D6 ("no synthetic error result is ever submitted").
+
+### What NOT to do
+
+- Do not attempt to skip straight from a pre-V1... this is the first migration after V1, so this is the
+  only upgrade path — there is no "V1.5" to worry about.
+- Do not manually edit `review_jobs`/`review_chunks` rows mid-migration; let the Flyway-managed SQL run
+  uninterrupted (it is ordinary transactional DDL/DML, no `CREATE INDEX CONCURRENTLY`, so it runs inside
+  one Flyway transaction and will cleanly roll back if interrupted before commit).
 
 ## 9. Operations quick reference
 
