@@ -218,6 +218,23 @@ public class ReviewService {
      * is re-checked against {@code OBSOLETABLE_STATUSES} immediately after it is locked, since it may
      * have changed between the unlocked candidate read and this row actually being locked.
      *
+     * <p><b>F-DC-12 fix:</b> the candidate query above and the per-row lock query below run in the
+     * <em>same</em> persistence-context session (both inside this one {@code REQUIRES_NEW}
+     * transaction) — so when {@code findByIdForNoKeyUpdate}'s native query returns a row whose entity
+     * is already managed in this session (which every candidate is, having just been loaded by the
+     * query above), Hibernate hands back the <em>existing managed instance</em> rather than
+     * re-hydrating its fields from the fresh result set. The {@code FOR NO KEY UPDATE} lock itself is
+     * still correctly acquired at the database level, but the Java object's {@code status} field can be
+     * stale relative to what that lock just protected — reproduced (appsec): a Review published
+     * concurrently between the candidate read and this row's lock still read back as its old,
+     * pre-publish status, letting a since-illegal {@code PUBLISHED -> OBSOLETE} transition slip past
+     * the re-check above (which only ever saw the stale value) and get persisted, silently clobbering a
+     * completed publish. {@link EntityManager#refresh} forces a fresh read of this row's columns from
+     * the database into the (already correctly locked) managed instance before the status re-check
+     * below runs. {@code ChunkCoordinator} and {@link #cancel} are not affected by this: both open a
+     * dedicated {@code REQUIRES_NEW} transaction that starts with a clean, empty persistence context, so
+     * there is no stale prior instance to collide with.
+     *
      * <p>Runs inside {@link #requiresNewTransactionTemplate}: this method is called from
      * {@link #createReview}, which is deliberately plain/non-{@code @Transactional} (see class javadoc).
      */
@@ -228,6 +245,12 @@ public class ReviewService {
                     projectId, mergeRequestId, newHeadSha, DeduplicationService.OBSOLETABLE_STATUSES);
             for (Review candidate : candidates) {
                 Review review = reviewRepository.findByIdForNoKeyUpdate(candidate.getId()).orElse(null);
+                if (review != null) {
+                    // F-DC-12: must run BEFORE the status re-check below -- see the method javadoc. The
+                    // row is already locked by the query above; this only refreshes this Java instance's
+                    // fields to match what that lock actually protects.
+                    entityManager.refresh(review);
+                }
                 if (review == null || !DeduplicationService.OBSOLETABLE_STATUSES.contains(review.getStatus())) {
                     // Already moved on (e.g. completed/published) between the unlocked read above and
                     // this row actually being locked -- safe to skip, matches the idempotent-sweep
