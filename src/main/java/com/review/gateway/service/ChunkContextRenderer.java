@@ -38,6 +38,8 @@ public class ChunkContextRenderer {
     /** No dedicated config property for the per-path cap (only the total header cap is configurable). */
     private static final int MAX_PATH_LENGTH = 300;
     private static final String PATH_TRUNCATION_SUFFIX = "...";
+    /** Generous reserve (chars) for the "... and N more" footer line's own length. */
+    private static final int MORE_LINE_RESERVE_CHARS = 40;
 
     private static final String FILES_IN_CHUNK_BEGIN = "<<<FILES_IN_THIS_PART>>>";
     private static final String FILES_IN_CHUNK_END = "<<<END_FILES_IN_THIS_PART>>>";
@@ -93,39 +95,44 @@ public class ChunkContextRenderer {
     public String render(int chunkIndex, int chunkCount, List<String> thisChunkPaths, List<String> otherPaths) {
         int maxTotalChars = Math.max(1, properties.getDiff().getMaxChunkContextChars());
 
-        StringBuilder header = new StringBuilder();
-        header.append("This diff was split into ").append(chunkCount)
+        StringBuilder out = new StringBuilder();
+        out.append("This diff was split into ").append(chunkCount)
                 .append(" parts because it was too large for one request. This is part ")
                 .append(chunkIndex + 1).append(" of ").append(chunkCount)
                 .append(". Only comment on issues in the files shown in THIS part; do not comment on files "
                         + "you cannot see.\n");
 
         if (!thisChunkPaths.isEmpty() || !otherPaths.isEmpty()) {
-            appendFileBlock(header, FILES_IN_CHUNK_BEGIN, FILES_IN_CHUNK_END, thisChunkPaths, Integer.MAX_VALUE);
+            appendFileBlock(out, FILES_IN_CHUNK_BEGIN, FILES_IN_CHUNK_END, thisChunkPaths, maxTotalChars);
+        }
+        if (!otherPaths.isEmpty()) {
+            appendFileBlock(out, OTHER_FILES_BEGIN, OTHER_FILES_END, otherPaths, maxTotalChars);
         }
 
-        String withoutOthers = header.toString();
-        int remainingBudget = Math.max(0, maxTotalChars - withoutOthers.length());
-        if (!otherPaths.isEmpty() && remainingBudget > 0) {
-            appendFileBlock(header, OTHER_FILES_BEGIN, OTHER_FILES_END, otherPaths, remainingBudget);
-        }
-
-        String result = header.toString();
-        return capLength(result, maxTotalChars);
+        // Safety-net cap only: appendFileBlock already bounds its own growth against maxTotalChars (the
+        // absolute running length, footer included), so this should rarely need to actually cut anything
+        // beyond an already-complete block; it exists for the fixed intro text itself being longer than
+        // the configured cap.
+        return capLength(out.toString(), maxTotalChars);
     }
 
-    private void appendFileBlock(StringBuilder out, String beginToken, String endToken, List<String> paths, int budgetChars) {
-        out.append(beginToken).append('\n');
-        int used = 0;
-        int shown = 0;
+    /**
+     * Appends one delimited file-list block, bounding growth against the ABSOLUTE running length of
+     * {@code out} (not a separately-tracked counter) so the reserved footer ({@code "... and N more"}
+     * line + the end delimiter token) is never itself pushed past {@code maxTotalChars} by a hard cap
+     * applied afterward.
+     */
+    private void appendFileBlock(StringBuilder out, String beginToken, String endToken, List<String> paths, int maxTotalChars) {
         List<String> distinct = dedupPreserveOrder(paths);
+        out.append(beginToken).append('\n');
+        int shown = 0;
+        int footerReserve = endToken.length() + 1 + MORE_LINE_RESERVE_CHARS;
         for (String path : distinct) {
             String line = path + "\n";
-            if (used + line.length() > budgetChars && shown > 0) {
+            if (out.length() + line.length() + footerReserve > maxTotalChars) {
                 break;
             }
             out.append(line);
-            used += line.length();
             shown++;
         }
         int remaining = distinct.size() - shown;
