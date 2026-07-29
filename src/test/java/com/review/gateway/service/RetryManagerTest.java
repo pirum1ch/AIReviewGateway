@@ -101,7 +101,23 @@ class RetryManagerTest extends AbstractPostgresIntegrationTest {
 
         List<com.review.gateway.model.ReviewEvent> events =
                 reviewEventRepository.findByReviewIdOrderByCreatedAtAsc(review.getId());
-        assertThat(events).extracting(com.review.gateway.model.ReviewEvent::getEventType).contains(EventType.RETRY);
+        List<com.review.gateway.model.ReviewEvent> retryEvents = events.stream()
+                .filter(e -> e.getEventType() == EventType.RETRY)
+                .toList();
+
+        // QA regression (metrics double-counting): a single retry legitimately writes TWO RETRY rows --
+        // one job-level (JobStateMachine, chunk_index/job_id set) and one review-level (ChunkCoordinator
+        // -> StateMachine, chunk_index/job_id null, since the parent's derived status also transitions
+        // back to QUEUED). Both rows are correct/expected at the audit-trail level; what must NOT happen
+        // is GET /metrics counting both as if they were two separate retries.
+        assertThat(retryEvents).hasSize(2);
+        assertThat(retryEvents).filteredOn(e -> e.getJobId() != null).hasSize(1);
+        assertThat(retryEvents).filteredOn(e -> e.getJobId() == null).hasSize(1);
+
+        // The fix: StatisticsService/GET-metrics must report exactly ONE retry for this one actual
+        // retry, not two -- verified directly against the repository method it uses.
+        assertThat(reviewEventRepository.countByEventTypeAndJobIdIsNotNull(EventType.RETRY)).isEqualTo(1L);
+        assertThat(reviewEventRepository.countByEventType(EventType.RETRY)).isEqualTo(2L);
     }
 
     @Test

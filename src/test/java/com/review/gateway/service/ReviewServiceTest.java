@@ -14,6 +14,8 @@ import com.review.gateway.repository.ReviewRepository;
 import com.review.gateway.service.dto.CreateReviewCommand;
 import com.review.gateway.service.dto.CreateReviewResult;
 import com.review.gateway.service.dto.ReviewStatusView;
+import jakarta.persistence.EntityManager;
+import jakarta.persistence.Query;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
@@ -49,6 +51,7 @@ class ReviewServiceTest {
     private ChunkContextRenderer chunkContextRenderer;
     private StateMachine stateMachine;
     private JobStateMachine jobStateMachine;
+    private EntityManager entityManager;
     private PlatformTransactionManager transactionManager;
     private ReviewService reviewService;
 
@@ -66,6 +69,9 @@ class ReviewServiceTest {
         stateMachine = Mockito.mock(StateMachine.class);
         jobStateMachine = Mockito.mock(JobStateMachine.class);
         transactionManager = Mockito.mock(PlatformTransactionManager.class);
+        entityManager = Mockito.mock(EntityManager.class);
+        Query lockTimeoutQuery = Mockito.mock(Query.class);
+        when(entityManager.createNativeQuery(anyString())).thenReturn(lockTimeoutQuery);
 
         // Single-chunk plan by default -- most tests don't care about chunking specifics.
         when(diffChunker.split(anyString())).thenAnswer(inv -> new DiffChunker.ChunkPlan(
@@ -82,7 +88,7 @@ class ReviewServiceTest {
 
         reviewService = new ReviewService(reviewRepository, reviewInputRepository, reviewChunkRepository,
                 reviewJobRepository, reviewCommentRepository, deduplicationService, diffSizeValidator,
-                diffChunker, chunkContextRenderer, stateMachine, jobStateMachine, transactionManager);
+                diffChunker, chunkContextRenderer, stateMachine, jobStateMachine, entityManager, transactionManager);
     }
 
     private CreateReviewCommand command(String headSha) {

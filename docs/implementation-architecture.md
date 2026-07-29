@@ -688,7 +688,11 @@ summarizes; this is the as-built record.
   locked job row being processed, never from the Worker's request body (CSR-20).
 - **`review_comments`**/**`review_events`** gain nullable `chunk_index` (+`job_id` for events) —
   audit/debug only, no constraint, no new `EventType` values (the existing set is reused, attributed at
-  either job or review granularity via these new columns).
+  either job or review granularity via these new columns). **QA fix:** the double-counting this pattern
+  causes (one job-level + one review-level event per actual occurrence) is correct/intentional for
+  `COMPLETED`/`FAILED`, but corrupted the live `GET /metrics` `retries` field for `RETRY` (which was
+  already querying `review_events` directly) — fixed by having `StatisticsService` count only the
+  job-level `RETRY` row (`ReviewEventRepository#countByEventTypeAndJobIdIsNotNull`), not both.
 - **Backfill** (same migration, ordinary transactional DDL/DML — no `CREATE INDEX CONCURRENTLY`):
   creates a `chunk_index=0`/`chunk_count=1` `review_chunks` row for every review lacking one (sourced
   from `review_inputs.diff`), a `review_jobs` row for any review never claimed, and derives
@@ -734,9 +738,16 @@ two lock acquisitions are always independent (never nested in the same transacti
 - `ReviewService.cancel`/`sweepObsolete` lock the parent row first (the sweep's repository query uses
   `@Lock(PESSIMISTIC_WRITE)` with a deterministic `ORDER BY id`, CSR-18, so concurrent multi-row sweeps
   can't deadlock against each other), then cascade to non-terminal child jobs in the same transaction.
-- A bounded `SET LOCAL lock_timeout = '3s'` on every lock-taking transaction prevents a lock wait from
-  pinning a Hikari connection (pool size 20) indefinitely; the resulting exception is mapped to a clean
-  `204` (claim) or `409 LOCK_TIMEOUT` (everything else), never a raw `500`.
+- A bounded `SET LOCAL lock_timeout = '3s'` (CSR-19) on every lock-taking transaction — `QueueManager`,
+  `RetryManager`, `ChunkCoordinator`, and (QA fix — initially missing) `ReviewService.cancel`/
+  `sweepObsolete` — prevents a lock wait from pinning a Hikari connection (pool size 20) indefinitely;
+  the resulting exception is mapped to a clean `204` (claim) or `409 LOCK_TIMEOUT` (everything else),
+  never a raw `500`. `LockTimeoutMappingTest` deliberately holds a row lock open past 3s in a background
+  thread/transaction and asserts the concurrent `DELETE /reviews/{id}` gets a `409`, not a hang or `500`
+  — the actual SQLState observed is Postgres `55P03`, translated by Hibernate/Spring to a
+  `PessimisticLockingFailureException`, which `GlobalExceptionHandler` maps alongside
+  `CannotAcquireLockException`/`QueryTimeoutException` (the mapping is defensive across all three since
+  which one a given JPA provider surfaces isn't itself part of the JPA spec).
 - Verified by `ClaimCancelObsoleteConcurrencyTest`: concurrent `POST /jobs/claim` / `DELETE
   /reviews/{id}` / `POST /reviews` (new `head_sha`, same MR) against the real Spring context, asserting
   zero unhandled `5xx`.

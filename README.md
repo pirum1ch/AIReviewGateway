@@ -770,8 +770,12 @@ length; it never contains a diff, chunk-context text, or raw model response.
 only, no constraint). A chunked Review now typically has *two* rows per lifecycle event of the same
 type — one attributed to the specific job/chunk (`chunk_index`/`job_id` set) and one for the Review's
 own derived-status transition (`chunk_index`/`job_id` null) — for the still-common single-chunk case
-this is unchanged in spirit but does mean two `COMPLETED` rows (one per level) rather than one; both are
-expected, not a bug.
+this is unchanged in spirit but does mean two `COMPLETED`/`FAILED` rows (one per level) rather than one;
+both are expected, not a bug. **Exception:** `GET /metrics`'s `retries` count deliberately counts only
+the job-level `RETRY` event (`job_id IS NOT NULL`), not both — counting both would double-report the
+retry count for the common single-chunk case, since a retry always writes both a job-level and a
+review-level `RETRY` row together. If you query `review_events` directly for retry analysis, filter on
+`job_id IS NOT NULL` for the same reason.
 
 ### Cancelling a review
 

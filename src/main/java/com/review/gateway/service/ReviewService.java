@@ -18,6 +18,7 @@ import com.review.gateway.repository.ReviewRepository;
 import com.review.gateway.service.dto.CreateReviewCommand;
 import com.review.gateway.service.dto.CreateReviewResult;
 import com.review.gateway.service.dto.ReviewStatusView;
+import jakarta.persistence.EntityManager;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.dao.DataIntegrityViolationException;
@@ -72,6 +73,7 @@ public class ReviewService {
     private final ChunkContextRenderer chunkContextRenderer;
     private final StateMachine stateMachine;
     private final JobStateMachine jobStateMachine;
+    private final EntityManager entityManager;
     private final TransactionTemplate requiresNewTransactionTemplate;
 
     public ReviewService(ReviewRepository reviewRepository,
@@ -85,6 +87,7 @@ public class ReviewService {
                           ChunkContextRenderer chunkContextRenderer,
                           StateMachine stateMachine,
                           JobStateMachine jobStateMachine,
+                          EntityManager entityManager,
                           PlatformTransactionManager transactionManager) {
         this.reviewRepository = reviewRepository;
         this.reviewInputRepository = reviewInputRepository;
@@ -97,6 +100,7 @@ public class ReviewService {
         this.chunkContextRenderer = chunkContextRenderer;
         this.stateMachine = stateMachine;
         this.jobStateMachine = jobStateMachine;
+        this.entityManager = entityManager;
         this.requiresNewTransactionTemplate = new TransactionTemplate(transactionManager);
         this.requiresNewTransactionTemplate.setPropagationBehavior(TransactionTemplate.PROPAGATION_REQUIRES_NEW);
         this.requiresNewTransactionTemplate.setName("ReviewService.persistNewReview");
@@ -176,10 +180,13 @@ public class ReviewService {
      * Admin cancel (req. 1.4, architecture §4 rows 13-16). Idempotent in spirit: cancelling an
      * already-terminal Review is rejected as an illegal transition rather than silently succeeding.
      * CSR-17: locks the parent row first, then cascades {@code CANCELLED} to every non-terminal child
-     * job (parent-then-child).
+     * job (parent-then-child). CSR-19: bounded {@code lock_timeout} so a contended row can never pin a
+     * Hikari connection indefinitely; a timeout surfaces as a clean {@code 409 LOCK_TIMEOUT} via
+     * {@code GlobalExceptionHandler}, not a raw {@code 500} or an indefinite hang.
      */
     @Transactional
     public ReviewStatusView cancel(Long reviewId) {
+        applyLockTimeout();
         Review review = reviewRepository.findByIdForUpdate(reviewId).orElseThrow(() -> new ReviewNotFoundException(reviewId));
         if (!CANCELLABLE_STATUSES.contains(review.getStatus())) {
             throw new InvalidStateTransitionException(review.getStatus(), ReviewStatus.CANCELLED);
@@ -206,6 +213,7 @@ public class ReviewService {
      */
     private void sweepObsolete(Long projectId, Long mergeRequestId, String newHeadSha) {
         requiresNewTransactionTemplate.executeWithoutResult(status -> {
+            applyLockTimeout();
             List<Review> toObsolete = reviewRepository.findByProjectIdAndMergeRequestIdAndHeadShaNotAndStatusInOrderByIdAsc(
                     projectId, mergeRequestId, newHeadSha, DeduplicationService.OBSOLETABLE_STATUSES);
             for (Review review : toObsolete) {
@@ -280,5 +288,14 @@ public class ReviewService {
     private CreateReviewResult toResult(Review review, boolean deduplicated) {
         int chunkCount = reviewChunkRepository.findByReviewIdOrderByChunkIndexAsc(review.getId()).size();
         return new CreateReviewResult(review.getId(), review.getStatus(), deduplicated, Math.max(1, chunkCount));
+    }
+
+    /**
+     * CSR-19: bounds how long a transaction here can wait for a contended row lock, so a lock wait can
+     * never pin a Hikari connection indefinitely (pool size 20). Mirrors the same helper in {@code
+     * QueueManager}/{@code RetryManager}/{@code ChunkCoordinator}.
+     */
+    private void applyLockTimeout() {
+        entityManager.createNativeQuery("SET LOCAL lock_timeout = '3s'").executeUpdate();
     }
 }

@@ -72,7 +72,7 @@ class ReviewServiceChunkingIntegrationTest extends AbstractPostgresIntegrationTe
         ChunkContextRenderer chunkContextRenderer = new ChunkContextRenderer(properties);
         return new ReviewService(reviewRepository, reviewInputRepository, reviewChunkRepository,
                 reviewJobRepository, reviewCommentRepository, deduplicationService, diffSizeValidator,
-                diffChunker, chunkContextRenderer, stateMachine, jobStateMachine, transactionManager);
+                diffChunker, chunkContextRenderer, stateMachine, jobStateMachine, entityManager, transactionManager);
     }
 
     private GatewayProperties smallBudgetProperties() {

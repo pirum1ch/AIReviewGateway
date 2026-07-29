@@ -8,6 +8,8 @@ import com.review.gateway.repository.ReviewCommentRepository;
 import com.review.gateway.repository.ReviewInputRepository;
 import com.review.gateway.repository.ReviewJobRepository;
 import com.review.gateway.repository.ReviewRepository;
+import jakarta.persistence.EntityManager;
+import jakarta.persistence.Query;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -23,6 +25,7 @@ import java.util.Optional;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -47,6 +50,7 @@ class ReviewServiceAdditionalTest {
     private ChunkContextRenderer chunkContextRenderer;
     private StateMachine stateMachine;
     private JobStateMachine jobStateMachine;
+    private EntityManager entityManager;
     private PlatformTransactionManager transactionManager;
     private ReviewService reviewService;
 
@@ -64,6 +68,9 @@ class ReviewServiceAdditionalTest {
         stateMachine = Mockito.mock(StateMachine.class);
         jobStateMachine = Mockito.mock(JobStateMachine.class);
         transactionManager = Mockito.mock(PlatformTransactionManager.class);
+        entityManager = Mockito.mock(EntityManager.class);
+        Query lockTimeoutQuery = Mockito.mock(Query.class);
+        when(entityManager.createNativeQuery(anyString())).thenReturn(lockTimeoutQuery);
 
         when(reviewJobRepository.findNonTerminalJobs(any())).thenReturn(List.of());
         when(reviewChunkRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
@@ -74,7 +81,7 @@ class ReviewServiceAdditionalTest {
 
         reviewService = new ReviewService(reviewRepository, reviewInputRepository, reviewChunkRepository,
                 reviewJobRepository, reviewCommentRepository, deduplicationService, diffSizeValidator,
-                diffChunker, chunkContextRenderer, stateMachine, jobStateMachine, transactionManager);
+                diffChunker, chunkContextRenderer, stateMachine, jobStateMachine, entityManager, transactionManager);
     }
 
     @ParameterizedTest
