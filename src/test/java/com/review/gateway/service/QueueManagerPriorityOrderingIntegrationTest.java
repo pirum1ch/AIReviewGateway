@@ -76,7 +76,7 @@ class QueueManagerPriorityOrderingIntegrationTest extends AbstractPostgresIntegr
         ChunkCoordinator chunkCoordinator = new ChunkCoordinator(reviewRepository, reviewJobRepository,
                 reviewChunkRepository, reviewCommentRepository, stateMachine, jobStateMachine, properties,
                 entityManager, transactionManager);
-        ChunkContextRenderer chunkContextRenderer = new ChunkContextRenderer(properties);
+        ChunkContextRenderer chunkContextRenderer = new ChunkContextRenderer(properties, new TextSanitizer());
         return new QueueManager(reviewRepository, reviewJobRepository, reviewChunkRepository, backendDispatcher,
                 jobStateMachine, chunkCoordinator, eventService, Mockito.mock(ResultProcessor.class),
                 chunkContextRenderer, entityManager, transactionManager);

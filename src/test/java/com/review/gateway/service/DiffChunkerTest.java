@@ -28,7 +28,7 @@ class DiffChunkerTest {
     }
 
     private DiffChunker newChunker(GatewayProperties properties) {
-        return new DiffChunker(properties, new DiffSizeValidator(properties), new ChunkContextRenderer(properties));
+        return new DiffChunker(properties, new DiffSizeValidator(properties), new ChunkContextRenderer(properties, new TextSanitizer()));
     }
 
     private String gitSection(String path, String... hunkLines) {

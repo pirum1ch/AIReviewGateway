@@ -78,7 +78,7 @@ class SweepObsoleteStaleReadTest extends AbstractPostgresIntegrationTest {
         JobStateMachine jobStateMachine = new JobStateMachine(eventService);
         DeduplicationService deduplicationService = new DeduplicationService(reviewRepository);
         DiffSizeValidator diffSizeValidator = new DiffSizeValidator(properties);
-        ChunkContextRenderer chunkContextRenderer = new ChunkContextRenderer(properties);
+        ChunkContextRenderer chunkContextRenderer = new ChunkContextRenderer(properties, new TextSanitizer());
         DiffChunker diffChunker = new DiffChunker(properties, diffSizeValidator, chunkContextRenderer);
         return new ReviewService(reviewRepository, reviewInputRepository, reviewChunkRepository,
                 reviewJobRepository, reviewCommentRepository, deduplicationService, diffSizeValidator,

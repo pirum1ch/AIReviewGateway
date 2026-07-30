@@ -41,6 +41,34 @@ public class RestClientConfig {
                 .build();
     }
 
+    /**
+     * Prompt Manager's dedicated read-only GitLab client (PMR-15/PMR-16): a separate {@code
+     * PRIVATE-TOKEN} ({@code GITLAB_PROMPT_TOKEN}, {@code read_api}/{@code read_repository}-scoped) and
+     * separate timeouts (3s connect / 8s read, {@code gateway.prompt.*}) from the write-scoped {@code
+     * gitLabRestClient}, so a leak of either credential is bounded to its own blast radius and read-path
+     * timeouts never race the (much longer) 5s/30s publish client's. Same host
+     * ({@code gateway.gitlab.base-url}) as {@code gitLabRestClient} — there is no separate URL field
+     * anywhere in {@code gateway.prompt.*} (PMR-14). {@code followRedirects(NEVER)} set explicitly
+     * (PMR-16): a redirect would forward the custom {@code PRIVATE-TOKEN} header off-host, which the JDK
+     * client does not strip on its own for non-standard headers.
+     */
+    @Bean
+    public RestClient gitLabPromptRestClient() {
+        HttpClient httpClient = HttpClient.newBuilder()
+                .connectTimeout(properties.getPrompt().getConnectTimeout())
+                .followRedirects(HttpClient.Redirect.NEVER)
+                .build();
+        JdkClientHttpRequestFactory requestFactory = new JdkClientHttpRequestFactory(httpClient);
+        requestFactory.setReadTimeout(properties.getPrompt().getReadTimeout());
+
+        return RestClient.builder()
+                .baseUrl(properties.getGitlab().getBaseUrl())
+                .requestFactory(requestFactory)
+                .defaultHeader("PRIVATE-TOKEN", properties.getGitlab().getPromptToken())
+                .defaultHeader(HttpHeaders.CONTENT_TYPE, "application/json")
+                .build();
+    }
+
     @Bean
     public RestClient backendProbeRestClient() {
         HttpClient httpClient = HttpClient.newBuilder()

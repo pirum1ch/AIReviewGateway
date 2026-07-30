@@ -47,6 +47,19 @@ public class Backend {
     @Column(name = "last_seen")
     private Instant lastSeen;
 
+    /**
+     * Prompt Manager (V3, PMR-22): per-backend override of {@code gateway.prompt.message-format}
+     * ({@code MULTI}/{@code SINGLE}), or {@code null} to use the configured global default. Deliberately
+     * a plain {@code String}, not {@code @Enumerated} bound directly to
+     * {@link com.review.gateway.model.enums.PromptMessageFormat} — {@code PromptMessageFormatter} parses
+     * it via {@code PromptMessageFormat.fromNullable}, never {@code Enum.valueOf}, so a value the DB
+     * {@code CHECK} constraint didn't catch (a stale row from before the constraint existed, manual DB
+     * edit, etc.) degrades to the global default with a {@code WARN} instead of throwing and taking the
+     * claim path down.
+     */
+    @Column(name = "prompt_message_format", length = 16)
+    private String promptMessageFormat;
+
     @Column(name = "created_at", nullable = false, updatable = false)
     private Instant createdAt;
 
@@ -123,6 +136,14 @@ public class Backend {
 
     public void setLastSeen(Instant lastSeen) {
         this.lastSeen = lastSeen;
+    }
+
+    public String getPromptMessageFormat() {
+        return promptMessageFormat;
+    }
+
+    public void setPromptMessageFormat(String promptMessageFormat) {
+        this.promptMessageFormat = promptMessageFormat;
     }
 
     public Instant getCreatedAt() {
