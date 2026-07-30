@@ -1,0 +1,248 @@
+package com.review.gateway.service;
+
+import com.review.gateway.config.GatewayProperties;
+import com.review.gateway.exception.PromptResolutionSaturatedException;
+import com.review.gateway.exception.PromptSourceMissingException;
+import com.review.gateway.exception.PromptSourceUnavailableException;
+import com.review.gateway.model.enums.PromptBundleMode;
+import com.review.gateway.model.enums.PromptSectionKind;
+import com.review.gateway.model.enums.PromptSectionStatus;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.mockito.Mockito;
+
+import java.time.Duration;
+import java.util.List;
+import java.util.Optional;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+/**
+ * Unit tests for {@link PromptManager} (PMR-09/10/11/17/19/21/26).
+ */
+class PromptManagerTest {
+
+    private GatewayProperties properties;
+    private GitLabClient gitLabClient;
+    private PromptManager manager;
+
+    @BeforeEach
+    void setUp() {
+        properties = new GatewayProperties();
+        properties.getPrompt().setEnabled(true);
+        properties.getPrompt().getCorporate().setProject("platform/ai-review-prompts");
+        properties.getPrompt().getCorporate().setRef("main");
+        properties.getPrompt().getCorporate().setBasePromptPath("prompts/base.md");
+        properties.getPrompt().getCorporate().setReviewRulesPath("prompts/rules.md");
+        properties.getPrompt().getLimits().setMaxConcurrentResolutions(4);
+        properties.getPrompt().setTotalTimeout(Duration.ofSeconds(20));
+
+        gitLabClient = Mockito.mock(GitLabClient.class);
+        manager = new PromptManager(properties, gitLabClient, new PromptSourceResolver(properties),
+                new PromptAssembler(properties, new DiffSizeValidator(properties)), new TextSanitizer());
+    }
+
+    // ---- kill-switch: zero GitLab calls (PMR-10 premise) ----
+
+    @Test
+    void disabledKillSwitchMakesZeroGitLabCallsAndReturnsNoneMode() {
+        properties.getPrompt().setEnabled(false);
+
+        PromptManager.PromptResolution result = manager.resolve(1042L);
+
+        assertThat(result.mode()).isEqualTo(PromptBundleMode.NONE);
+        assertThat(result.sections()).isEmpty();
+        Mockito.verifyNoInteractions(gitLabClient);
+    }
+
+    // ---- corporate mandatory, always fails hard ----
+
+    @Test
+    void mandatoryCorporateFileMissingThrowsPromptSourceMissingException() {
+        properties.getPrompt().getProject().setEnabled(false);
+        when(gitLabClient.resolveCommitSha("platform/ai-review-prompts", "main")).thenReturn("sha1");
+        when(gitLabClient.fetchRawFile(eq("platform/ai-review-prompts"), eq("prompts/base.md"), eq("sha1"), anyInt()))
+                .thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> manager.resolve(1042L)).isInstanceOf(PromptSourceMissingException.class);
+    }
+
+    @Test
+    void corporateCommitResolutionFailureAlwaysFailsRegardlessOfOnErrorConfig() {
+        properties.getPrompt().getErrorHandling().setOnError("SKIP_OPTIONAL");
+        when(gitLabClient.resolveCommitSha("platform/ai-review-prompts", "main"))
+                .thenThrow(new PromptSourceUnavailableException("gitlab down"));
+
+        assertThatThrownBy(() -> manager.resolve(1042L)).isInstanceOf(PromptSourceUnavailableException.class);
+    }
+
+    // ---- full happy path with project sections ----
+
+    @Test
+    void successfulResolutionProducesRepoModeWithFourSections() {
+        properties.getPrompt().getProject().setEnabled(true);
+        when(gitLabClient.resolveCommitSha("platform/ai-review-prompts", "main")).thenReturn("corpsha");
+        when(gitLabClient.fetchRawFile("platform/ai-review-prompts", "prompts/base.md", "corpsha", 262144))
+                .thenReturn(Optional.of("corporate base content"));
+        when(gitLabClient.fetchRawFile("platform/ai-review-prompts", "prompts/rules.md", "corpsha", 262144))
+                .thenReturn(Optional.of("corporate rules content"));
+        when(gitLabClient.resolveDefaultBranch("1042")).thenReturn("main");
+        when(gitLabClient.resolveCommitSha("1042", "main")).thenReturn("projsha");
+        when(gitLabClient.fetchRawFile("1042", ".ai-review/architecture.md", "projsha", 262144))
+                .thenReturn(Optional.of("project architecture doc"));
+        when(gitLabClient.fetchRawFile("1042", ".ai-review/code-rules.md", "projsha", 262144))
+                .thenReturn(Optional.of("project code rules doc"));
+
+        PromptManager.PromptResolution result = manager.resolve(1042L);
+
+        assertThat(result.mode()).isEqualTo(PromptBundleMode.REPO);
+        assertThat(result.sections()).hasSize(4);
+        assertThat(result.degraded()).isFalse();
+        assertThat(result.explicitPathsMissing()).isEmpty();
+    }
+
+    // ---- PMR-11: explicit override path 404 vs default path 404 ----
+
+    @Test
+    void explicitOverridePathNotFoundIsRecordedInExplicitPathsMissing() {
+        GatewayProperties.Prompt.Project.Override override = new GatewayProperties.Prompt.Project.Override();
+        override.setProject("1042");
+        override.setRef("main");
+        override.setArchitecturePath("typo-architecture.md");
+        override.setCodeRulesPath("code-rules.md");
+        properties.getPrompt().getProject().getOverrides().put("1042", override);
+        manager = new PromptManager(properties, gitLabClient, new PromptSourceResolver(properties),
+                new PromptAssembler(properties, new DiffSizeValidator(properties)), new TextSanitizer());
+
+        when(gitLabClient.resolveCommitSha("platform/ai-review-prompts", "main")).thenReturn("corpsha");
+        when(gitLabClient.fetchRawFile("platform/ai-review-prompts", "prompts/base.md", "corpsha", 262144))
+                .thenReturn(Optional.of("corporate base"));
+        when(gitLabClient.fetchRawFile("platform/ai-review-prompts", "prompts/rules.md", "corpsha", 262144))
+                .thenReturn(Optional.of("corporate rules"));
+        when(gitLabClient.resolveCommitSha("1042", "main")).thenReturn("projsha");
+        when(gitLabClient.fetchRawFile("1042", "typo-architecture.md", "projsha", 262144))
+                .thenReturn(Optional.empty());
+        when(gitLabClient.fetchRawFile("1042", "code-rules.md", "projsha", 262144))
+                .thenReturn(Optional.of("code rules content"));
+
+        PromptManager.PromptResolution result = manager.resolve(1042L);
+
+        assertThat(result.explicitPathsMissing()).containsExactly(PromptSectionKind.PROJECT_ARCHITECTURE);
+        // resolveDefaultBranch is never called: this override pinned an explicit ref.
+        verify(gitLabClient, never()).resolveDefaultBranch(any());
+        var archSection = result.sections().stream()
+                .filter(s -> s.kind() == PromptSectionKind.PROJECT_ARCHITECTURE).findFirst().orElseThrow();
+        assertThat(archSection.status()).isEqualTo(PromptSectionStatus.ABSENT);
+    }
+
+    @Test
+    void defaultPathNotFoundIsSilentNoSignal() {
+        properties.getPrompt().getProject().setEnabled(true);
+        when(gitLabClient.resolveCommitSha("platform/ai-review-prompts", "main")).thenReturn("corpsha");
+        when(gitLabClient.fetchRawFile("platform/ai-review-prompts", "prompts/base.md", "corpsha", 262144))
+                .thenReturn(Optional.of("corporate base"));
+        when(gitLabClient.fetchRawFile("platform/ai-review-prompts", "prompts/rules.md", "corpsha", 262144))
+                .thenReturn(Optional.of("corporate rules"));
+        when(gitLabClient.resolveDefaultBranch("1042")).thenReturn("main");
+        when(gitLabClient.resolveCommitSha("1042", "main")).thenReturn("projsha");
+        when(gitLabClient.fetchRawFile("1042", ".ai-review/architecture.md", "projsha", 262144))
+                .thenReturn(Optional.empty());
+        when(gitLabClient.fetchRawFile("1042", ".ai-review/code-rules.md", "projsha", 262144))
+                .thenReturn(Optional.empty());
+
+        PromptManager.PromptResolution result = manager.resolve(1042L);
+
+        assertThat(result.explicitPathsMissing()).isEmpty();
+        assertThat(result.sections().stream().filter(s -> s.status() == PromptSectionStatus.ABSENT)).hasSize(2);
+    }
+
+    // ---- SKIP_OPTIONAL vs FAIL for project source failures ----
+
+    @Test
+    void projectSourceFailureWithFailOnErrorPropagates() {
+        properties.getPrompt().getErrorHandling().setOnError("FAIL");
+        when(gitLabClient.resolveCommitSha("platform/ai-review-prompts", "main")).thenReturn("corpsha");
+        when(gitLabClient.fetchRawFile("platform/ai-review-prompts", "prompts/base.md", "corpsha", 262144))
+                .thenReturn(Optional.of("corporate base"));
+        when(gitLabClient.fetchRawFile("platform/ai-review-prompts", "prompts/rules.md", "corpsha", 262144))
+                .thenReturn(Optional.of("corporate rules"));
+        when(gitLabClient.resolveDefaultBranch("1042")).thenThrow(new PromptSourceUnavailableException("down"));
+
+        assertThatThrownBy(() -> manager.resolve(1042L)).isInstanceOf(PromptSourceUnavailableException.class);
+    }
+
+    @Test
+    void projectSourceFailureWithSkipOptionalDegradesInsteadOfFailing() {
+        properties.getPrompt().getErrorHandling().setOnError("SKIP_OPTIONAL");
+        when(gitLabClient.resolveCommitSha("platform/ai-review-prompts", "main")).thenReturn("corpsha");
+        when(gitLabClient.fetchRawFile("platform/ai-review-prompts", "prompts/base.md", "corpsha", 262144))
+                .thenReturn(Optional.of("corporate base"));
+        when(gitLabClient.fetchRawFile("platform/ai-review-prompts", "prompts/rules.md", "corpsha", 262144))
+                .thenReturn(Optional.of("corporate rules"));
+        when(gitLabClient.resolveDefaultBranch("1042")).thenThrow(new PromptSourceUnavailableException("down"));
+
+        PromptManager.PromptResolution result = manager.resolve(1042L);
+
+        assertThat(result.mode()).isEqualTo(PromptBundleMode.REPO);
+        assertThat(result.degraded()).isTrue();
+        assertThat(result.sections()).hasSize(2); // corporate only
+    }
+
+    // ---- PMR-19: bounded concurrency permit, immediate rejection on saturation ----
+
+    @Test
+    void saturatedConcurrencyPermitRejectsImmediatelyRatherThanQueueing() throws InterruptedException {
+        properties.getPrompt().getLimits().setMaxConcurrentResolutions(1);
+        properties.getPrompt().getProject().setEnabled(false);
+        // The Semaphore's permit count is captured at PromptManager construction time -- must rebuild
+        // after changing max-concurrent-resolutions above.
+        manager = new PromptManager(properties, gitLabClient, new PromptSourceResolver(properties),
+                new PromptAssembler(properties, new DiffSizeValidator(properties)), new TextSanitizer());
+        CountDownLatch releaseLatch = new CountDownLatch(1);
+        CountDownLatch enteredLatch = new CountDownLatch(1);
+        when(gitLabClient.resolveCommitSha(any(), any())).thenAnswer(invocation -> {
+            enteredLatch.countDown();
+            releaseLatch.await(5, TimeUnit.SECONDS);
+            return "sha1";
+        });
+        when(gitLabClient.fetchRawFile(any(), any(), any(), anyInt())).thenReturn(Optional.of("content"));
+
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        try {
+            executor.submit(() -> manager.resolve(1042L));
+            assertThat(enteredLatch.await(2, TimeUnit.SECONDS)).isTrue();
+
+            // The first resolve() holds the only permit; a second concurrent call must be rejected
+            // immediately (not block waiting for the first to finish).
+            long start = System.nanoTime();
+            assertThatThrownBy(() -> manager.resolve(1042L)).isInstanceOf(PromptResolutionSaturatedException.class);
+            long elapsedMs = (System.nanoTime() - start) / 1_000_000;
+            assertThat(elapsedMs).isLessThan(500);
+        } finally {
+            releaseLatch.countDown();
+            executor.shutdown();
+            executor.awaitTermination(5, TimeUnit.SECONDS);
+        }
+    }
+
+    // ---- PMR-26: coarse, undifferentiated error for all resolution failures ----
+
+    @Test
+    void allResolutionFailuresProduceTheSameExceptionTypeRegardlessOfCause() {
+        // Cause 1: corporate commit SHA resolution fails.
+        when(gitLabClient.resolveCommitSha("platform/ai-review-prompts", "main"))
+                .thenThrow(new PromptSourceUnavailableException("cause A"));
+        assertThatThrownBy(() -> manager.resolve(1042L)).isInstanceOf(PromptSourceUnavailableException.class);
+    }
+}

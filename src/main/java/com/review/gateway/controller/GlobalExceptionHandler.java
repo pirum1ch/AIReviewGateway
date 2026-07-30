@@ -5,6 +5,7 @@ import com.review.gateway.exception.DiffTooLargeException;
 import com.review.gateway.exception.IncompatiblePromptVersionException;
 import com.review.gateway.exception.InvalidStateTransitionException;
 import com.review.gateway.exception.JobNotClaimableException;
+import com.review.gateway.exception.PromptResolutionSaturatedException;
 import com.review.gateway.exception.PromptSourceInvalidException;
 import com.review.gateway.exception.PromptSourceMissingException;
 import com.review.gateway.exception.PromptSourceUnavailableException;
@@ -96,6 +97,13 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ErrorResponse> handlePromptTooLarge(PromptTooLargeException ex) {
         return ResponseEntity.status(HttpStatus.UNPROCESSABLE_ENTITY)
                 .body(new ErrorResponse("PROMPT_TOO_LARGE", ex.getMessage()));
+    }
+
+    /** PMR-19: immediate 503, never a 500/hang — see {@code PromptManager}'s bounded concurrency permit. */
+    @ExceptionHandler(PromptResolutionSaturatedException.class)
+    public ResponseEntity<ErrorResponse> handlePromptResolutionSaturated(PromptResolutionSaturatedException ex) {
+        return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
+                .body(new ErrorResponse("PROMPT_RESOLUTION_SATURATED", "Too many concurrent prompt resolutions; retry shortly"));
     }
 
     /** Postgres SQLSTATE for a genuine detected deadlock (class {@code 40}, "transaction rollback"). */
