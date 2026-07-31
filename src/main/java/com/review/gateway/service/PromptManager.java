@@ -5,6 +5,7 @@ import com.review.gateway.exception.PromptResolutionSaturatedException;
 import com.review.gateway.exception.PromptSourceInvalidException;
 import com.review.gateway.exception.PromptSourceMissingException;
 import com.review.gateway.exception.PromptSourceUnavailableException;
+import com.review.gateway.exception.PromptTooLargeException;
 import com.review.gateway.model.enums.PromptBundleMode;
 import com.review.gateway.model.enums.PromptSectionKind;
 import org.slf4j.Logger;
@@ -167,8 +168,33 @@ public class PromptManager {
             }
         }
 
-        PromptAssembler.ResolvedSystemPrompt resolved = assembler.assemble(
-                corpBaseCandidate, corpRulesCandidate, projectArchitecture, projectCodeRules, degraded);
+        PromptAssembler.ResolvedSystemPrompt resolved;
+        try {
+            resolved = assembler.assemble(corpBaseCandidate, corpRulesCandidate, projectArchitecture, projectCodeRules,
+                    degraded);
+        } catch (PromptTooLargeException tooLarge) {
+            // F-PM-03: an oversized but otherwise-valid *optional* PROJECT_* section must be able to
+            // degrade under on-error=SKIP_OPTIONAL, exactly like a missing/invalid project source above
+            // -- architecture §3 step 4c's "other error => FAIL or SKIP_OPTIONAL per config" did not
+            // originally cover this throw, because it happens after (not inside) that catch's scope, so
+            // a genuinely oversized-but-valid architecture.md/code-rules.md doc could 422 every
+            // POST /reviews for that project with no operator escape hatch, even under SKIP_OPTIONAL.
+            //
+            // Attribution matters: re-assemble corporate-only first. If *that* still throws, the
+            // overflow is attributable to the mandatory CORPORATE_* content itself and must remain a
+            // hard 422 regardless of on-error (PMR-21: never silently truncate the corporate rulebook --
+            // corporate-only overflow is a configuration error, not something SKIP_OPTIONAL exists to
+            // paper over). Only when the corporate-only re-assembly fits do we know the PROJECT_*
+            // sections were the cause, and only then do we drop them and proceed degraded.
+            boolean hadProjectContent = projectArchitecture != null || projectCodeRules != null;
+            if (!hadProjectContent || !ON_ERROR_SKIP_OPTIONAL.equals(properties.getPrompt().getErrorHandling().getOnError())) {
+                throw tooLarge;
+            }
+            log.warn("Assembled system prompt exceeds gateway.prompt.limits.max-system-prompt-tokens with "
+                    + "optional PROJECT_* sections included; dropping them and proceeding with the "
+                    + "corporate rulebook only (prompt_degraded=true)");
+            resolved = assembler.assemble(corpBaseCandidate, corpRulesCandidate, null, null, true);
+        }
         return new PromptResolution(PromptBundleMode.REPO, resolved.sections(), resolved.estimatedTokens(),
                 resolved.degraded(), List.copyOf(explicitPathsMissing));
     }

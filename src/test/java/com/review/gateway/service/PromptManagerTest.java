@@ -262,6 +262,106 @@ class PromptManagerTest {
         assertThatThrownBy(() -> manager.resolve(1042L)).isInstanceOf(PromptSourceInvalidException.class);
     }
 
+    // ---- F-PM-03: PromptTooLargeException from an oversized *optional* project section ----
+
+    /**
+     * F-PM-03 regression (appsec SAST round): before the fix, {@code PromptAssembler.assemble} threw
+     * {@link com.review.gateway.exception.PromptTooLargeException} from outside the try/catch that
+     * {@code on-error=SKIP_OPTIONAL} governs, so a genuinely oversized-but-valid optional
+     * {@code PROJECT_ARCHITECTURE} doc 422'd every {@code POST /reviews} for that project with no
+     * operator escape hatch, even under {@code SKIP_OPTIONAL}. Corporate-only content comfortably fits
+     * the (deliberately tiny) budget below; only adding the project section pushes it over.
+     */
+    @Test
+    void oversizedOptionalProjectSectionDegradesUnderSkipOptional() {
+        properties.getPrompt().getErrorHandling().setOnError("SKIP_OPTIONAL");
+        properties.getPrompt().getLimits().setMaxSystemPromptTokens(20); // corp-only ~8 tokens; +project overflows
+        when(gitLabClient.resolveCommitSha("platform/ai-review-prompts", "main")).thenReturn("corpsha");
+        when(gitLabClient.fetchRawFile("platform/ai-review-prompts", "prompts/base.md", "corpsha", 262144))
+                .thenReturn(Optional.of("corporate base"));
+        when(gitLabClient.fetchRawFile("platform/ai-review-prompts", "prompts/rules.md", "corpsha", 262144))
+                .thenReturn(Optional.of("corporate rules"));
+        when(gitLabClient.resolveDefaultBranch("1042")).thenReturn("main");
+        when(gitLabClient.resolveCommitSha("1042", "main")).thenReturn("projsha");
+        when(gitLabClient.fetchRawFile("1042", ".ai-review/architecture.md", "projsha", 262144))
+                .thenReturn(Optional.of("x".repeat(500))); // comfortably over max-file-bytes-independent token cap
+        when(gitLabClient.fetchRawFile("1042", ".ai-review/code-rules.md", "projsha", 262144))
+                .thenReturn(Optional.empty());
+
+        PromptManager.PromptResolution result = manager.resolve(1042L);
+
+        assertThat(result.mode()).isEqualTo(PromptBundleMode.REPO);
+        assertThat(result.degraded()).isTrue();
+        assertThat(result.sections()).hasSize(2); // corporate only -- the review still runs, under the rulebook
+        assertThat(result.explicitPathsMissing()).isEmpty();
+    }
+
+    /** The other half of the same fix: with the default {@code on-error=FAIL} it must still 422 hard. */
+    @Test
+    void oversizedOptionalProjectSectionStillFailsHardUnderFail() {
+        properties.getPrompt().getErrorHandling().setOnError("FAIL");
+        properties.getPrompt().getLimits().setMaxSystemPromptTokens(20);
+        when(gitLabClient.resolveCommitSha("platform/ai-review-prompts", "main")).thenReturn("corpsha");
+        when(gitLabClient.fetchRawFile("platform/ai-review-prompts", "prompts/base.md", "corpsha", 262144))
+                .thenReturn(Optional.of("corporate base"));
+        when(gitLabClient.fetchRawFile("platform/ai-review-prompts", "prompts/rules.md", "corpsha", 262144))
+                .thenReturn(Optional.of("corporate rules"));
+        when(gitLabClient.resolveDefaultBranch("1042")).thenReturn("main");
+        when(gitLabClient.resolveCommitSha("1042", "main")).thenReturn("projsha");
+        when(gitLabClient.fetchRawFile("1042", ".ai-review/architecture.md", "projsha", 262144))
+                .thenReturn(Optional.of("x".repeat(500)));
+        when(gitLabClient.fetchRawFile("1042", ".ai-review/code-rules.md", "projsha", 262144))
+                .thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> manager.resolve(1042L))
+                .isInstanceOf(com.review.gateway.exception.PromptTooLargeException.class);
+    }
+
+    /**
+     * F-PM-03 scope guard (PMR-21): when the mandatory CORPORATE_* content alone already exceeds the
+     * budget, that must remain a hard failure regardless of {@code on-error} -- SKIP_OPTIONAL degrades
+     * only the optional half, it must never be read as "silently truncate the corporate rulebook".
+     */
+    @Test
+    void oversizedCorporateContentAloneAlwaysFailsEvenUnderSkipOptionalWithNoProjectSection() {
+        properties.getPrompt().getErrorHandling().setOnError("SKIP_OPTIONAL");
+        properties.getPrompt().getProject().setEnabled(false);
+        properties.getPrompt().getLimits().setMaxSystemPromptTokens(1); // corp-only alone already overflows this
+        when(gitLabClient.resolveCommitSha("platform/ai-review-prompts", "main")).thenReturn("corpsha");
+        when(gitLabClient.fetchRawFile("platform/ai-review-prompts", "prompts/base.md", "corpsha", 262144))
+                .thenReturn(Optional.of("corporate base"));
+        when(gitLabClient.fetchRawFile("platform/ai-review-prompts", "prompts/rules.md", "corpsha", 262144))
+                .thenReturn(Optional.of("corporate rules"));
+
+        assertThatThrownBy(() -> manager.resolve(1042L))
+                .isInstanceOf(com.review.gateway.exception.PromptTooLargeException.class);
+    }
+
+    /**
+     * Same scope guard, but with a project section present too: the corporate-only re-assembly (the
+     * attribution step) must itself still overflow and propagate, rather than being masked by the
+     * project-section-dropping degrade path.
+     */
+    @Test
+    void oversizedCorporateContentAloneAlwaysFailsEvenWhenAProjectSectionIsAlsoPresent() {
+        properties.getPrompt().getErrorHandling().setOnError("SKIP_OPTIONAL");
+        properties.getPrompt().getLimits().setMaxSystemPromptTokens(1); // corp-only alone already overflows this
+        when(gitLabClient.resolveCommitSha("platform/ai-review-prompts", "main")).thenReturn("corpsha");
+        when(gitLabClient.fetchRawFile("platform/ai-review-prompts", "prompts/base.md", "corpsha", 262144))
+                .thenReturn(Optional.of("corporate base"));
+        when(gitLabClient.fetchRawFile("platform/ai-review-prompts", "prompts/rules.md", "corpsha", 262144))
+                .thenReturn(Optional.of("corporate rules"));
+        when(gitLabClient.resolveDefaultBranch("1042")).thenReturn("main");
+        when(gitLabClient.resolveCommitSha("1042", "main")).thenReturn("projsha");
+        when(gitLabClient.fetchRawFile("1042", ".ai-review/architecture.md", "projsha", 262144))
+                .thenReturn(Optional.of("small"));
+        when(gitLabClient.fetchRawFile("1042", ".ai-review/code-rules.md", "projsha", 262144))
+                .thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> manager.resolve(1042L))
+                .isInstanceOf(com.review.gateway.exception.PromptTooLargeException.class);
+    }
+
     // ---- PMR-19: bounded concurrency permit, immediate rejection on saturation ----
 
     @Test

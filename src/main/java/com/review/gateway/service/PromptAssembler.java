@@ -112,7 +112,15 @@ public class PromptAssembler {
      *                            candidate if the file itself was looked up and not found (404).
      * @param projectCodeRules    same shape as {@code projectArchitecture}.
      * @throws PromptTooLargeException if the aggregate token estimate (all sections + preamble/trailer,
-     *                                  when emitted) exceeds {@code gateway.prompt.limits.max-system-prompt-tokens}
+     *                                  when emitted) exceeds {@code gateway.prompt.limits.max-system-prompt-tokens}.
+     *                                  This method itself never degrades or drops content on overflow —
+     *                                  it always throws, unconditionally, regardless of {@code
+     *                                  on-error}. F-PM-03: {@code PromptManager} is the one place that
+     *                                  interprets this throw, re-assembling corporate-only and dropping
+     *                                  the {@code PROJECT_*} sections when {@code on-error=SKIP_OPTIONAL}
+     *                                  and the overflow is attributable to them — never here, so that a
+     *                                  corporate-only overflow (a real configuration error, PMR-21) is
+     *                                  always a hard failure no matter which caller invokes this method.
      */
     public ResolvedSystemPrompt assemble(SectionCandidate corporateBase, SectionCandidate corporateReviewRules,
                                           SectionCandidate projectArchitecture, SectionCandidate projectCodeRules,
