@@ -155,6 +155,21 @@ the token is issued in GitLab, not something the application enforces.
 call, and the Gateway compares it against its single configured `WORKER_TOKEN`). Copy the value out-of-band
 (a secrets manager, or manually) when provisioning each Worker host.
 
+**Prompt Manager (V3): a fifth secret, `GITLAB_PROMPT_TOKEN`.** Required only when
+`gateway.prompt.enabled=true` (the default — see `gateway.prompt.*` in
+[§10](#10-config-file-appendix)). A **separate, read-only** GitLab project/group access token
+(`read_api`/`read_repository` scope — never `api`/write), used exclusively for the three Prompt
+Manager reads (`GitLabClientImpl.resolveCommitSha`/`fetchRawFile`/`resolveDefaultBranch`) via the
+dedicated `gitLabPromptRestClient` bean — the write-scoped `GITLAB_TOKEN` above is never sent on a
+read call and vice versa (PMR-15). For the corporate prompt repo specifically, issue a **project
+access token scoped to that one project**; for project reads, prefer a **group access token with
+`read_repository` only** over an `api`-scoped personal token. Like `GITLAB_TOKEN`, this is checked
+only for presence (not the 32-character floor), for the same reason — it is GitLab's own fixed token
+format, not an operator-chosen secret. If you are not ready to configure Prompt Manager yet, set
+`PROMPT_MANAGER_ENABLED=false` instead of provisioning this token — with the kill-switch off,
+`GatewayProperties.validateOnStartup()` skips all `gateway.prompt.*` validation, including this
+token's presence check, and behavior is byte-identical to pre-V3.
+
 ## 3. Step 1: PostgreSQL
 
 ```bash
@@ -189,6 +204,9 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON
     reviews, review_inputs, backends, review_jobs, review_results, review_comments
     TO review_gateway;
 GRANT SELECT, INSERT ON review_events TO review_gateway;   -- no UPDATE/DELETE
+-- Prompt Manager (V3, PMR-07): same append-only contract as review_events -- the resolved sections
+-- are an immutable audit/provenance record, never rewritten after insert.
+GRANT SELECT, INSERT ON review_prompt_sections TO review_gateway;   -- no UPDATE/DELETE
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO review_gateway;
 ```
 
