@@ -5,6 +5,7 @@ import com.review.gateway.model.Review;
 import com.review.gateway.model.ReviewInput;
 import com.review.gateway.model.ReviewJob;
 import com.review.gateway.model.enums.BackendStatus;
+import com.review.gateway.model.enums.JobStatus;
 import com.review.gateway.model.enums.ReviewStatus;
 import com.review.gateway.repository.BackendRepository;
 import com.review.gateway.repository.ReviewInputRepository;
@@ -108,7 +109,9 @@ class BackendDispatcherClaimDeclineTransactionBugTest {
         Review runningElsewhere = new Review(1L, 2L, "sha-qa-running", "base", "v1", 10);
         runningElsewhere.setStatus(ReviewStatus.RUNNING);
         Review savedRunning = reviewRepository.saveAndFlush(runningElsewhere);
-        reviewJobRepository.saveAndFlush(new ReviewJob(savedRunning.getId(), savedBackend.getId(), "worker-existing"));
+        ReviewJob runningJob = new ReviewJob(savedRunning.getId(), savedBackend.getId(), "worker-existing");
+        runningJob.setStatus(JobStatus.RUNNING);
+        reviewJobRepository.saveAndFlush(runningJob);
 
         Review queued = new Review(1L, 3L, "sha-qa-queued", "base", "v1", 10);
         queued.setStatus(ReviewStatus.QUEUED);

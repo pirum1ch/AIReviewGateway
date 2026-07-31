@@ -2,9 +2,7 @@ package com.review.gateway.repository;
 
 import com.review.gateway.model.Review;
 import com.review.gateway.model.enums.ReviewStatus;
-import jakarta.persistence.LockModeType;
 import org.springframework.data.jpa.repository.JpaRepository;
-import org.springframework.data.jpa.repository.Lock;
 import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
@@ -88,22 +86,40 @@ public interface ReviewRepository extends JpaRepository<Review, Long> {
      * through {@code StateMachine} individually — which is what produces one {@code OBSOLETE}
      * {@code review_events} row per affected Review (req. 1.11), rather than a single silent bulk
      * UPDATE with no per-row audit trail.
+     *
+     * <p><b>Deliberately unlocked</b> (F-DC-03 fix): this used to carry {@code @Lock(PESSIMISTIC_WRITE)}
+     * (a plain {@code FOR UPDATE}), but that conflicts with the {@code FOR KEY SHARE} every child-row
+     * {@code INSERT} (`review_events`/`review_results`/`review_comments`/`review_jobs`, all FK-
+     * referencing {@code reviews}) implicitly takes on this same row via PostgreSQL's referential-
+     * integrity trigger — reproduced as a real {@code deadlock detected} (SQLSTATE 40P01) against a
+     * child-first writer (e.g. {@code RetryManager}) holding a job-row lock and inserting an event.
+     * {@code ReviewService.sweepObsolete} now takes the row-level lock explicitly, one row at a time in
+     * this {@code ORDER BY id} order, via {@link #findByIdForNoKeyUpdate} (CSR-18 determinism preserved:
+     * the ordering here is what the caller iterates and locks in).
      */
-    List<Review> findByProjectIdAndMergeRequestIdAndHeadShaNotAndStatusIn(
+    List<Review> findByProjectIdAndMergeRequestIdAndHeadShaNotAndStatusInOrderByIdAsc(
             Long projectId, Long mergeRequestId, String headSha, Collection<ReviewStatus> obsoletableStatuses);
 
     /**
-     * F02-02 fix: loads a Review under a row-level {@code SELECT ... FOR UPDATE} lock (SR-06 spirit —
-     * serializes completion instead of a lease token, since the frozen V1 schema has no lease column
-     * to add). {@code ResultProcessor}'s completion/fail phase uses this instead of {@code findById} so
-     * that two genuinely concurrent {@code submitResult} calls for the same Review cannot both insert
-     * comments and both transition {@code RUNNING -> COMPLETED}: the second caller's lock acquisition
-     * blocks until the first's {@code REQUIRES_NEW} transaction commits, at which point it re-observes
-     * the Review as no longer {@code RUNNING} and safely no-ops.
+     * F-DC-03 fix (supersedes the old {@code findByIdForUpdate}, a plain {@code FOR UPDATE}): locks the
+     * Review row with PostgreSQL's {@code FOR NO KEY UPDATE} instead. {@code FOR NO KEY UPDATE} still
+     * mutually excludes every other writer that also wants to mutate/delete this row (other callers of
+     * this same method, or anything using {@code FOR UPDATE}) — but, critically, it does **not**
+     * conflict with {@code FOR KEY SHARE}, which is exactly the lock mode PostgreSQL's own referential-
+     * integrity trigger takes on {@code reviews} for every child-row insert (`review_events` /
+     * `review_results` / `review_comments` / `review_jobs`, all {@code REFERENCES reviews(id)}). Using
+     * {@code FOR UPDATE} here (as a prior version did) let a parent-lock holder (this method) and a
+     * child-first writer (e.g. {@code RetryManager}, which locks a job row then inserts an event) form a
+     * genuine two-cycle deadlock, reproduced on real PostgreSQL (SQLSTATE 40P01, F-DC-03). Switching to
+     * {@code FOR NO KEY UPDATE} removes that edge entirely while preserving every actual invariant this
+     * lock exists for (mutual exclusion between concurrent parent-status writers such as
+     * {@code ReviewService.cancel}/{@code sweepObsolete} and {@code ChunkCoordinator}).
+     *
+     * <p>A native query is required: JPA's {@code LockModeType} has no {@code FOR NO KEY UPDATE}
+     * equivalent (only {@code FOR UPDATE}-strength pessimistic write locks are standardized).
      */
-    @Lock(LockModeType.PESSIMISTIC_WRITE)
-    @Query("SELECT r FROM Review r WHERE r.id = :id")
-    Optional<Review> findByIdForUpdate(@Param("id") Long id);
+    @Query(value = "SELECT * FROM reviews WHERE id = :id FOR NO KEY UPDATE", nativeQuery = true)
+    Optional<Review> findByIdForNoKeyUpdate(@Param("id") Long id);
 
     /**
      * Aggregate counts per status, backing {@code GET /metrics}.

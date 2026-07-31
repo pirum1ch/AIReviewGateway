@@ -59,7 +59,7 @@ class StatisticsServiceTest {
         when(reviewJobRepository.averageQueueWaitMillis()).thenReturn(1234.5);
         when(reviewJobRepository.averageRunDurationMillis()).thenReturn(67890.0);
         when(reviewCommentRepository.count()).thenReturn(42L);
-        when(reviewEventRepository.countByEventType(EventType.RETRY)).thenReturn(7L);
+        when(reviewEventRepository.countByEventTypeAndJobIdIsNotNull(EventType.RETRY)).thenReturn(7L);
 
         StatisticsService service = newService(
                 reviewRepository, reviewJobRepository, reviewCommentRepository, reviewEventRepository, backendRepository);
@@ -88,7 +88,7 @@ class StatisticsServiceTest {
         when(reviewJobRepository.averageQueueWaitMillis()).thenReturn(null);
         when(reviewJobRepository.averageRunDurationMillis()).thenReturn(null);
         when(reviewCommentRepository.count()).thenReturn(0L);
-        when(reviewEventRepository.countByEventType(EventType.RETRY)).thenReturn(0L);
+        when(reviewEventRepository.countByEventTypeAndJobIdIsNotNull(EventType.RETRY)).thenReturn(0L);
 
         StatisticsService service = newService(
                 reviewRepository, reviewJobRepository, reviewCommentRepository, reviewEventRepository, backendRepository);

@@ -22,7 +22,7 @@ class EntityRoundTripTest extends AbstractPostgresIntegrationTest {
     private TestEntityManager entityManager;
 
     @Test
-    void allSevenTablesRoundTrip() {
+    void allEightTablesRoundTrip() {
         // reviews
         Review review = new Review(100L, 7L, "abc123", "def456", "v1", 20);
         review = entityManager.persistFlushFind(review);
@@ -41,6 +41,14 @@ class EntityRoundTripTest extends AbstractPostgresIntegrationTest {
         assertThat(input.getDiff()).isEqualTo("diff --git a b");
         assertThat(input.getEstimatedTokens()).isEqualTo(1234);
 
+        // review_chunks (V2, diff chunking)
+        ReviewChunk chunk = new ReviewChunk(review.getId(), 0, 1, "diff --git a b", 1234, 1, "[\"a\"]");
+        chunk = entityManager.persistFlushFind(chunk);
+        assertThat(chunk.getId()).isNotNull();
+        assertThat(chunk.getReviewId()).isEqualTo(review.getId());
+        assertThat(chunk.getChunkIndex()).isZero();
+        assertThat(chunk.getChunkCount()).isEqualTo(1);
+
         // backends
         Backend backend = new Backend("mac-mini-01", "https://mac-mini-01.local:8443", "qwen2.5-coder-32b", 2);
         backend = entityManager.persistFlushFind(backend);
@@ -57,14 +65,17 @@ class EntityRoundTripTest extends AbstractPostgresIntegrationTest {
         assertThat(job.getReviewId()).isEqualTo(review.getId());
         assertThat(job.getBackendId()).isEqualTo(backend.getId());
         assertThat(job.getWorkerId()).isEqualTo("worker-1");
+        assertThat(job.getStatus()).isNotNull();
+        assertThat(job.getChunkIndex()).isZero();
 
         // review_results
-        ReviewResult result = new ReviewResult(review.getId(), "{\"raw\":true}", "summary text",
+        ReviewResult result = new ReviewResult(review.getId(), 0, job.getId(), "{\"raw\":true}", "summary text",
                 100, 200, 300, 4500L, "qwen2.5-coder-32b", backend.getId());
         result = entityManager.persistFlushFind(result);
         assertThat(result.getId()).isNotNull();
         assertThat(result.getReviewId()).isEqualTo(review.getId());
         assertThat(result.getTotalTokens()).isEqualTo(300);
+        assertThat(result.getChunkIndex()).isZero();
 
         // review_comments
         ReviewComment comment = new ReviewComment(review.getId(), "src/Main.java", 42, Severity.MAJOR,

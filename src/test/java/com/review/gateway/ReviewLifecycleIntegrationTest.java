@@ -196,7 +196,8 @@ class ReviewLifecycleIntegrationTest {
     void oversizedDiffIsRejectedWith422DiffTooLargeShapeOverRealHttp() {
         // gateway.diff.max-diff-tokens is 10000 with chars-per-token 4 in test config (inherited from
         // main application.yml defaults) -> ~40000+ chars comfortably exceeds the budget, well under
-        // the SR-11 edge byte-cap (100000) so this exercises DiffSizeValidator, not the body-size filter.
+        // the SR-11/CSR-02 edge byte-cap (320000) so this exercises DiffChunker (which rejects this
+        // no-hunk-markers, over-budget, single-indivisible-section shape), not the body-size filter.
         String hugeDiff = "x".repeat(45_000);
         Map<String, Object> body = createReviewBody(102, 202, "sha-e2e-huge");
         body.put("diff", hugeDiff);

@@ -56,6 +56,17 @@ public class CommentParser {
     }
 
     public List<ParsedComment> parse(String rawResponse) {
+        return parse(rawResponse, properties.getPublish().getMaxCommentCount());
+    }
+
+    /**
+     * V2 (diff chunking): {@code maxCountOverride} lets the caller pass a fair-share per-chunk cap
+     * ({@code max(1, floor(maxCommentCount / chunkCount))}, computed by the caller) instead of the
+     * configured review-wide default — the review-level cap itself is enforced separately, at persist
+     * time, by {@code ChunkCoordinator} (CSR-21), since a per-chunk cap alone would let
+     * {@code maxCommentCount} be multiplied by the number of chunks.
+     */
+    public List<ParsedComment> parse(String rawResponse, int maxCountOverride) {
         if (rawResponse == null || rawResponse.isBlank()) {
             return List.of(new ParsedComment(null, null, Severity.INFO, "(model returned an empty response)"));
         }
@@ -65,7 +76,7 @@ public class CommentParser {
                 ? jsonComments
                 : List.of(new RawComment(null, null, Severity.INFO, rawResponse));
 
-        int maxCount = Math.max(0, properties.getPublish().getMaxCommentCount());
+        int maxCount = Math.max(0, maxCountOverride);
         List<ParsedComment> sanitized = new ArrayList<>();
         int dropped = 0;
         for (RawComment candidate : candidates) {

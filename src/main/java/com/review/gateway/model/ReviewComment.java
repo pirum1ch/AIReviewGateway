@@ -32,6 +32,10 @@ public class ReviewComment {
     @Column(name = "review_id", nullable = false, updatable = false)
     private Long reviewId;
 
+    /** Audit/debug only (V2, diff chunking) — no constraint, nullable, not used for dedup logic. */
+    @Column(name = "chunk_index", updatable = false)
+    private Integer chunkIndex;
+
     @Column(name = "file_path", updatable = false, length = 1024)
     private String filePath;
 
@@ -60,7 +64,13 @@ public class ReviewComment {
 
     public ReviewComment(Long reviewId, String filePath, Integer lineNumber, Severity severity,
                          String comment) {
+        this(reviewId, null, filePath, lineNumber, severity, comment);
+    }
+
+    public ReviewComment(Long reviewId, Integer chunkIndex, String filePath, Integer lineNumber,
+                         Severity severity, String comment) {
         this.reviewId = Objects.requireNonNull(reviewId, "reviewId");
+        this.chunkIndex = chunkIndex;
         this.filePath = filePath;
         this.lineNumber = lineNumber;
         this.severity = severity;
@@ -78,6 +88,10 @@ public class ReviewComment {
 
     public Long getReviewId() {
         return reviewId;
+    }
+
+    public Integer getChunkIndex() {
+        return chunkIndex;
     }
 
     public String getFilePath() {

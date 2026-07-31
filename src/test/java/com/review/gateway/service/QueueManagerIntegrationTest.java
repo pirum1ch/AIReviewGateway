@@ -1,13 +1,18 @@
 package com.review.gateway.service;
 
 import com.review.gateway.AbstractPostgresIntegrationTest;
+import com.review.gateway.config.GatewayProperties;
 import com.review.gateway.model.Backend;
 import com.review.gateway.model.Review;
+import com.review.gateway.model.ReviewChunk;
 import com.review.gateway.model.ReviewInput;
 import com.review.gateway.model.ReviewJob;
 import com.review.gateway.model.enums.BackendStatus;
+import com.review.gateway.model.enums.JobStatus;
 import com.review.gateway.model.enums.ReviewStatus;
 import com.review.gateway.repository.BackendRepository;
+import com.review.gateway.repository.ReviewChunkRepository;
+import com.review.gateway.repository.ReviewCommentRepository;
 import com.review.gateway.repository.ReviewEventRepository;
 import com.review.gateway.repository.ReviewInputRepository;
 import com.review.gateway.repository.ReviewJobRepository;
@@ -18,10 +23,14 @@ import com.review.gateway.service.dto.HeartbeatResult;
 import com.review.gateway.service.dto.ResultOutcome;
 import com.review.gateway.service.dto.SubmitResultCommand;
 import com.review.gateway.service.dto.SubmitResultOutcome;
+import jakarta.persistence.EntityManager;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.boot.test.autoconfigure.orm.jpa.TestEntityManager;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.annotation.Propagation;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Instant;
 import java.util.Optional;
@@ -35,16 +44,18 @@ import static org.mockito.Mockito.when;
 /**
  * Exercises {@link QueueManager} end-to-end against a real (Zonky) PostgreSQL instance: claim's
  * capacity/SKIP-LOCKED path, heartbeat ownership (SR-04), and result submission's idempotent-no-op
- * short-circuit. {@link ResultProcessor} is mocked here since its own behavior (raw-stored-before-
- * parse, COMPLETED/FAILED transitions) is covered in depth by {@link ResultProcessorTest}.
+ * short-circuit. V2 (diff chunking): the queue lives on {@code review_jobs}, so every fixture creates
+ * a single-chunk {@link ReviewChunk} + {@link ReviewJob} alongside the {@link Review}.
  *
- * <p>Services are constructed directly ({@code new QueueManager(...)}) rather than obtained from a
- * Spring context, wired against real, {@code @Autowired} repositories. This is a deliberate
- * simplification: true cross-statement atomicity of the claim transaction under concurrency is
- * already covered at the repository layer by {@code ReviewRepositoryConcurrentClaimTest}
- * (feature/01-data-model); this test verifies claim's *functional* behavior (capacity, status,
- * payload) end-to-end against a real DB in a single thread.
+ * <p>{@code @Transactional(NOT_SUPPORTED)}: {@link QueueManager#claim} (CSR-17) genuinely opens its own
+ * separate, independently-committed transactions (via {@code TransactionTemplate}, not a proxied
+ * {@code @Transactional} — this works even though {@code QueueManager} is constructed directly here,
+ * bypassing Spring AOP, precisely because {@code TransactionTemplate} manages the transaction itself).
+ * Fixture rows must therefore be genuinely committed (not merely flushed within an ambient, never-
+ * committed per-test transaction) for {@code claim}'s separate transaction to see them under
+ * read-committed isolation — exactly the same reasoning as {@code ResultProcessorTest}.
  */
+@Transactional(propagation = Propagation.NOT_SUPPORTED)
 class QueueManagerIntegrationTest extends AbstractPostgresIntegrationTest {
 
     @Autowired
@@ -54,32 +65,53 @@ class QueueManagerIntegrationTest extends AbstractPostgresIntegrationTest {
     @Autowired
     private ReviewInputRepository reviewInputRepository;
     @Autowired
+    private ReviewChunkRepository reviewChunkRepository;
+    @Autowired
+    private ReviewCommentRepository reviewCommentRepository;
+    @Autowired
     private BackendRepository backendRepository;
     @Autowired
     private ReviewEventRepository reviewEventRepository;
     @Autowired
-    private TestEntityManager entityManager;
+    private EntityManager entityManager;
+    @Autowired
+    private PlatformTransactionManager transactionManager;
+
+    @AfterEach
+    void cleanUpCommittedRows() {
+        reviewRepository.deleteAll();
+        backendRepository.deleteAll();
+    }
 
     private QueueManager newQueueManager(ResultProcessor resultProcessor) {
         EventService eventService = new EventService(reviewEventRepository);
         StateMachine stateMachine = new StateMachine(eventService);
+        JobStateMachine jobStateMachine = new JobStateMachine(eventService);
         BackendDispatcher backendDispatcher = new BackendDispatcher(backendRepository, reviewJobRepository);
-        return new QueueManager(reviewRepository, reviewJobRepository, reviewInputRepository,
-                backendDispatcher, stateMachine, eventService, resultProcessor);
+        GatewayProperties properties = new GatewayProperties();
+        ChunkCoordinator chunkCoordinator = new ChunkCoordinator(reviewRepository, reviewJobRepository,
+                reviewChunkRepository, reviewCommentRepository, stateMachine, jobStateMachine, properties, entityManager, transactionManager);
+        ChunkContextRenderer chunkContextRenderer = new ChunkContextRenderer(properties);
+        return new QueueManager(reviewRepository, reviewJobRepository, reviewChunkRepository, backendDispatcher,
+                jobStateMachine, chunkCoordinator, eventService, resultProcessor, chunkContextRenderer,
+                entityManager, transactionManager);
     }
 
     private Review persistQueuedReview(long projectId, long mrId, String headSha, int priority) {
         Review review = new Review(projectId, mrId, headSha, "base", "v1", priority);
         review.setStatus(ReviewStatus.QUEUED);
-        Review saved = entityManager.persistFlushFind(review);
-        entityManager.persistAndFlush(new ReviewInput(saved.getId(), "diff-" + headSha, "v1", headSha, "base", 10));
-        return saved;
+        review = reviewRepository.saveAndFlush(review);
+        reviewInputRepository.saveAndFlush(new ReviewInput(review.getId(), "diff-" + headSha, "v1", headSha, "base", 10));
+        ReviewChunk chunk = reviewChunkRepository.saveAndFlush(
+                new ReviewChunk(review.getId(), 0, 1, "diff-" + headSha, 10, 0, "[]"));
+        reviewJobRepository.saveAndFlush(new ReviewJob(review.getId(), chunk.getId(), 0, priority, null, null));
+        return review;
     }
 
     private Backend persistBackend(String name, BackendStatus status, int capacity) {
         Backend backend = new Backend(name, "https://" + name + ".local", "model-x", capacity);
         backend.setStatus(status);
-        return entityManager.persistFlushFind(backend);
+        return backendRepository.saveAndFlush(backend);
     }
 
     @Test
@@ -93,16 +125,15 @@ class QueueManagerIntegrationTest extends AbstractPostgresIntegrationTest {
         assertThat(claimed).isPresent();
         assertThat(claimed.get().reviewId()).isEqualTo(review.getId());
         assertThat(claimed.get().diff()).isEqualTo("diff-sha-a");
+        assertThat(claimed.get().chunkContext()).isNull(); // single chunk -> no context header (§8)
 
-        entityManager.getEntityManager().flush();
-        entityManager.getEntityManager().clear();
-        Review reloaded = entityManager.find(Review.class, review.getId());
+        Review reloaded = reviewRepository.findById(review.getId()).orElseThrow();
         assertThat(reloaded.getStatus()).isEqualTo(ReviewStatus.RUNNING);
-        assertThat(reloaded.getAttempts()).isEqualTo(1);
 
-        Optional<ReviewJob> job = reviewJobRepository.findByReviewId(review.getId());
-        assertThat(job).isPresent();
-        assertThat(job.get().getWorkerId()).isEqualTo("worker-1");
+        ReviewJob job = reviewJobRepository.findByReviewIdAndChunkIndex(review.getId(), 0).orElseThrow();
+        assertThat(job.getStatus()).isEqualTo(JobStatus.RUNNING);
+        assertThat(job.getAttempts()).isEqualTo(1);
+        assertThat(job.getWorkerId()).isEqualTo("worker-1");
     }
 
     @Test
@@ -131,8 +162,12 @@ class QueueManagerIntegrationTest extends AbstractPostgresIntegrationTest {
         Backend backend = persistBackend("mac-mini-d", BackendStatus.ACTIVE, 1);
         Review runningElsewhere = persistQueuedReview(1L, 102L, "sha-d-running", 10);
         runningElsewhere.setStatus(ReviewStatus.RUNNING);
-        entityManager.persistAndFlush(runningElsewhere);
-        entityManager.persistAndFlush(new ReviewJob(runningElsewhere.getId(), backend.getId(), "worker-existing"));
+        reviewRepository.saveAndFlush(runningElsewhere);
+        ReviewJob runningJob = reviewJobRepository.findByReviewIdAndChunkIndex(runningElsewhere.getId(), 0).orElseThrow();
+        runningJob.setStatus(JobStatus.RUNNING);
+        runningJob.setBackendId(backend.getId());
+        runningJob.setWorkerId("worker-existing");
+        reviewJobRepository.saveAndFlush(runningJob);
 
         persistQueuedReview(1L, 103L, "sha-d-queued", 10);
 
@@ -164,12 +199,6 @@ class QueueManagerIntegrationTest extends AbstractPostgresIntegrationTest {
         QueueManager queueManager = newQueueManager(Mockito.mock(ResultProcessor.class));
         ClaimedJob claimed = queueManager.claim("mac-mini-f", "worker-1").orElseThrow();
 
-        // Flush + clear so this read (and the one below) both hit the DB fresh, at its actual
-        // stored (microsecond) precision -- otherwise the first read would return the still-attached,
-        // full-nanosecond-precision Java instant from the same persistence context, which would never
-        // compare equal to a genuinely re-fetched value.
-        entityManager.getEntityManager().flush();
-        entityManager.getEntityManager().clear();
         ReviewJob beforeJob = reviewJobRepository.findById(claimed.jobId()).orElseThrow();
         Instant beforeHeartbeat = beforeJob.getHeartbeatAt();
 
@@ -178,8 +207,6 @@ class QueueManagerIntegrationTest extends AbstractPostgresIntegrationTest {
         assertThat(result.outcome()).isEqualTo(HeartbeatOutcome.OWNERSHIP_MISMATCH);
         assertThat(result.shouldContinue()).isFalse();
 
-        entityManager.getEntityManager().flush();
-        entityManager.getEntityManager().clear();
         ReviewJob afterJob = reviewJobRepository.findById(claimed.jobId()).orElseThrow();
         assertThat(afterJob.getHeartbeatAt()).isEqualTo(beforeHeartbeat);
     }
@@ -202,10 +229,12 @@ class QueueManagerIntegrationTest extends AbstractPostgresIntegrationTest {
         QueueManager queueManager = newQueueManager(Mockito.mock(ResultProcessor.class));
         ClaimedJob claimed = queueManager.claim("mac-mini-g", "worker-1").orElseThrow();
 
-        // Simulate the review going OBSOLETE concurrently (e.g. a new head_sha arrived).
-        Review running = entityManager.find(Review.class, review.getId());
+        // Simulate the review going OBSOLETE concurrently (e.g. a new head_sha arrived) -- the job
+        // itself is still RUNNING (a real OBSOLETE sweep would also cascade to the job, but this test
+        // deliberately isolates the heartbeat's "review no longer RUNNING" check).
+        Review running = reviewRepository.findById(review.getId()).orElseThrow();
         running.setStatus(ReviewStatus.OBSOLETE);
-        entityManager.persistAndFlush(running);
+        reviewRepository.saveAndFlush(running);
 
         HeartbeatResult result = queueManager.heartbeat(claimed.jobId(), "worker-1");
 
@@ -214,7 +243,7 @@ class QueueManagerIntegrationTest extends AbstractPostgresIntegrationTest {
     }
 
     @Test
-    void submitResultIsIdempotentNoOpWhenReviewIsNoLongerRunning() {
+    void submitResultIsIdempotentNoOpWhenJobIsNoLongerRunning() {
         persistBackend("mac-mini-h", BackendStatus.ACTIVE, 2);
         Review review = persistQueuedReview(1L, 107L, "sha-h", 10);
 
@@ -222,10 +251,13 @@ class QueueManagerIntegrationTest extends AbstractPostgresIntegrationTest {
         QueueManager queueManager = newQueueManager(resultProcessor);
         ClaimedJob claimed = queueManager.claim("mac-mini-h", "worker-1").orElseThrow();
 
-        // Simulate the review already having completed via a prior (or concurrent) result delivery.
-        Review completed = entityManager.find(Review.class, review.getId());
+        // Simulate the job already having completed via a prior (or concurrent) result delivery.
+        ReviewJob job = reviewJobRepository.findById(claimed.jobId()).orElseThrow();
+        job.setStatus(JobStatus.COMPLETED);
+        reviewJobRepository.saveAndFlush(job);
+        Review completed = reviewRepository.findById(review.getId()).orElseThrow();
         completed.setStatus(ReviewStatus.COMPLETED);
-        entityManager.persistAndFlush(completed);
+        reviewRepository.saveAndFlush(completed);
 
         SubmitResultOutcome outcome = queueManager.submitResult(claimed.jobId(), "worker-1",
                 new SubmitResultCommand("raw response", 10, 20, 500L, "model-x"));

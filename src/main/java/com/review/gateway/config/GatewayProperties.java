@@ -89,6 +89,18 @@ public class GatewayProperties {
             throw new IllegalStateException(
                     "gateway.gitlab.base-url must use https:// (SR-15); got: " + describeUrlScheme(gitlab.getBaseUrl()));
         }
+
+        if (diff.getMaxChunks() < 1) {
+            throw new IllegalStateException("gateway.diff.max-chunks must be >= 1; got: " + diff.getMaxChunks());
+        }
+        if (diff.getChunkHeaderReserveTokens() < 0) {
+            throw new IllegalStateException("gateway.diff.chunk-header-reserve-tokens must be >= 0; got: "
+                    + diff.getChunkHeaderReserveTokens());
+        }
+        if (diff.getMaxChunkContextChars() < 1) {
+            throw new IllegalStateException("gateway.diff.max-chunk-context-chars must be >= 1; got: "
+                    + diff.getMaxChunkContextChars());
+        }
     }
 
     private void requireSecret(String propertyName, String value) {
@@ -135,13 +147,50 @@ public class GatewayProperties {
         /** Heuristic characters-per-token ratio used to estimate diff size without a real tokenizer. */
         private int charsPerToken = 4;
         /**
-         * SR-11 hard edge cap (bytes) for the whole {@code POST /reviews} request body, enforced by
-         * {@code RequestBodySizeLimitFilter} before Spring MVC/Jackson reads it. Sized generously above
-         * {@code maxDiffTokens * charsPerToken} to allow for JSON-escaping overhead (quotes/backslashes/
-         * newlines in a diff can each expand to a 2-6 char escape sequence) and the request's other
-         * fields; default here assumes the stock {@code maxDiffTokens=10000}/{@code charsPerToken=4}.
+         * CSR-05: maximum number of chunks {@code DiffChunker} may split one diff into; more than this
+         * is rejected with {@code DIFF_TOO_LARGE} rather than dispatched. Default deliberately lowered
+         * to <b>5</b> (not the architect's original draft of 10) — the threat model flagged 10 as too
+         * high a pool-starvation risk for launch, given the compute-cost math below.
+         *
+         * <p>Compute-cost bound this caps: in the worst case (every chunk retried to exhaustion) one
+         * Review can occupy {@code max-chunks * gateway.job.max-duration * gateway.retry.max-attempts}
+         * of aggregate Worker time before finally failing — with the stock defaults (45m max-duration,
+         * 3 max-attempts) that is {@code 5 * 45m * 3 = 675} Worker-minutes for a single MR at the
+         * default cap, versus {@code 10 * 45m * 3 = 1350} at the architect's original draft value. At
+         * this project's scale (1-10 backends total), the lower default meaningfully bounds how much of
+         * the shared pool one pathological MR can monopolize.
          */
-        private long maxRequestBodyBytes = 100_000;
+        private int maxChunks = 5;
+        /**
+         * Tokens reserved, per chunk, for the {@code ChunkContextRenderer} cross-chunk header text that
+         * gets injected into the prompt whenever a Review has more than one chunk (§3). Subtracted from
+         * the per-chunk budget during bin-packing so the header always has room without pushing a chunk
+         * over its real token budget; irrelevant (not subtracted) for the single-chunk case, since no
+         * header is rendered then.
+         */
+        private int chunkHeaderReserveTokens = 256;
+        /**
+         * CSR-09/CSR-10: hard cap (characters) on the rendered cross-chunk context header text (file
+         * paths from this chunk + the sanitized list of other files changed elsewhere in the MR).
+         * Excess paths collapse to "... and N more" rather than growing the header unboundedly.
+         */
+        private int maxChunkContextChars = 1000;
+        /**
+         * SR-11 hard edge cap (bytes) for the whole {@code POST /reviews} request body, enforced by
+         * {@code RequestBodySizeLimitFilter} before Spring MVC/Jackson reads it.
+         *
+         * <p>CSR-02: derived from {@code max-chunks * max-diff-tokens * chars-per-token * safety-factor
+         * + fixed-overhead}, with the stock defaults ({@code max-chunks=5}, {@code max-diff-tokens=
+         * 10000}, {@code chars-per-token=4}) giving {@code 5 * 10000 * 4 * 1.5 + 20000 = 320000}. The
+         * {@code 1.5x} safety factor covers JSON-escaping overhead (quotes/backslashes/newlines in a
+         * diff can each expand to a 2-6 char escape sequence); the {@code 20000}-byte fixed overhead
+         * covers the request's other fields plus general slack. <b>If any of {@code max-chunks}/{@code
+         * max-diff-tokens}/{@code chars-per-token} is changed in a deployment's config, this value must
+         * be recomputed from the same formula and changed to match</b> — it is not automatically
+         * derived at startup (unlike {@code budgetTokens()}) because the edge-level byte filter must
+         * run before any config-driven request parsing, as cheaply as possible.
+         */
+        private long maxRequestBodyBytes = 320_000;
 
         public int getContextWindow() {
             return contextWindow;
@@ -189,6 +238,30 @@ public class GatewayProperties {
 
         public void setMaxRequestBodyBytes(long maxRequestBodyBytes) {
             this.maxRequestBodyBytes = maxRequestBodyBytes;
+        }
+
+        public int getMaxChunks() {
+            return maxChunks;
+        }
+
+        public void setMaxChunks(int maxChunks) {
+            this.maxChunks = maxChunks;
+        }
+
+        public int getChunkHeaderReserveTokens() {
+            return chunkHeaderReserveTokens;
+        }
+
+        public void setChunkHeaderReserveTokens(int chunkHeaderReserveTokens) {
+            this.chunkHeaderReserveTokens = chunkHeaderReserveTokens;
+        }
+
+        public int getMaxChunkContextChars() {
+            return maxChunkContextChars;
+        }
+
+        public void setMaxChunkContextChars(int maxChunkContextChars) {
+            this.maxChunkContextChars = maxChunkContextChars;
         }
     }
 

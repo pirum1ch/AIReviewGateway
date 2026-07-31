@@ -69,7 +69,11 @@ public class StatisticsService {
         double avgQueueMs = nullToZero(reviewJobRepository.averageQueueWaitMillis());
         double avgRunMs = nullToZero(reviewJobRepository.averageRunDurationMillis());
         long totalComments = reviewCommentRepository.count();
-        long retries = reviewEventRepository.countByEventType(EventType.RETRY);
+        // V2 bugfix: count only the job-level RETRY event (job_id set) -- a retry also triggers a
+        // second, review-level RETRY event when the parent's derived status transitions back to QUEUED,
+        // which would otherwise double this count for the common single-chunk case. See
+        // ReviewEventRepository#countByEventTypeAndJobIdIsNotNull javadoc for the full rationale.
+        long retries = reviewEventRepository.countByEventTypeAndJobIdIsNotNull(EventType.RETRY);
 
         return new MetricsSnapshot(total, byStatus, avgQueueMs, avgRunMs, totalComments, retries);
     }

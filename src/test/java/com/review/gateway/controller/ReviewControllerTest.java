@@ -57,7 +57,7 @@ class ReviewControllerTest {
     @Test
     void createReviewReturns201ForANewReview() throws Exception {
         when(reviewService.createReview(any(CreateReviewCommand.class)))
-                .thenReturn(new CreateReviewResult(42L, ReviewStatus.QUEUED, false));
+                .thenReturn(new CreateReviewResult(42L, ReviewStatus.QUEUED, false, 1));
 
         mockMvc.perform(post("/reviews")
                         .header("Authorization", "Bearer " + SecurityTestTokens.CI_TOKEN)
@@ -71,7 +71,7 @@ class ReviewControllerTest {
     @Test
     void createReviewReturns200WhenDeduplicated() throws Exception {
         when(reviewService.createReview(any(CreateReviewCommand.class)))
-                .thenReturn(new CreateReviewResult(7L, ReviewStatus.RUNNING, true));
+                .thenReturn(new CreateReviewResult(7L, ReviewStatus.RUNNING, true, 1));
 
         mockMvc.perform(post("/reviews")
                         .header("Authorization", "Bearer " + SecurityTestTokens.CI_TOKEN)

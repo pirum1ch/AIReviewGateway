@@ -12,11 +12,13 @@ import java.time.Instant;
 import java.util.Objects;
 
 /**
- * Raw model response + metrics for a {@link Review} → {@code review_results}. The raw response is
- * stored mandatorily, before any parsing is attempted (req. 1.9). {@code review_id} is
- * {@code UNIQUE}, which is what makes result submission idempotent at the repository layer
- * ({@code INSERT ... ON CONFLICT (review_id) DO NOTHING}). Append-only: no column besides
- * {@code id} is ever updated after insert.
+ * Raw model response + metrics for one chunk of a {@link Review} → {@code review_results} (V2, diff
+ * chunking: 1:N per review, one row per completed chunk). The raw response is stored mandatorily,
+ * before any parsing is attempted (req. 1.9). {@code (review_id, chunk_index)} is {@code UNIQUE},
+ * which is what makes result submission idempotent per chunk at the repository layer. {@code job_id}
+ * (CSR-20) is always derived server-side from the locked {@code review_jobs} row being processed —
+ * never taken from the Worker-supplied request body. Append-only: no column besides {@code id} is
+ * ever updated after insert.
  */
 @Entity
 @Table(name = "review_results")
@@ -26,8 +28,14 @@ public class ReviewResult {
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
 
-    @Column(name = "review_id", nullable = false, unique = true, updatable = false)
+    @Column(name = "review_id", nullable = false, updatable = false)
     private Long reviewId;
+
+    @Column(name = "chunk_index", nullable = false, updatable = false)
+    private Integer chunkIndex;
+
+    @Column(name = "job_id", updatable = false)
+    private Long jobId;
 
     @Column(name = "raw_response", nullable = false, updatable = false)
     private String rawResponse;
@@ -60,10 +68,12 @@ public class ReviewResult {
     protected ReviewResult() {
     }
 
-    public ReviewResult(Long reviewId, String rawResponse, String summary, Integer promptTokens,
-                        Integer completionTokens, Integer totalTokens, Long durationMs,
+    public ReviewResult(Long reviewId, Integer chunkIndex, Long jobId, String rawResponse, String summary,
+                        Integer promptTokens, Integer completionTokens, Integer totalTokens, Long durationMs,
                         String model, Long backendId) {
         this.reviewId = Objects.requireNonNull(reviewId, "reviewId");
+        this.chunkIndex = chunkIndex != null ? chunkIndex : 0;
+        this.jobId = jobId;
         this.rawResponse = Objects.requireNonNull(rawResponse, "rawResponse");
         this.summary = summary;
         this.promptTokens = promptTokens;
@@ -85,6 +95,14 @@ public class ReviewResult {
 
     public Long getReviewId() {
         return reviewId;
+    }
+
+    public Integer getChunkIndex() {
+        return chunkIndex;
+    }
+
+    public Long getJobId() {
+        return jobId;
     }
 
     public String getRawResponse() {

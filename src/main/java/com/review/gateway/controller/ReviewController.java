@@ -45,7 +45,7 @@ public class ReviewController {
                 request.projectId(), request.mergeRequestId(), request.headSha(),
                 request.baseSha(), request.diff(), request.promptVersion(), request.priority());
         CreateReviewResult result = reviewService.createReview(command);
-        CreateReviewResponse body = new CreateReviewResponse(result.reviewId(), result.status().name());
+        CreateReviewResponse body = new CreateReviewResponse(result.reviewId(), result.status().name(), result.chunkCount());
         HttpStatus status = result.deduplicated() ? HttpStatus.OK : HttpStatus.CREATED;
         return ResponseEntity.status(status).body(body);
     }

@@ -651,7 +651,7 @@ External call contracts:
 
 ## 12. Risks & trade-offs
 
-- **`reviews`-as-queue-owner deviates from the literal `review_jobs.status` column in the architecture doc.** Chosen to keep a single status column and make both required indexes single-table. Trade-off: `review_jobs` is thinner than the doc's field list (status/priority/attempts moved to `reviews`); per-attempt detail is recovered from `review_events`. Explicitly sanctioned by the brief.
+- **`reviews`-as-queue-owner deviates from the literal `review_jobs.status` column in the architecture doc.** Chosen to keep a single status column and make both required indexes single-table. Trade-off: `review_jobs` is thinner than the doc's field list (status/priority/attempts moved to `reviews`); per-attempt detail is recovered from `review_events`. Explicitly sanctioned by the brief. **Superseded by V2 (§14):** diff chunking requires more than one job per review, so queue ownership moved back to `review_jobs` (matching the original architecture doc's intent) — `reviews.status` is now a *derived* value, not the queue's own column.
 - **Single Gateway instance** is a deliberate SPOF at this scale (systemd `Restart=always`, `RUNNING` survives restart). Horizontal scaling is a future change; the SKIP-LOCKED claim already tolerates multiple claimers, so scaling out is possible later without a redesign.
 - **Comment double-post window** (section 6) accepted at 20–30 MRs/day.
 - **VARCHAR+CHECK enums** trade native-enum type-safety for migration simplicity — the right call for a Flyway-driven schema.
@@ -662,3 +662,135 @@ External call contracts:
 ## 13. Handoff to the developer
 
 Build in branch order `01 → 02 → 03`, following the 6-stage codegen brief inside each branch. Non-negotiables to keep verifying at every stage: PostgreSQL is the only infra; Worker never touches DB/GitLab; `RUNNING` untouched on restart; `RestClient` not `RestTemplate`; constructor injection; records for DTOs; `spring.threads.virtual.enabled=true`; every state change goes through `StateMachine` and writes a `review_events` row; no secret ever reaches logs or `review_events`.
+
+---
+
+## 14. V2 — Diff chunking (as-built)
+
+Feature branch `feature/diff-chunking`, built on top of the complete V1 system described above. Splits
+an oversized MR diff into file-based chunks, each dispatched as its own `review_jobs` row (possibly to
+different Workers/backends in parallel), then aggregates the results back into one Review. See
+`Требования_Review_Gateway_v2.md` / the architect+appsec design docs for the full spec this section
+summarizes; this is the as-built record.
+
+### 14.1 Schema (`V2__diff_chunking.sql`, additive — `V1__initial_schema.sql` untouched)
+
+- New table **`review_chunks`**: `review_id` (FK, cascade delete), `chunk_index`/`chunk_count`, `diff`
+  (this chunk's slice), `estimated_tokens`, `file_count`, `file_paths` (JSON array of *sanitized* paths,
+  §14.4). `UNIQUE(review_id, chunk_index)`, `CHECK(chunk_index >= 0 AND chunk_index < chunk_count)`.
+- **`review_jobs` becomes the queue owner** (1:N per review, reverting the §12 trade-off back to the
+  original architecture doc's intent): the old implicit `UNIQUE(review_id)` is dropped (looked up
+  dynamically, not hardcoded), and `chunk_id`, `chunk_index`, `status`/`priority`/`attempts` are added.
+  New partial indexes for the claim query (`WHERE status='QUEUED'`) and heartbeat sweep
+  (`WHERE status='RUNNING'`), plus a backend-capacity index.
+- **`review_results`** becomes 1:N per review (`chunk_index`, `job_id`, new `UNIQUE(review_id,
+  chunk_index)` replacing the old `UNIQUE(review_id)`). `job_id` is always derived server-side from the
+  locked job row being processed, never from the Worker's request body (CSR-20).
+- **`review_comments`**/**`review_events`** gain nullable `chunk_index` (+`job_id` for events) —
+  audit/debug only, no constraint, no new `EventType` values (the existing set is reused, attributed at
+  either job or review granularity via these new columns). **QA fix:** the double-counting this pattern
+  causes (one job-level + one review-level event per actual occurrence) is correct/intentional for
+  `COMPLETED`/`FAILED`, but corrupted the live `GET /metrics` `retries` field for `RETRY` (which was
+  already querying `review_events` directly) — fixed by having `StatisticsService` count only the
+  job-level `RETRY` row (`ReviewEventRepository#countByEventTypeAndJobIdIsNotNull`), not both.
+- **Backfill** (same migration, ordinary transactional DDL/DML — no `CREATE INDEX CONCURRENTLY`):
+  creates a `chunk_index=0`/`chunk_count=1` `review_chunks` row for every review lacking one (sourced
+  from `review_inputs.diff`), a `review_jobs` row for any review never claimed, and derives
+  status/priority/attempts + `chunk_id` linkage on every existing job row — `review_jobs.id` is always
+  preserved (`UPDATE`, never delete+reinsert), so in-flight `RUNNING` jobs survive the migration
+  untouched. See `DEPLOYMENT.md` §8a for the forward-only rollback hazard and downtime budget.
+
+### 14.2 New services
+
+- **`DiffChunker`** (pure function, no DB/Spring state beyond reading config): line-scan splits a diff
+  into `diff --git`-delimited file sections (falling back to `--- `/`+++ ` markers, then to one
+  indivisible unit), bin-packs them next-fit preserving file order, and splits any single oversized file
+  at `@@` hunk boundaries with its header replayed per piece. Single-chunk diffs return the original
+  `String` instance unmodified (§14.6 backward compatibility).
+- **`ChunkContextRenderer`**: sanitizes file paths (strips Unicode Cc/Cf/Zl/Zp categories, caps length)
+  and renders the cross-chunk context header injected into the prompt (fixed instruction text + a
+  delimited, non-prose file-path block) — every path is treated as attacker-controlled MR-author input.
+- **`JobStateMachine`**: mirrors `StateMachine` one level down, for `ReviewJob.status`
+  (`QUEUED→RUNNING|CANCELLED|OBSOLETE`; `RUNNING→COMPLETED|FAILED|QUEUED|CANCELLED|OBSOLETE`).
+- **`ChunkCoordinator`**: derives `reviews.status` from the set of a review's job statuses (any `FAILED`
+  → `FAILED`; all `COMPLETED` → `COMPLETED`; any `RUNNING` (or some `COMPLETED`, rest `QUEUED`) →
+  `RUNNING`; all `QUEUED` → `QUEUED`) and applies it through the existing `StateMachine` — for
+  `chunkCount==1` this collapses exactly onto pre-V2 behavior. Also owns the review-level comment-count
+  cap (CSR-21) and sibling-cancellation-on-permanent-failure.
+
+### 14.3 Lock-ordering fix (CSR-17/CSR-18 — supersedes the original per-feature design draft)
+
+The original per-feature draft proposed "always lock the job row, then the parent row" — unsafe, because
+admin-cancel/OBSOLETE-sweep necessarily discover children *from* the parent (parent-first), creating a
+genuine lock-order inversion. The as-built fix: **every propagation direction is parent → child, and the
+two lock acquisitions are always independent (never nested in the same transaction)**:
+
+- `QueueManager.claim` no longer locks the parent row at all — only the job row (`FOR UPDATE SKIP
+  LOCKED`), in its own committed transaction. The parent's derived status is then updated by
+  `ChunkCoordinator` in a *separate*, independently-committed transaction, called only after the job-row
+  transaction has already committed (so the job lock is never held while requesting the parent lock).
+  A lock-free, best-effort "doomed job" check (unlocked read of the parent's current status) after that
+  avoids handing a job to a Worker if the parent already went `CANCELLED`/`OBSOLETE` — correctness still
+  comes from the heartbeat mechanism, not this check.
+- `RetryManager.requeueOrFail` (previously a lost-update bug: unconditional `UPDATE reviews SET
+  status='QUEUED'` after an unlocked `findById`) now locks the **job** row first, writes the job's own
+  status, then calls `ChunkCoordinator` independently once that transaction has committed.
+- `ReviewService.cancel`/`sweepObsolete` lock the parent row first (the sweep's repository query uses
+  `@Lock(PESSIMISTIC_WRITE)` with a deterministic `ORDER BY id`, CSR-18, so concurrent multi-row sweeps
+  can't deadlock against each other), then cascade to non-terminal child jobs in the same transaction.
+- A bounded `SET LOCAL lock_timeout = '3s'` (CSR-19) on every lock-taking transaction — `QueueManager`,
+  `RetryManager`, `ChunkCoordinator`, and (QA fix — initially missing) `ReviewService.cancel`/
+  `sweepObsolete` — prevents a lock wait from pinning a Hikari connection (pool size 20) indefinitely;
+  the resulting exception is mapped to a clean `204` (claim) or `409 LOCK_TIMEOUT` (everything else),
+  never a raw `500`. `LockTimeoutMappingTest` deliberately holds a row lock open past 3s in a background
+  thread/transaction and asserts the concurrent `DELETE /reviews/{id}` gets a `409`, not a hang or `500`
+  — the actual SQLState observed is Postgres `55P03`, translated by Hibernate/Spring to a
+  `PessimisticLockingFailureException`, which `GlobalExceptionHandler` maps alongside
+  `CannotAcquireLockException`/`QueryTimeoutException` (the mapping is defensive across all three since
+  which one a given JPA provider surfaces isn't itself part of the JPA spec).
+- Verified by `ClaimCancelObsoleteConcurrencyTest`: concurrent `POST /jobs/claim` / `DELETE
+  /reviews/{id}` / `POST /reviews` (new `head_sha`, same MR) against the real Spring context, asserting
+  zero unhandled `5xx`.
+
+### 14.4 Worker changes (minimal, still fully stateless/chunk-ignorant)
+
+- `JobPayload` (both Gateway and Worker DTOs) gains a nullable `chunkContext` field, plus a masked
+  `toString()` on the previously-unmasked Gateway `dto.JobPayload`/`service.dto.ClaimedJob` (CSR-14).
+- `PromptTemplateService.resolve` substitutes both `{{DIFF}}` and `{{CHUNK_CONTEXT}}` in a **single
+  regex pass** (`Matcher.appendReplacement`/`quoteReplacement`) rather than two sequential
+  `String.replace` calls, which would let one placeholder's substituted content accidentally satisfy the
+  other's pattern (CSR-08); `chunkContext` also has literal `{{`/`}}` stripped before substitution as
+  defense in depth. Fails closed (`AbandonJobException`) if `chunkContext` is supplied but the resolved
+  template has no `{{CHUNK_CONTEXT}}` placeholder (CSR-12) — the Gateway independently enforces a
+  prompt-version allowlist (currently just `v2`) before ever dispatching a chunked Review under an
+  unaware template.
+- New `worker/src/main/resources/prompts/v2.yml`, placing `{{CHUNK_CONTEXT}}` in the user-message
+  section only (never system) since it carries attacker-controlled content; `v1.yml` is untouched.
+- `worker.limits.max-diff-bytes` now bounds `diff bytes + chunkContext bytes` combined.
+- Everything else (`WorkerLoop`, `HeartbeatScheduler`, `AbortSignal`, `LlamaClient`, `GatewayClient`,
+  metrics, graceful shutdown) is unchanged — the Worker still just claims a job, calls llama-server,
+  heartbeats, and submits a result, with zero knowledge of chunking, retries, or the queue.
+
+### 14.5 Aggregation / idempotency
+
+- `ResultProcessor` now operates at the per-chunk-job level in two phases, run as genuinely separate
+  transactions: phase 1 locks the job row, stores the raw response (idempotent per `(review_id,
+  chunk_index)`), parses comments with a fair per-chunk share of `gateway.publish.max-comment-count`,
+  and transitions the job to `COMPLETED`/`FAILED`; phase 2 (`ChunkCoordinator`) locks the parent row,
+  persists the parsed comments under the *review-level* remaining budget (CSR-21 — a single
+  count-then-insert step under one lock, not a per-chunk cap multiplied by chunk count), exact-match-
+  dedupes across chunks (only relevant for the rare same-file hunk-split case), and re-derives the
+  parent's status.
+- `GitLabPublisher`/`PublishRetryService` needed **no code changes** — a composite Review only reaches
+  `COMPLETED` once every chunk is `COMPLETED`, so "publish when status=COMPLETED" continues to work
+  unmodified.
+
+### 14.6 Backward compatibility
+
+A single-chunk MR (still the common case) is provably byte-for-byte behaviorally identical to pre-V2:
+same request/response shapes on `POST /reviews`/`GET /reviews/{id}` (additive `chunkCount` field only),
+same prompt sent to llama-server on `v1.yml`, same state-transition timeline (`ChunkCoordinator`'s
+derivation collapses to the single job's status), same retry/timeout behavior, same publish path.
+Covered by `ReviewServiceChunkingIntegrationTest.singleChunkDiffCollapsesOntoPreV2Behavior` and the
+existing end-to-end `ReviewLifecycleIntegrationTest` (unmodified in spirit, only updated for relocated
+fields).
