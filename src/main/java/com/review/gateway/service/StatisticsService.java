@@ -75,7 +75,15 @@ public class StatisticsService {
         // ReviewEventRepository#countByEventTypeAndJobIdIsNotNull javadoc for the full rationale.
         long retries = reviewEventRepository.countByEventTypeAndJobIdIsNotNull(EventType.RETRY);
 
-        return new MetricsSnapshot(total, byStatus, avgQueueMs, avgRunMs, totalComments, retries);
+        // PMR-10/PMR-11: derived from the append-only review_events audit trail, same "no in-memory
+        // counters, PostgreSQL is the single source of truth" pattern as every other metric here --
+        // how many Reviews were created with the kill-switch off, and how many explicitly-configured
+        // override paths were looked up and not found, org-wide.
+        long promptDisabledCount = reviewEventRepository.countByEventType(EventType.PROMPT_DISABLED);
+        long promptSectionMissingCount = reviewEventRepository.countByEventType(EventType.PROMPT_SECTION_MISSING);
+
+        return new MetricsSnapshot(total, byStatus, avgQueueMs, avgRunMs, totalComments, retries,
+                promptDisabledCount, promptSectionMissingCount);
     }
 
     private double nullToZero(Double value) {

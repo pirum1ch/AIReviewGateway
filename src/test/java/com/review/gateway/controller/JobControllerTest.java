@@ -16,6 +16,7 @@ import org.springframework.http.MediaType;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.web.servlet.MockMvc;
 
+import java.util.List;
 import java.util.Optional;
 
 import static org.mockito.ArgumentMatchers.any;
@@ -37,7 +38,7 @@ class JobControllerTest {
     @Test
     void claimReturns200WithPayloadWhenAJobIsAvailable() throws Exception {
         when(queueManager.claim(eq("mac-mini-1"), eq("worker-1")))
-                .thenReturn(Optional.of(new ClaimedJob(10L, 20L, "diff content", "v1", null)));
+                .thenReturn(Optional.of(new ClaimedJob(10L, 20L, "diff content", "v1", null, null)));
 
         mockMvc.perform(post("/jobs/claim")
                         .header("Authorization", "Bearer " + SecurityTestTokens.WORKER_TOKEN)
@@ -49,6 +50,24 @@ class JobControllerTest {
                 .andExpect(jsonPath("$.jobId").value(10))
                 .andExpect(jsonPath("$.reviewId").value(20))
                 .andExpect(jsonPath("$.payload.diff").value("diff content"));
+    }
+
+    @Test
+    void claimReturns200WithSystemMessagesWhenPromptManagerResolvedSections() throws Exception {
+        // Prompt Manager (V3): systemMessages passes through from ClaimedJob into the response payload.
+        when(queueManager.claim(eq("mac-mini-1"), eq("worker-1")))
+                .thenReturn(Optional.of(new ClaimedJob(10L, 20L, "diff content", "v2", null,
+                        List.of("corporate base", "corporate rules"))));
+
+        mockMvc.perform(post("/jobs/claim")
+                        .header("Authorization", "Bearer " + SecurityTestTokens.WORKER_TOKEN)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"backendId":"mac-mini-1","workerId":"worker-1"}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.payload.systemMessages[0]").value("corporate base"))
+                .andExpect(jsonPath("$.payload.systemMessages[1]").value("corporate rules"));
     }
 
     @Test

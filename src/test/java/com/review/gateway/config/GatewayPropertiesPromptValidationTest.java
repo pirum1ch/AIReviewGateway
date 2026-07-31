@@ -1,0 +1,254 @@
+package com.review.gateway.config;
+
+import org.junit.jupiter.api.Test;
+
+import java.time.Duration;
+
+import static org.assertj.core.api.Assertions.assertThatCode;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
+/**
+ * {@code gateway.prompt.*} startup validation (PMR-13/14/15/21/30), only enforced when the kill-switch
+ * is on — see {@link GatewayPropertiesValidationTest} for the pre-existing SR-01/SR-15 tokens/URL rules.
+ */
+class GatewayPropertiesPromptValidationTest {
+
+    private GatewayProperties validProperties() {
+        GatewayProperties properties = new GatewayProperties();
+        properties.getSecurity().setCiToken("a".repeat(32));
+        properties.getSecurity().setWorkerToken("b".repeat(32));
+        properties.getSecurity().setAdminToken("c".repeat(32));
+        properties.getGitlab().setToken("d".repeat(32));
+        properties.getGitlab().setBaseUrl("https://gitlab.example.com/api/v4");
+        properties.getGitlab().setPromptToken("e".repeat(32));
+        properties.getPrompt().setEnabled(true);
+        properties.getPrompt().getCorporate().setProject("platform/ai-review-prompts");
+        properties.getPrompt().getCorporate().setRef("main");
+        properties.getPrompt().getCorporate().setBasePromptPath("prompts/base-system-prompt.md");
+        properties.getPrompt().getCorporate().setReviewRulesPath("prompts/review-rules.md");
+        return properties;
+    }
+
+    @Test
+    void validPromptConfigurationPassesValidation() {
+        assertThatCode(() -> validProperties().validateOnStartup()).doesNotThrowAnyException();
+    }
+
+    @Test
+    void disabledKillSwitchSkipsAllPromptValidation() {
+        GatewayProperties properties = validProperties();
+        properties.getPrompt().setEnabled(false);
+        properties.getPrompt().getCorporate().setProject(null); // would otherwise fail
+
+        assertThatCode(properties::validateOnStartup).doesNotThrowAnyException();
+    }
+
+    // ---- PMR-14: project references only, never a URL/host ----
+
+    @Test
+    void urlShapedCorporateProjectRefusesStartup() {
+        GatewayProperties properties = validProperties();
+        properties.getPrompt().getCorporate().setProject("https://evil.example/x");
+
+        assertThatThrownBy(properties::validateOnStartup)
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("corporate.project");
+    }
+
+    @Test
+    void projectRefWithSchemeIsRejected() {
+        GatewayProperties properties = validProperties();
+        properties.getPrompt().getCorporate().setProject("http://gitlab.internal/group/project");
+
+        assertThatThrownBy(properties::validateOnStartup).isInstanceOf(IllegalStateException.class);
+    }
+
+    @Test
+    void numericProjectIdIsAccepted() {
+        GatewayProperties properties = validProperties();
+        properties.getPrompt().getCorporate().setProject("1042");
+
+        assertThatCode(properties::validateOnStartup).doesNotThrowAnyException();
+    }
+
+    @Test
+    void groupPathProjectRefIsAccepted() {
+        GatewayProperties properties = validProperties();
+        properties.getPrompt().getCorporate().setProject("org/team-a/ai-review-prompts");
+
+        assertThatCode(properties::validateOnStartup).doesNotThrowAnyException();
+    }
+
+    @Test
+    void blankCorporateProjectRefusesStartup() {
+        GatewayProperties properties = validProperties();
+        properties.getPrompt().getCorporate().setProject("");
+
+        assertThatThrownBy(properties::validateOnStartup).isInstanceOf(IllegalStateException.class);
+    }
+
+    // ---- PMR-13: ref/path shape ----
+
+    @Test
+    void refWithDotDotIsRejected() {
+        GatewayProperties properties = validProperties();
+        properties.getPrompt().getCorporate().setRef("../../etc/passwd");
+
+        assertThatThrownBy(properties::validateOnStartup).isInstanceOf(IllegalStateException.class);
+    }
+
+    @Test
+    void pathTraversalInConfiguredPathIsRejected() {
+        GatewayProperties properties = validProperties();
+        properties.getPrompt().getCorporate().setBasePromptPath("../../../etc/passwd");
+
+        assertThatThrownBy(properties::validateOnStartup).isInstanceOf(IllegalStateException.class);
+    }
+
+    @Test
+    void pathWithLeadingSlashIsRejected() {
+        GatewayProperties properties = validProperties();
+        properties.getPrompt().getCorporate().setBasePromptPath("/etc/passwd");
+
+        assertThatThrownBy(properties::validateOnStartup).isInstanceOf(IllegalStateException.class);
+    }
+
+    @Test
+    void overLongPathIsRejected() {
+        GatewayProperties properties = validProperties();
+        properties.getPrompt().getCorporate().setBasePromptPath("a".repeat(201) + ".md");
+
+        assertThatThrownBy(properties::validateOnStartup).isInstanceOf(IllegalStateException.class);
+    }
+
+    @Test
+    void blankReviewRulesPathRefusesStartup() {
+        GatewayProperties properties = validProperties();
+        properties.getPrompt().getCorporate().setReviewRulesPath(null);
+
+        assertThatThrownBy(properties::validateOnStartup).isInstanceOf(IllegalStateException.class);
+    }
+
+    // ---- PMR-15: read-only token presence ----
+
+    @Test
+    void missingPromptTokenRefusesStartup() {
+        GatewayProperties properties = validProperties();
+        properties.getGitlab().setPromptToken(null);
+
+        assertThatThrownBy(properties::validateOnStartup)
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("prompt-token");
+    }
+
+    @Test
+    void blankPromptTokenRefusesStartup() {
+        GatewayProperties properties = validProperties();
+        properties.getGitlab().setPromptToken("");
+
+        assertThatThrownBy(properties::validateOnStartup).isInstanceOf(IllegalStateException.class);
+    }
+
+    @Test
+    void promptTokenIsMaskedInToString() {
+        GatewayProperties properties = validProperties();
+
+        assertThatCode(() -> {
+            String rendered = properties.getGitlab().toString();
+            org.assertj.core.api.Assertions.assertThat(rendered).doesNotContain("e".repeat(32));
+            org.assertj.core.api.Assertions.assertThat(rendered).contains("MASKED");
+        }).doesNotThrowAnyException();
+    }
+
+    // ---- overrides ----
+
+    @Test
+    void overrideWithUrlShapedProjectRefusesStartup() {
+        GatewayProperties properties = validProperties();
+        GatewayProperties.Prompt.Project.Override override = new GatewayProperties.Prompt.Project.Override();
+        override.setProject("https://evil.example/x");
+        properties.getPrompt().getProject().getOverrides().put("1042", override);
+
+        assertThatThrownBy(properties::validateOnStartup)
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("overrides[1042]");
+    }
+
+    @Test
+    void overrideWithValidProjectAndNullRefPassesValidation() {
+        GatewayProperties properties = validProperties();
+        GatewayProperties.Prompt.Project.Override override = new GatewayProperties.Prompt.Project.Override();
+        override.setProject("org/team-a/ai-review-prompts");
+        properties.getPrompt().getProject().getOverrides().put("1042", override);
+
+        assertThatCode(properties::validateOnStartup).doesNotThrowAnyException();
+    }
+
+    @Test
+    void tooManyOverridesRefusesStartup() {
+        GatewayProperties properties = validProperties();
+        for (int i = 0; i < 501; i++) {
+            GatewayProperties.Prompt.Project.Override override = new GatewayProperties.Prompt.Project.Override();
+            override.setProject("org/team-a/repo" + i);
+            properties.getPrompt().getProject().getOverrides().put(String.valueOf(i), override);
+        }
+
+        assertThatThrownBy(properties::validateOnStartup).isInstanceOf(IllegalStateException.class);
+    }
+
+    // ---- PMR-21: budget consistency ----
+
+    @Test
+    void inconsistentBudgetRefusesStartup() {
+        GatewayProperties properties = validProperties();
+        properties.getPrompt().getLimits().setMaxSystemPromptTokens(20000); // larger than the context window itself
+
+        assertThatThrownBy(properties::validateOnStartup).isInstanceOf(IllegalStateException.class);
+    }
+
+    @Test
+    void consistentBudgetPassesValidation() {
+        GatewayProperties properties = validProperties();
+        properties.getPrompt().getLimits().setMaxSystemPromptTokens(6000);
+
+        assertThatCode(properties::validateOnStartup).doesNotThrowAnyException();
+    }
+
+    // ---- error-handling / message-format enum-shaped strings ----
+
+    @Test
+    void invalidOnErrorValueRefusesStartup() {
+        GatewayProperties properties = validProperties();
+        properties.getPrompt().getErrorHandling().setOnError("IGNORE");
+
+        assertThatThrownBy(properties::validateOnStartup).isInstanceOf(IllegalStateException.class);
+    }
+
+    @Test
+    void invalidMessageFormatValueRefusesStartup() {
+        GatewayProperties properties = validProperties();
+        properties.getPrompt().setMessageFormat("BOGUS");
+
+        assertThatThrownBy(properties::validateOnStartup).isInstanceOf(IllegalStateException.class);
+    }
+
+    // ---- timeouts ----
+
+    @Test
+    void totalTimeoutBelowTwiceReadTimeoutRefusesStartup() {
+        GatewayProperties properties = validProperties();
+        properties.getPrompt().setReadTimeout(Duration.ofSeconds(8));
+        properties.getPrompt().setTotalTimeout(Duration.ofSeconds(10));
+
+        assertThatThrownBy(properties::validateOnStartup).isInstanceOf(IllegalStateException.class);
+    }
+
+    @Test
+    void totalTimeoutAtLeastTwiceReadTimeoutPassesValidation() {
+        GatewayProperties properties = validProperties();
+        properties.getPrompt().setReadTimeout(Duration.ofSeconds(8));
+        properties.getPrompt().setTotalTimeout(Duration.ofSeconds(20));
+
+        assertThatCode(properties::validateOnStartup).doesNotThrowAnyException();
+    }
+}

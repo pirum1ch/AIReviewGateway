@@ -9,11 +9,13 @@ import com.review.gateway.repository.ReviewCommentRepository;
 import com.review.gateway.repository.ReviewEventRepository;
 import com.review.gateway.repository.ReviewInputRepository;
 import com.review.gateway.repository.ReviewJobRepository;
+import com.review.gateway.repository.ReviewPromptSectionRepository;
 import com.review.gateway.repository.ReviewRepository;
 import com.review.gateway.service.dto.CreateReviewCommand;
 import jakarta.persistence.EntityManager;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.mockito.Mockito;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.annotation.Propagation;
@@ -62,6 +64,8 @@ class SweepObsoleteStaleReadTest extends AbstractPostgresIntegrationTest {
     @Autowired
     private ReviewEventRepository reviewEventRepository;
     @Autowired
+    private ReviewPromptSectionRepository reviewPromptSectionRepository;
+    @Autowired
     private EntityManager entityManager;
     @Autowired
     private PlatformTransactionManager transactionManager;
@@ -73,6 +77,7 @@ class SweepObsoleteStaleReadTest extends AbstractPostgresIntegrationTest {
 
     private ReviewService newReviewService() {
         GatewayProperties properties = new GatewayProperties();
+        properties.getPrompt().setEnabled(false);
         EventService eventService = new EventService(reviewEventRepository);
         StateMachine stateMachine = new StateMachine(eventService);
         JobStateMachine jobStateMachine = new JobStateMachine(eventService);
@@ -80,9 +85,13 @@ class SweepObsoleteStaleReadTest extends AbstractPostgresIntegrationTest {
         DiffSizeValidator diffSizeValidator = new DiffSizeValidator(properties);
         ChunkContextRenderer chunkContextRenderer = new ChunkContextRenderer(properties, new TextSanitizer());
         DiffChunker diffChunker = new DiffChunker(properties, diffSizeValidator, chunkContextRenderer);
+        PromptManager promptManager = new PromptManager(properties, Mockito.mock(GitLabClient.class),
+                new PromptSourceResolver(properties), new PromptAssembler(properties, diffSizeValidator),
+                new TextSanitizer());
         return new ReviewService(reviewRepository, reviewInputRepository, reviewChunkRepository,
-                reviewJobRepository, reviewCommentRepository, deduplicationService, diffSizeValidator,
-                diffChunker, chunkContextRenderer, stateMachine, jobStateMachine, entityManager, transactionManager);
+                reviewJobRepository, reviewCommentRepository, reviewPromptSectionRepository, deduplicationService,
+                diffSizeValidator, diffChunker, chunkContextRenderer, promptManager, eventService, stateMachine,
+                jobStateMachine, entityManager, transactionManager);
     }
 
     @Test

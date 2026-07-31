@@ -50,3 +50,14 @@ ALTER TABLE backends
 -- see DEPLOYMENT.md's GRANT block, extends the same append-only contract already applied to
 -- review_events (SR-19). Not expressed here because V1/V2 never GRANT from inside Flyway either
 -- (the migration runs as the schema-owning role, not the constrained app role).
+
+-- ============================================================
+-- review_events : extend the audit-trail vocabulary (PMR-09/PMR-10/PMR-11). Deliberately additive
+-- (the constraint is dropped and recreated with a strict superset of the V1 value list) -- no existing
+-- row's event_type can ever fail the new constraint.
+-- ============================================================
+ALTER TABLE review_events DROP CONSTRAINT ck_event_type;
+ALTER TABLE review_events ADD CONSTRAINT ck_event_type CHECK (event_type IN
+    ('CREATED','CLAIMED','RUNNING','HEARTBEAT','RETRY',
+     'COMPLETED','PUBLISHED','FAILED','OBSOLETE','CANCELLED',
+     'PROMPT_DISABLED','PROMPT_SECTION_MISSING','PROMPT_SECTIONS_MISSING'));

@@ -10,6 +10,7 @@ import com.review.gateway.repository.ReviewChunkRepository;
 import com.review.gateway.repository.ReviewCommentRepository;
 import com.review.gateway.repository.ReviewInputRepository;
 import com.review.gateway.repository.ReviewJobRepository;
+import com.review.gateway.repository.ReviewPromptSectionRepository;
 import com.review.gateway.repository.ReviewRepository;
 import com.review.gateway.service.dto.CreateReviewCommand;
 import com.review.gateway.service.dto.CreateReviewResult;
@@ -30,6 +31,7 @@ import java.util.Optional;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doThrow;
@@ -45,10 +47,13 @@ class ReviewServiceTest {
     private ReviewChunkRepository reviewChunkRepository;
     private ReviewJobRepository reviewJobRepository;
     private ReviewCommentRepository reviewCommentRepository;
+    private ReviewPromptSectionRepository reviewPromptSectionRepository;
     private DeduplicationService deduplicationService;
     private DiffSizeValidator diffSizeValidator;
     private DiffChunker diffChunker;
     private ChunkContextRenderer chunkContextRenderer;
+    private PromptManager promptManager;
+    private EventService eventService;
     private StateMachine stateMachine;
     private JobStateMachine jobStateMachine;
     private EntityManager entityManager;
@@ -62,10 +67,13 @@ class ReviewServiceTest {
         reviewChunkRepository = Mockito.mock(ReviewChunkRepository.class);
         reviewJobRepository = Mockito.mock(ReviewJobRepository.class);
         reviewCommentRepository = Mockito.mock(ReviewCommentRepository.class);
+        reviewPromptSectionRepository = Mockito.mock(ReviewPromptSectionRepository.class);
         deduplicationService = Mockito.mock(DeduplicationService.class);
         diffSizeValidator = Mockito.mock(DiffSizeValidator.class);
         diffChunker = Mockito.mock(DiffChunker.class);
         chunkContextRenderer = Mockito.mock(ChunkContextRenderer.class);
+        promptManager = Mockito.mock(PromptManager.class);
+        eventService = Mockito.mock(EventService.class);
         stateMachine = Mockito.mock(StateMachine.class);
         jobStateMachine = Mockito.mock(JobStateMachine.class);
         transactionManager = Mockito.mock(PlatformTransactionManager.class);
@@ -73,8 +81,10 @@ class ReviewServiceTest {
         Query lockTimeoutQuery = Mockito.mock(Query.class);
         when(entityManager.createNativeQuery(anyString())).thenReturn(lockTimeoutQuery);
 
+        // Kill-switch off by default -- most tests don't care about Prompt Manager specifics.
+        when(promptManager.resolve(any())).thenReturn(PromptManager.PromptResolution.none());
         // Single-chunk plan by default -- most tests don't care about chunking specifics.
-        when(diffChunker.split(anyString())).thenAnswer(inv -> new DiffChunker.ChunkPlan(
+        when(diffChunker.split(anyString(), anyInt())).thenAnswer(inv -> new DiffChunker.ChunkPlan(
                 List.of(new DiffChunker.DiffChunk(0, inv.getArgument(0), 10, List.of())), 10));
         when(reviewJobRepository.findNonTerminalJobs(any())).thenReturn(List.of());
         when(reviewChunkRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
@@ -87,8 +97,9 @@ class ReviewServiceTest {
         when(transactionManager.getTransaction(any(TransactionDefinition.class))).thenReturn(fakeStatus);
 
         reviewService = new ReviewService(reviewRepository, reviewInputRepository, reviewChunkRepository,
-                reviewJobRepository, reviewCommentRepository, deduplicationService, diffSizeValidator,
-                diffChunker, chunkContextRenderer, stateMachine, jobStateMachine, entityManager, transactionManager);
+                reviewJobRepository, reviewCommentRepository, reviewPromptSectionRepository, deduplicationService,
+                diffSizeValidator, diffChunker, chunkContextRenderer, promptManager, eventService, stateMachine,
+                jobStateMachine, entityManager, transactionManager);
     }
 
     private CreateReviewCommand command(String headSha) {

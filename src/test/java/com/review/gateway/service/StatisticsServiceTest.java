@@ -60,6 +60,8 @@ class StatisticsServiceTest {
         when(reviewJobRepository.averageRunDurationMillis()).thenReturn(67890.0);
         when(reviewCommentRepository.count()).thenReturn(42L);
         when(reviewEventRepository.countByEventTypeAndJobIdIsNotNull(EventType.RETRY)).thenReturn(7L);
+        when(reviewEventRepository.countByEventType(EventType.PROMPT_DISABLED)).thenReturn(4L);
+        when(reviewEventRepository.countByEventType(EventType.PROMPT_SECTION_MISSING)).thenReturn(2L);
 
         StatisticsService service = newService(
                 reviewRepository, reviewJobRepository, reviewCommentRepository, reviewEventRepository, backendRepository);
@@ -74,6 +76,8 @@ class StatisticsServiceTest {
         assertThat(snapshot.avgRunMs()).isEqualTo(67890.0);
         assertThat(snapshot.totalComments()).isEqualTo(42L);
         assertThat(snapshot.retries()).isEqualTo(7L);
+        assertThat(snapshot.promptDisabledCount()).isEqualTo(4L);
+        assertThat(snapshot.promptSectionMissingCount()).isEqualTo(2L);
     }
 
     @Test

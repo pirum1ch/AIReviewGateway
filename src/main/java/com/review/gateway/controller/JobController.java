@@ -90,6 +90,6 @@ public class JobController {
 
     private ClaimJobResponse toResponse(ClaimedJob job) {
         return new ClaimJobResponse(job.jobId(), job.reviewId(),
-                new JobPayload(job.diff(), job.promptVersion(), job.chunkContext()));
+                new JobPayload(job.diff(), job.promptVersion(), job.chunkContext(), job.systemMessages()));
     }
 }

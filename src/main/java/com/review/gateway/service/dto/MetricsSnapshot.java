@@ -13,5 +13,7 @@ public record MetricsSnapshot(
         double avgQueueMs,
         double avgRunMs,
         long totalComments,
-        long retries) {
+        long retries,
+        long promptDisabledCount,
+        long promptSectionMissingCount) {
 }

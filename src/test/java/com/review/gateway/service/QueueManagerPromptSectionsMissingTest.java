@@ -8,6 +8,9 @@ import com.review.gateway.model.ReviewChunk;
 import com.review.gateway.model.ReviewInput;
 import com.review.gateway.model.ReviewJob;
 import com.review.gateway.model.enums.BackendStatus;
+import com.review.gateway.model.enums.EventType;
+import com.review.gateway.model.enums.JobStatus;
+import com.review.gateway.model.enums.PromptBundleMode;
 import com.review.gateway.model.enums.ReviewStatus;
 import com.review.gateway.repository.BackendRepository;
 import com.review.gateway.repository.ReviewChunkRepository;
@@ -26,22 +29,19 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
-import org.springframework.transaction.support.TransactionTemplate;
 
-import java.time.Instant;
-import java.time.temporal.ChronoUnit;
+import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * Fills a coverage gap in {@link QueueManagerIntegrationTest}: that suite proves claim's capacity/
- * status/payload behavior but never exercises the ordering guarantee itself (architecture §5 step 2:
- * {@code ORDER BY priority DESC, created_at ASC}, now on {@code review_jobs} as of V2 diff chunking).
- *
- * <p>{@code @Transactional(NOT_SUPPORTED)}: see {@code QueueManagerIntegrationTest}'s javadoc for why.
+ * PMR-09 (MUST): {@code prompt_bundle_mode=REPO} but zero {@code CORPORATE_*} sections at claim time
+ * must fail the job explicitly — never dispatch it with an empty/partial system prompt. Also proves the
+ * companion PMR-09 case (a {@code NONE}-mode Review still claims and runs normally) end to end against a
+ * real (Zonky) PostgreSQL instance, matching {@code QueueManagerIntegrationTest}'s fixture conventions.
  */
 @Transactional(propagation = Propagation.NOT_SUPPORTED)
-class QueueManagerPriorityOrderingIntegrationTest extends AbstractPostgresIntegrationTest {
+class QueueManagerPromptSectionsMissingTest extends AbstractPostgresIntegrationTest {
 
     @Autowired
     private ReviewRepository reviewRepository;
@@ -87,74 +87,78 @@ class QueueManagerPriorityOrderingIntegrationTest extends AbstractPostgresIntegr
                 transactionManager);
     }
 
-    private Review persistQueuedReview(long mrId, String headSha, int priority, Instant createdAt) {
-        Review review = new Review(1L, mrId, headSha, "base", "v1", priority);
+    private Review persistQueuedReview(long mrId, String headSha, PromptBundleMode mode) {
+        Review review = new Review(1L, mrId, headSha, "base", "v1", 10, mode);
         review.setStatus(ReviewStatus.QUEUED);
         review = reviewRepository.saveAndFlush(review);
         reviewInputRepository.saveAndFlush(new ReviewInput(review.getId(), "diff-" + headSha, "v1", headSha, "base", 10));
         ReviewChunk chunk = reviewChunkRepository.saveAndFlush(
                 new ReviewChunk(review.getId(), 0, 1, "diff-" + headSha, 10, 0, "[]"));
-        ReviewJob job = reviewJobRepository.saveAndFlush(new ReviewJob(review.getId(), chunk.getId(), 0, priority, null, null));
-
-        // created_at is DB-defaulted (now()) at insert time; force the intended ordering with a direct
-        // update (in its own genuine transaction, since NOT_SUPPORTED disables the ambient one) so the
-        // test can express "arrived earlier" deterministically regardless of wall-clock granularity. As
-        // of V2 the claim query orders review_jobs.created_at, not reviews.created_at.
-        new TransactionTemplate(transactionManager).executeWithoutResult(status ->
-                entityManager.createNativeQuery("UPDATE review_jobs SET created_at = ?1 WHERE id = ?2")
-                        .setParameter(1, createdAt)
-                        .setParameter(2, job.getId())
-                        .executeUpdate());
+        reviewJobRepository.saveAndFlush(new ReviewJob(review.getId(), chunk.getId(), 0, 10, null, null));
         return review;
     }
 
-    private void persistBackend(String name, int capacity) {
-        Backend backend = new Backend(name, "https://" + name + ".local", "model-x", capacity);
+    private Backend persistBackend(String name) {
+        Backend backend = new Backend(name, "https://" + name + ".local", "model-x", 2);
         backend.setStatus(BackendStatus.ACTIVE);
-        backendRepository.saveAndFlush(backend);
+        return backendRepository.saveAndFlush(backend);
     }
 
     @Test
-    void claimPicksTheHighestPriorityReviewRegardlessOfInsertionOrder() {
-        persistBackend("prio-backend-a", 1);
-        Instant now = Instant.now();
-        persistQueuedReview(200L, "sha-low-prio", 5, now);
-        Review highPriority = persistQueuedReview(201L, "sha-high-prio", 50, now);
-        persistQueuedReview(202L, "sha-mid-prio", 10, now);
+    void repoModeWithNoPersistedSectionsFailsTheJobInsteadOfDispatchingIt() {
+        persistBackend("mac-mini-missing-sections");
+        Review review = persistQueuedReview(900L, "sha-missing", PromptBundleMode.REPO);
+        // Deliberately no review_prompt_sections rows persisted for this Review (simulating a retention
+        // purge / kill-switch flip / partial transaction between create and claim).
 
         QueueManager queueManager = newQueueManager();
-        ClaimedJob claimed = queueManager.claim("prio-backend-a", "worker-1").orElseThrow();
+        Optional<ClaimedJob> claimed = queueManager.claim("mac-mini-missing-sections", "worker-1");
 
-        assertThat(claimed.reviewId()).isEqualTo(highPriority.getId());
+        assertThat(claimed).isEmpty();
+
+        ReviewJob job = reviewJobRepository.findByReviewIdAndChunkIndex(review.getId(), 0).orElseThrow();
+        assertThat(job.getStatus()).isEqualTo(JobStatus.FAILED);
+        assertThat(job.getAttempts()).isEqualTo(1); // the attempt WAS counted -- not silently requeued forever
+
+        boolean hasMissingSectionsEvent = reviewEventRepository.findByReviewIdOrderByCreatedAtAsc(review.getId())
+                .stream().anyMatch(e -> e.getEventType() == EventType.PROMPT_SECTIONS_MISSING);
+        assertThat(hasMissingSectionsEvent).isTrue();
+
+        // The parent Review's derived status must not go stale after a claim-time-only failure (recompute
+        // still runs -- see QueueManager.claim's ClaimAttempt.reviewIdTouched()).
+        Review reloaded = reviewRepository.findById(review.getId()).orElseThrow();
+        assertThat(reloaded.getStatus()).isEqualTo(ReviewStatus.FAILED);
     }
 
     @Test
-    void withEqualPriorityClaimPicksTheOldestCreatedAtFirst() {
-        persistBackend("prio-backend-b", 1);
-        Instant older = Instant.now().minus(1, ChronoUnit.HOURS);
-        Instant newer = Instant.now();
-        persistQueuedReview(210L, "sha-newer", 10, newer);
-        Review olderReview = persistQueuedReview(211L, "sha-older", 10, older);
+    void noneModeStillClaimsAndRunsNormallyWithNullSystemMessages() {
+        persistBackend("mac-mini-none-mode");
+        persistQueuedReview(901L, "sha-none", PromptBundleMode.NONE);
 
         QueueManager queueManager = newQueueManager();
-        ClaimedJob claimed = queueManager.claim("prio-backend-b", "worker-1").orElseThrow();
+        Optional<ClaimedJob> claimed = queueManager.claim("mac-mini-none-mode", "worker-1");
 
-        assertThat(claimed.reviewId()).isEqualTo(olderReview.getId());
+        assertThat(claimed).isPresent();
+        assertThat(claimed.get().systemMessages()).isNull();
     }
 
     @Test
-    void secondClaimAfterFirstGetsTheNextHighestPriorityRemainingReview() {
-        persistBackend("prio-backend-c", 2);
-        Instant now = Instant.now();
-        Review high = persistQueuedReview(220L, "sha-c-high", 30, now);
-        Review mid = persistQueuedReview(221L, "sha-c-mid", 20, now);
-        persistQueuedReview(222L, "sha-c-low", 10, now);
+    void repoModeWithPersistedCorporateSectionsClaimsSuccessfullyWithSystemMessages() {
+        persistBackend("mac-mini-repo-ok");
+        Review review = persistQueuedReview(902L, "sha-repo-ok", PromptBundleMode.REPO);
+        reviewPromptSectionRepository.saveAndFlush(new com.review.gateway.model.ReviewPromptSection(
+                review.getId(), 0, com.review.gateway.model.enums.PromptSectionKind.CORPORATE_BASE,
+                com.review.gateway.model.enums.PromptSectionStatus.PRESENT, "corporate base content",
+                "platform/prompts", "base.md", "main", "sha1", "hash1", 5));
+        reviewPromptSectionRepository.saveAndFlush(new com.review.gateway.model.ReviewPromptSection(
+                review.getId(), 1, com.review.gateway.model.enums.PromptSectionKind.CORPORATE_REVIEW_RULES,
+                com.review.gateway.model.enums.PromptSectionStatus.PRESENT, "corporate rules content",
+                "platform/prompts", "rules.md", "main", "sha1", "hash2", 5));
 
         QueueManager queueManager = newQueueManager();
-        ClaimedJob first = queueManager.claim("prio-backend-c", "worker-1").orElseThrow();
-        ClaimedJob second = queueManager.claim("prio-backend-c", "worker-2").orElseThrow();
+        Optional<ClaimedJob> claimed = queueManager.claim("mac-mini-repo-ok", "worker-1");
 
-        assertThat(first.reviewId()).isEqualTo(high.getId());
-        assertThat(second.reviewId()).isEqualTo(mid.getId());
+        assertThat(claimed).isPresent();
+        assertThat(claimed.get().systemMessages()).containsExactly("corporate base content", "corporate rules content");
     }
 }

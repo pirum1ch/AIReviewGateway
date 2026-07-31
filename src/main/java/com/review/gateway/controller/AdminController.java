@@ -1,5 +1,6 @@
 package com.review.gateway.controller;
 
+import com.review.gateway.config.GatewayProperties;
 import com.review.gateway.dto.BackendView;
 import com.review.gateway.dto.MetricsResponse;
 import com.review.gateway.service.StatisticsService;
@@ -19,9 +20,11 @@ import java.util.Map;
 public class AdminController {
 
     private final StatisticsService statisticsService;
+    private final GatewayProperties properties;
 
-    public AdminController(StatisticsService statisticsService) {
+    public AdminController(StatisticsService statisticsService, GatewayProperties properties) {
         this.statisticsService = statisticsService;
+        this.properties = properties;
     }
 
     @GetMapping("/backends")
@@ -34,8 +37,11 @@ public class AdminController {
         MetricsSnapshot snapshot = statisticsService.computeMetrics();
         Map<String, Long> byStatus = new LinkedHashMap<>();
         snapshot.byStatus().forEach((status, count) -> byStatus.put(status.name(), count));
+        // PMR-10: gateway.prompt.enabled is exposed here directly from config (not derived from the
+        // DB) so an operator can see at a glance whether the kill-switch is currently on.
         return new MetricsResponse(snapshot.total(), byStatus, snapshot.avgQueueMs(),
-                snapshot.avgRunMs(), snapshot.totalComments(), snapshot.retries());
+                snapshot.avgRunMs(), snapshot.totalComments(), snapshot.retries(),
+                properties.getPrompt().isEnabled(), snapshot.promptDisabledCount(), snapshot.promptSectionMissingCount());
     }
 
     private BackendView toView(BackendSnapshot snapshot) {

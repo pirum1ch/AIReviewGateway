@@ -16,6 +16,7 @@ import com.review.gateway.repository.ReviewCommentRepository;
 import com.review.gateway.repository.ReviewEventRepository;
 import com.review.gateway.repository.ReviewInputRepository;
 import com.review.gateway.repository.ReviewJobRepository;
+import com.review.gateway.repository.ReviewPromptSectionRepository;
 import com.review.gateway.repository.ReviewRepository;
 import com.review.gateway.service.dto.ClaimedJob;
 import com.review.gateway.service.dto.HeartbeatOutcome;
@@ -73,6 +74,8 @@ class QueueManagerIntegrationTest extends AbstractPostgresIntegrationTest {
     @Autowired
     private ReviewEventRepository reviewEventRepository;
     @Autowired
+    private ReviewPromptSectionRepository reviewPromptSectionRepository;
+    @Autowired
     private EntityManager entityManager;
     @Autowired
     private PlatformTransactionManager transactionManager;
@@ -92,9 +95,10 @@ class QueueManagerIntegrationTest extends AbstractPostgresIntegrationTest {
         ChunkCoordinator chunkCoordinator = new ChunkCoordinator(reviewRepository, reviewJobRepository,
                 reviewChunkRepository, reviewCommentRepository, stateMachine, jobStateMachine, properties, entityManager, transactionManager);
         ChunkContextRenderer chunkContextRenderer = new ChunkContextRenderer(properties, new TextSanitizer());
-        return new QueueManager(reviewRepository, reviewJobRepository, reviewChunkRepository, backendDispatcher,
-                jobStateMachine, chunkCoordinator, eventService, resultProcessor, chunkContextRenderer,
-                entityManager, transactionManager);
+        PromptMessageFormatter promptMessageFormatter = new PromptMessageFormatter(properties);
+        return new QueueManager(reviewRepository, reviewJobRepository, reviewChunkRepository,
+                reviewPromptSectionRepository, backendDispatcher, jobStateMachine, chunkCoordinator, eventService,
+                resultProcessor, chunkContextRenderer, promptMessageFormatter, entityManager, transactionManager);
     }
 
     private Review persistQueuedReview(long projectId, long mrId, String headSha, int priority) {

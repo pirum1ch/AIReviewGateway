@@ -3,6 +3,8 @@ package com.review.gateway.dto;
 import com.review.gateway.service.dto.ClaimedJob;
 import org.junit.jupiter.api.Test;
 
+import java.util.List;
+
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
@@ -11,15 +13,20 @@ import static org.assertj.core.api.Assertions.assertThat;
  * new {@code chunkContext} field must never appear in a {@code toString()} rendering, only their
  * lengths, guarding against an accidental {@code log.debug("{}", payload)} dumping proprietary diff
  * content or MR-author-controlled file-path text into logs.
+ *
+ * <p>Prompt Manager (V3, PMR-25): the new {@code systemMessages} field must be masked identically —
+ * counts + total chars only, never section content.
  */
 class SensitiveDtoToStringMaskingTest {
 
     private static final String SECRET_DIFF = "diff --git a/Secret.java\n+String apiKey = \"THE-SECRET-DIFF-CONTENT\";";
     private static final String SECRET_CHUNK_CONTEXT = "part 2 of 6\nSECRET-FILE-PATH-CONTENT.java";
+    private static final String SECRET_SYSTEM_MESSAGE_1 = "SECRET-CORPORATE-RULEBOOK-CONTENT";
+    private static final String SECRET_SYSTEM_MESSAGE_2 = "SECRET-PROJECT-ARCHITECTURE-CONTENT";
 
     @Test
     void jobPayloadToStringNeverContainsTheRawDiffOrChunkContext() {
-        JobPayload payload = new JobPayload(SECRET_DIFF, "v2", SECRET_CHUNK_CONTEXT);
+        JobPayload payload = new JobPayload(SECRET_DIFF, "v2", SECRET_CHUNK_CONTEXT, null);
 
         String rendered = payload.toString();
 
@@ -35,7 +42,7 @@ class SensitiveDtoToStringMaskingTest {
 
     @Test
     void jobPayloadAccessorsStillReturnFullContentUnmasked() {
-        JobPayload payload = new JobPayload(SECRET_DIFF, "v2", SECRET_CHUNK_CONTEXT);
+        JobPayload payload = new JobPayload(SECRET_DIFF, "v2", SECRET_CHUNK_CONTEXT, null);
 
         assertThat(payload.diff()).isEqualTo(SECRET_DIFF);
         assertThat(payload.chunkContext()).isEqualTo(SECRET_CHUNK_CONTEXT);
@@ -43,14 +50,45 @@ class SensitiveDtoToStringMaskingTest {
 
     @Test
     void jobPayloadToStringHandlesNullChunkContextGracefully() {
-        JobPayload payload = new JobPayload(SECRET_DIFF, "v1", null);
+        JobPayload payload = new JobPayload(SECRET_DIFF, "v1", null, null);
 
         assertThat(payload.toString()).contains("chunkContext=<masked, 0 chars>");
     }
 
     @Test
+    void jobPayloadToStringNeverContainsRawSystemMessages() {
+        JobPayload payload = new JobPayload(SECRET_DIFF, "v2", null,
+                List.of(SECRET_SYSTEM_MESSAGE_1, SECRET_SYSTEM_MESSAGE_2));
+
+        String rendered = payload.toString();
+
+        assertThat(rendered).doesNotContain(SECRET_SYSTEM_MESSAGE_1);
+        assertThat(rendered).doesNotContain(SECRET_SYSTEM_MESSAGE_2);
+        assertThat(rendered).contains("systemMessages=<masked, 2 msg, "
+                + (SECRET_SYSTEM_MESSAGE_1.length() + SECRET_SYSTEM_MESSAGE_2.length()) + " chars>");
+    }
+
+    @Test
+    void jobPayloadToStringDistinguishesNullFromEmptySystemMessages() {
+        // PMR-24: null (legacy/kill-switch-off) vs empty list must render distinguishably.
+        JobPayload nullMessages = new JobPayload(SECRET_DIFF, "v1", null, null);
+        JobPayload emptyMessages = new JobPayload(SECRET_DIFF, "v1", null, List.of());
+
+        assertThat(nullMessages.toString()).contains("systemMessages=null");
+        assertThat(emptyMessages.toString()).contains("systemMessages=<masked, 0 msg, 0 chars>");
+    }
+
+    @Test
+    void jobPayloadAccessorStillReturnsSystemMessagesUnmasked() {
+        List<String> messages = List.of(SECRET_SYSTEM_MESSAGE_1, SECRET_SYSTEM_MESSAGE_2);
+        JobPayload payload = new JobPayload(SECRET_DIFF, "v2", null, messages);
+
+        assertThat(payload.systemMessages()).isEqualTo(messages);
+    }
+
+    @Test
     void claimedJobToStringNeverContainsTheRawDiffOrChunkContext() {
-        ClaimedJob claimedJob = new ClaimedJob(10L, 20L, SECRET_DIFF, "v2", SECRET_CHUNK_CONTEXT);
+        ClaimedJob claimedJob = new ClaimedJob(10L, 20L, SECRET_DIFF, "v2", SECRET_CHUNK_CONTEXT, null);
 
         String rendered = claimedJob.toString();
 
@@ -63,9 +101,21 @@ class SensitiveDtoToStringMaskingTest {
 
     @Test
     void claimedJobAccessorsStillReturnFullContentUnmasked() {
-        ClaimedJob claimedJob = new ClaimedJob(10L, 20L, SECRET_DIFF, "v2", SECRET_CHUNK_CONTEXT);
+        ClaimedJob claimedJob = new ClaimedJob(10L, 20L, SECRET_DIFF, "v2", SECRET_CHUNK_CONTEXT, null);
 
         assertThat(claimedJob.diff()).isEqualTo(SECRET_DIFF);
         assertThat(claimedJob.chunkContext()).isEqualTo(SECRET_CHUNK_CONTEXT);
+    }
+
+    @Test
+    void claimedJobToStringNeverContainsRawSystemMessages() {
+        ClaimedJob claimedJob = new ClaimedJob(10L, 20L, SECRET_DIFF, "v2", null,
+                List.of(SECRET_SYSTEM_MESSAGE_1, SECRET_SYSTEM_MESSAGE_2));
+
+        String rendered = claimedJob.toString();
+
+        assertThat(rendered).doesNotContain(SECRET_SYSTEM_MESSAGE_1);
+        assertThat(rendered).doesNotContain(SECRET_SYSTEM_MESSAGE_2);
+        assertThat(rendered).contains("masked, 2 msg");
     }
 }

@@ -34,3 +34,9 @@ gateway:
     token: test-gitlab-token-0123456789012345678901
   backend:
     allowed-host-pattern: ".*"
+  prompt:
+    # Kill-switch off for the shared full-Spring-context test suite (SR-01/PMR-10 premise: identical
+    # to today's behavior, zero GitLab calls) -- Prompt-Manager-specific tests set this back to true
+    # with their own valid corporate.project/gitlab.prompt-token via @DynamicPropertySource/direct
+    # construction instead of relying on this shared context.
+    enabled: false

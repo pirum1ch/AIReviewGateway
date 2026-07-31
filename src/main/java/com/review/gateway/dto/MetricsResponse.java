@@ -9,5 +9,8 @@ public record MetricsResponse(
         double avgQueueMs,
         double avgRunMs,
         long totalComments,
-        long retries) {
+        long retries,
+        boolean promptManagerEnabled,
+        long promptDisabledCount,
+        long promptSectionMissingCount) {
 }
