@@ -719,6 +719,16 @@ public class GatewayProperties {
         private final Limits limits = new Limits();
         private Duration connectTimeout = Duration.ofSeconds(3);
         private Duration readTimeout = Duration.ofSeconds(8);
+        /**
+         * Wall-clock deadline for the whole resolve block (PMR-19), checked via {@code
+         * PromptManager.checkDeadline} before each of the up to 6 outbound GitLab calls one resolve can
+         * make. <b>F-PM-09:</b> this is a between-calls check, not an in-flight interrupt — a call that
+         * begins just under the deadline can still run to its own {@link #readTimeout}, so the real
+         * worst-case wall-clock bound for one resolve is {@code totalTimeout + readTimeout}, not {@code
+         * totalTimeout} alone. The startup rule {@code totalTimeout >= 2 * readTimeout} already assumes
+         * an operator reasons about the two together; this javadoc makes that assumption explicit rather
+         * than only implicit in the validation arithmetic.
+         */
         private Duration totalTimeout = Duration.ofSeconds(20);
 
         public boolean isEnabled() {

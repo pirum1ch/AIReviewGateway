@@ -225,6 +225,23 @@ public class PromptManager {
         return properties.getPrompt().getLimits().getMaxFileBytes();
     }
 
+    /**
+     * ponytail: F-PM-09 (Info) -- a deadline breach here throws the same {@link
+     * PromptSourceUnavailableException} as an ordinary GitLab failure, so it is caught by the same
+     * {@code on-error=SKIP_OPTIONAL} branch in {@link #doResolve} and reported as an ordinary
+     * degradation rather than as the deadline breach it actually is (both in the WARN log and in
+     * {@code prompt_degraded}). Giving the deadline its own exception type/flag so {@code
+     * SKIP_OPTIONAL} does not absorb it — i.e. a slow/hung GitLab always surfaces distinctly even when
+     * an operator has opted into graceful degradation for source-availability failures — is a
+     * deliberate policy call, not a mechanical fix: it would make SKIP_OPTIONAL's resilience guarantee
+     * narrower (a deadline breach would hard-fail POST /reviews even under SKIP_OPTIONAL), which is a
+     * real behavior change for production traffic during a slow GitLab period, not just a defect fix.
+     * Not implemented in this round for that reason. Re-evaluate if the two causes (deadline vs.
+     * ordinary unavailability) ever need to be told apart operationally — e.g. an alert wants to fire
+     * only on the former, or an operator reports "SKIP_OPTIONAL degraded silently, but it should have
+     * been an alarm" — at which point a distinct subclass is the mechanical part of the fix and this
+     * comment is the design note for the actual policy decision.
+     */
     private void checkDeadline(Instant deadline) {
         if (Instant.now().isAfter(deadline)) {
             throw new PromptSourceUnavailableException(

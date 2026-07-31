@@ -79,6 +79,18 @@ public class StatisticsService {
         // counters, PostgreSQL is the single source of truth" pattern as every other metric here --
         // how many Reviews were created with the kill-switch off, and how many explicitly-configured
         // override paths were looked up and not found, org-wide.
+        //
+        // ponytail: F-PM-11(b) (Info) -- PMR-11 originally asked for a labeled metric
+        // (prompt_section_absent_total{kind, configured}) so an operator could tell *which* override is
+        // broken from /metrics alone, without cross-referencing review_events. These two flat counters
+        // are correct in substance but have no dimensions. Not implemented as labeled here because this
+        // project deliberately has no Prometheus/labeled-metrics library (requirements §15) -- a
+        // label-less GET /metrics is a legitimate reading of the same requirement, and the missing
+        // dimension is already recoverable per-incident from the review_events row itself (its `details`
+        // column carries `kind=...`). Revisit (either add a per-kind breakdown here, e.g. a
+        // Map<PromptSectionKind, Long>, or formally amend PMR-11 in the threat model to match this
+        // label-less reading) if an operator ever actually needs the per-kind breakdown from /metrics
+        // without querying review_events directly.
         long promptDisabledCount = reviewEventRepository.countByEventType(EventType.PROMPT_DISABLED);
         long promptSectionMissingCount = reviewEventRepository.countByEventType(EventType.PROMPT_SECTION_MISSING);
 

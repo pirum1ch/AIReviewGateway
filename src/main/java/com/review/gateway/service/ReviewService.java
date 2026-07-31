@@ -357,6 +357,18 @@ public class ReviewService {
      * Prompt Manager (V3): persists the resolved sections, immutable/append-only, in the same
      * transaction as the Review itself — ordinal is the assembly order {@code PromptResolution.sections()}
      * already carries.
+     *
+     * <p>ponytail: F-PM-11(a) (Info) -- no single assembled-output hash is recorded for the Review as a
+     * whole; each row's own {@code content_sha256} (covering its exact stored bytes) is the only hash
+     * persisted. Reconstructibility itself is not at risk (ordering derives from {@code kind}, the
+     * preamble/trailer are compile-time constants, and every row's hash covers its exact content) — what
+     * a single assembled-prompt hash would add is a forensic shortcut: an auditor could verify a
+     * reconstruction without re-deriving the assembly order/framing from the code version that produced
+     * it. Not implemented here because it is a genuinely new artifact (a {@code PROMPT_ASSEMBLED} event
+     * or an extra column), not a fix to something already computed. Add it once a real audit/incident
+     * response scenario actually needs "verify this reconstruction without cross-referencing the code" —
+     * until then the per-row hashes plus the deterministic ordering already satisfy PMR-07's
+     * reconstructibility requirement.
      */
     private void persistPromptSections(Long reviewId, PromptManager.PromptResolution promptResolution) {
         int ordinal = 0;
