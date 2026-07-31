@@ -34,6 +34,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
@@ -172,6 +173,40 @@ class ReviewServiceTest {
         assertThat(result.deduplicated()).isFalse();
         verify(reviewInputRepository).save(any(ReviewInput.class));
         verify(stateMachine).transition(any(Review.class), eq(ReviewStatus.QUEUED), eq(EventType.CREATED), any());
+    }
+
+    // ---- PMR-10: the kill-switch being off must be traceable per-Review, not just at startup ----
+
+    @Test
+    void killSwitchOffRecordsPromptDisabledEventOnEveryCreatedReview() {
+        when(reviewRepository.findByProjectIdAndMergeRequestIdAndHeadShaNotAndStatusInOrderByIdAsc(any(), any(), any(), any()))
+                .thenReturn(List.of());
+        when(deduplicationService.findActiveReview(1L, 2L, "sha-1")).thenReturn(Optional.empty());
+        when(reviewRepository.saveAndFlush(any(Review.class)))
+                .thenAnswer(inv -> ReviewTestSupport.withId(inv.getArgument(0), 301L));
+        when(diffSizeValidator.estimateTokens("diff content")).thenReturn(42);
+        // promptManager.resolve(...) is stubbed to PromptResolution.none() in setUp -- the kill-switch-off case.
+
+        reviewService.createReview(command("sha-1"));
+
+        verify(eventService).record(eq(301L), eq(EventType.PROMPT_DISABLED), isNull(), isNull(), anyString());
+    }
+
+    @Test
+    void repoModeSuccessfulResolutionNeverRecordsPromptDisabledOrSectionMissingEvents() {
+        when(reviewRepository.findByProjectIdAndMergeRequestIdAndHeadShaNotAndStatusInOrderByIdAsc(any(), any(), any(), any()))
+                .thenReturn(List.of());
+        when(deduplicationService.findActiveReview(1L, 2L, "sha-1")).thenReturn(Optional.empty());
+        when(reviewRepository.saveAndFlush(any(Review.class)))
+                .thenAnswer(inv -> ReviewTestSupport.withId(inv.getArgument(0), 302L));
+        when(diffSizeValidator.estimateTokens("diff content")).thenReturn(42);
+        when(promptManager.resolve(1L)).thenReturn(new PromptManager.PromptResolution(
+                com.review.gateway.model.enums.PromptBundleMode.REPO, List.of(), 10, false, List.of()));
+
+        reviewService.createReview(command("sha-1"));
+
+        verify(eventService, never()).record(any(), eq(EventType.PROMPT_DISABLED), any(), any(), anyString());
+        verify(eventService, never()).record(any(), eq(EventType.PROMPT_SECTION_MISSING), any(), any(), anyString());
     }
 
     @Test
