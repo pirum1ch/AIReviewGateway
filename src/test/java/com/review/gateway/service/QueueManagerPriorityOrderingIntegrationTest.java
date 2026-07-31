@@ -80,7 +80,7 @@ class QueueManagerPriorityOrderingIntegrationTest extends AbstractPostgresIntegr
                 reviewChunkRepository, reviewCommentRepository, stateMachine, jobStateMachine, properties,
                 entityManager, transactionManager);
         ChunkContextRenderer chunkContextRenderer = new ChunkContextRenderer(properties, new TextSanitizer());
-        PromptMessageFormatter promptMessageFormatter = new PromptMessageFormatter(properties);
+        PromptMessageFormatter promptMessageFormatter = new PromptMessageFormatter(properties, new PromptAssembler(properties, new DiffSizeValidator(properties)));
         return new QueueManager(reviewRepository, reviewJobRepository, reviewChunkRepository,
                 reviewPromptSectionRepository, backendDispatcher, jobStateMachine, chunkCoordinator, eventService,
                 Mockito.mock(ResultProcessor.class), chunkContextRenderer, promptMessageFormatter, entityManager,

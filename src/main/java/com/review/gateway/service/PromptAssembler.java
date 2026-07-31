@@ -179,6 +179,20 @@ public class PromptAssembler {
         return beginLine + "\n" + sanitizedContent + "\n" + endLine;
     }
 
+    /**
+     * F-PM-08: whether {@code content} already carries {@code kind}'s begin/end delimiter lines
+     * (verbatim, as {@link #delimitedBlock} would produce them) — lets a claim-time caller
+     * ({@code PromptMessageFormatter}) verify the create-time wrapping invariant instead of trusting it.
+     */
+    boolean isDelimited(PromptSectionKind kind, String content) {
+        if (content == null) {
+            return false;
+        }
+        String beginLine = DELIMITER + " BEGIN " + kind.name() + " " + DELIMITER;
+        String endLine = DELIMITER + " END " + kind.name() + " " + DELIMITER;
+        return content.startsWith(beginLine) && content.endsWith(endLine);
+    }
+
     private String sha256(String content) {
         try {
             MessageDigest digest = MessageDigest.getInstance("SHA-256");

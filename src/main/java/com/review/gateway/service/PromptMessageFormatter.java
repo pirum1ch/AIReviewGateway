@@ -28,9 +28,11 @@ public class PromptMessageFormatter {
     private static final Logger log = LoggerFactory.getLogger(PromptMessageFormatter.class);
 
     private final GatewayProperties properties;
+    private final PromptAssembler assembler;
 
-    public PromptMessageFormatter(GatewayProperties properties) {
+    public PromptMessageFormatter(GatewayProperties properties, PromptAssembler assembler) {
         this.properties = properties;
+        this.assembler = assembler;
     }
 
     /**
@@ -47,8 +49,22 @@ public class PromptMessageFormatter {
             return null;
         }
 
+        // F-PM-07: PMR-08's claim-time cardinality bound, re-checked here rather than trusted solely from
+        // the schema (UNIQUE(review_id, kind) + the 4-value kind CHECK already make this unreachable via
+        // the normal create path, but a hand-edited/backfilled row set is not this class's problem to
+        // trust). Excess rows are dropped, not rendered -- ordinal-ascending order means CORPORATE_* is
+        // always kept; a corrupted row set fails closed via the mandatory-section check below instead of
+        // silently growing the rendered prompt.
+        int maxSections = properties.getPrompt().getLimits().getMaxSections();
+        List<ReviewPromptSection> boundedSections = sections;
+        if (sections.size() > maxSections) {
+            log.warn("review_prompt_sections row count ({}) exceeds gateway.prompt.limits.max-sections ({}); "
+                    + "dropping the excess rather than rendering them", sections.size(), maxSections);
+            boundedSections = sections.subList(0, maxSections);
+        }
+
         Map<PromptSectionKind, ReviewPromptSection> byKind = new EnumMap<>(PromptSectionKind.class);
-        for (ReviewPromptSection section : sections) {
+        for (ReviewPromptSection section : boundedSections) {
             byKind.put(section.getKind(), section);
         }
 
@@ -70,10 +86,10 @@ public class PromptMessageFormatter {
             pieces.add(PromptAssembler.PREAMBLE);
         }
         if (isPresent(projectArchitecture)) {
-            pieces.add(projectArchitecture.getContent());
+            pieces.add(wrappedProjectContent(projectArchitecture));
         }
         if (isPresent(projectCodeRules)) {
-            pieces.add(projectCodeRules.getContent());
+            pieces.add(wrappedProjectContent(projectCodeRules));
         }
         if (hasProjectContent) {
             pieces.add(PromptAssembler.TRAILER);
@@ -85,6 +101,26 @@ public class PromptMessageFormatter {
             return List.of(String.join(separator, pieces));
         }
         return List.copyOf(pieces);
+    }
+
+    /**
+     * F-PM-08: the PMR-02 delimiter wrapping is applied once, at create time
+     * ({@code PromptAssembler.toSection}), and trusted as stored thereafter -- this re-derives it from
+     * {@code kind} at claim time instead of trusting that whatever wrote the row applied the wrapper. A
+     * {@code PROJECT_*} row whose stored content is missing its begin/end delimiter lines (a future bug,
+     * a partial backfill, a manual insert) is re-wrapped here rather than reaching the model's system
+     * role undelimited — the same "re-check the trust-boundary property on every claim rather than
+     * inherit it from create time" argument PMR-09's fail-closed check already makes for the mandatory
+     * sections next to this one.
+     */
+    private String wrappedProjectContent(ReviewPromptSection section) {
+        String content = section.getContent();
+        if (assembler.isDelimited(section.getKind(), content)) {
+            return content;
+        }
+        log.warn("PROJECT_* review_prompt_sections row (kind={}) is missing its expected delimiter wrapper "
+                + "at claim time; re-wrapping defensively", section.getKind());
+        return assembler.delimitedBlock(section.getKind(), content);
     }
 
     private boolean isPresent(ReviewPromptSection section) {
