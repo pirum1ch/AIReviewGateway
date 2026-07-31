@@ -75,10 +75,10 @@ class RestClientConfigRedirectTest {
 
     @Test
     void gitLabRestClientAlsoNeverFollowsA302ToAnotherHost() {
-        // PMR-16 only mandates this explicitly for the new prompt client, but gitLabRestClient carries the
-        // write-scoped token and deserves the same proof -- it currently relies on the JDK's own NEVER
-        // default rather than an explicit setting (architecture §4.4's own caveat), so this also guards
-        // against that default silently changing.
+        // F-PM-10: gitLabRestClient (the write-scoped client) now pins followRedirects(NEVER) explicitly,
+        // the same as gitLabPromptRestClient/backendProbeRestClient -- previously it relied on the JDK's
+        // own NEVER default (architecture §4.4's own caveat: threat model §4.4 asked for the explicit
+        // pin on both GitLab clients). This test now guards a stated contract, not an inherited default.
         target = new RedirectStubServer();
         origin = new RedirectStubServer();
         target.respondPlainly("/secret", 200, "you should never see this");

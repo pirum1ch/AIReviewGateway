@@ -29,6 +29,12 @@ public class RestClientConfig {
     public RestClient gitLabRestClient() {
         HttpClient httpClient = HttpClient.newBuilder()
                 .connectTimeout(properties.getGitlab().getConnectTimeout())
+                // F-PM-10: pinned explicitly, matching gitLabPromptRestClient/backendProbeRestClient
+                // (PMR-16/threat model §4.4 asks for it on both GitLab clients) -- the JDK's own
+                // HttpClient.Builder default happens to be NEVER, so behavior is unchanged, but this
+                // must be a stated contract, not an inherited default one edit away from silently
+                // forwarding PRIVATE-TOKEN (a custom header the JDK does not strip on redirect) off-host.
+                .followRedirects(HttpClient.Redirect.NEVER)
                 .build();
         JdkClientHttpRequestFactory requestFactory = new JdkClientHttpRequestFactory(httpClient);
         requestFactory.setReadTimeout(properties.getGitlab().getReadTimeout());
