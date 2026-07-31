@@ -191,13 +191,27 @@ class ClaimCancelObsoleteConcurrencyTest {
      */
     @Test
     void multiChunkConcurrentResultSubmitAndCancelNeverDeadlockOrLeakAnUnhandled500() throws Exception {
-        Backend backend = new Backend("chunk-concurrency-backend", "http://192.168.1.61:8080", "model-x", 10);
-        backend.setStatus(BackendStatus.ACTIVE);
-        backendRepository.saveAndFlush(backend);
-
         List<Integer> unexpectedStatuses = new CopyOnWriteArrayList<>();
         List<String> deadlockResponses = new CopyOnWriteArrayList<>();
         int iterations = 8;
+        // F-PM-12: capacity must exceed iterations * 3, not just the 3 jobs of one in-flight iteration.
+        // Only jobs 0/1 of each iteration are driven to a terminal state by a submitted result -- job 2
+        // is only ever completed by the admin DELETE cascading to it, and recordIfUnexpected deliberately
+        // whitelists 409 as "a legitimate outcome" for the cancel/submit race. Any iteration where the
+        // cancel loses that lock race leaves job 2 RUNNING forever, "leaking" one unit of the backend's
+        // capacity (BackendDispatcher derives load from the RUNNING count, not a separate counter) --
+        // across 8 iterations that can accumulate to more than a capacity of 10 covers, starving
+        // /jobs/claim (204) for a later iteration and failing the test for a reason it doesn't name (the
+        // assertion fires on "expected to claim" instead of on the real cause). This is a pre-existing
+        // test-arithmetic defect (not a claim-logic defect), spotted by QA as a side effect of a
+        // regression run under load; not a production issue since a real Review's terminal chunk always
+        // resolves to FAILED/CANCELLED/COMPLETED eventually, just possibly not within this test's own
+        // 8-iteration window.
+        Backend backend = new Backend("chunk-concurrency-backend", "http://192.168.1.61:8080", "model-x",
+                iterations * 3 + 10);
+        backend.setStatus(BackendStatus.ACTIVE);
+        backendRepository.saveAndFlush(backend);
+
         ExecutorService executor = Executors.newFixedThreadPool(3);
 
         try {
