@@ -1,5 +1,8 @@
 package com.review.gateway.dto;
 
+import com.review.gateway.model.ReviewPromptSection;
+import com.review.gateway.model.enums.PromptSectionKind;
+import com.review.gateway.model.enums.PromptSectionStatus;
 import com.review.gateway.service.dto.ClaimedJob;
 import org.junit.jupiter.api.Test;
 
@@ -117,5 +120,33 @@ class SensitiveDtoToStringMaskingTest {
         assertThat(rendered).doesNotContain(SECRET_SYSTEM_MESSAGE_1);
         assertThat(rendered).doesNotContain(SECRET_SYSTEM_MESSAGE_2);
         assertThat(rendered).contains("masked, 2 msg");
+    }
+
+    // ---- ReviewPromptSection entity (PMR-25): same masking contract as the DTOs above ----
+
+    @Test
+    void reviewPromptSectionToStringNeverContainsRawContentEvenForAProjectSourcedSection() {
+        ReviewPromptSection section = new ReviewPromptSection(1L, 2, PromptSectionKind.PROJECT_ARCHITECTURE,
+                PromptSectionStatus.PRESENT, SECRET_SYSTEM_MESSAGE_1, "some/project", "path.md", "main",
+                "a".repeat(40), "hash-prefix-abc123", 42);
+
+        String rendered = section.toString();
+
+        assertThat(rendered).doesNotContain(SECRET_SYSTEM_MESSAGE_1);
+        assertThat(rendered).contains("masked, " + SECRET_SYSTEM_MESSAGE_1.length() + " chars");
+        assertThat(rendered).contains("kind=PROJECT_ARCHITECTURE");
+        assertThat(rendered).contains("status=PRESENT");
+        // Provenance metadata (never content) is exactly what PMR-07/PMR-25 want reconstructible from logs.
+        assertThat(rendered).contains("sourceProject=some/project");
+        assertThat(rendered).contains("contentSha256=hash-prefix-abc123");
+    }
+
+    @Test
+    void reviewPromptSectionAccessorStillReturnsRawContentUnmasked() {
+        ReviewPromptSection section = new ReviewPromptSection(1L, 0, PromptSectionKind.CORPORATE_BASE,
+                PromptSectionStatus.PRESENT, SECRET_SYSTEM_MESSAGE_2, "corp/repo", "base.md", "main",
+                "b".repeat(40), "hash", 10);
+
+        assertThat(section.getContent()).isEqualTo(SECRET_SYSTEM_MESSAGE_2);
     }
 }

@@ -262,6 +262,41 @@ class PromptTemplateServiceTest {
         assertThat(countOccurrences(allContent, "real diff content")).isEqualTo(1);
     }
 
+    /**
+     * PMR-23 x CSR-08 interaction (task ask: prove the two features don't regress each other when both
+     * are active on the same job): a v2, multi-chunk-context Review whose {@code systemMessages} contain
+     * literal {@code {{DIFF}}}/{@code {{CHUNK_CONTEXT}}} text, at the same time as a real, non-null
+     * {@code chunkContext} that itself contains a literal {@code {{DIFF}}}. Every piece must land exactly
+     * where it belongs and nowhere else: chunkContext substitutes into the user message only (with its
+     * own {@code {{}}} stripped first, CSR-08 defense in depth), systemMessages are wrapped byte-for-byte
+     * verbatim, and neither channel leaks into the other.
+     */
+    @Test
+    void systemMessagesStayVerbatimAndIsolatedFromChunkContextSubstitutionWhenBothArePresentTogether() {
+        String diff = "diff --git a/A.java b/A.java\n+ real diff content";
+        String chunkContextWithLiteralDiffPlaceholder = "part 1 of 3, file {{DIFF}}.java";
+        List<String> systemMessages = List.of("{{DIFF}}", "{{CHUNK_CONTEXT}}", "rule: use {{ in code");
+
+        ResolvedPrompt resolved = service.resolve("v2", diff, chunkContextWithLiteralDiffPlaceholder, systemMessages);
+
+        List<ChatMessage> systemChatMessages = resolved.messages().stream()
+                .filter(m -> "system".equals(m.role())).toList();
+        assertThat(systemChatMessages).extracting(ChatMessage::content)
+                .containsExactly("{{DIFF}}", "{{CHUNK_CONTEXT}}", "rule: use {{ in code");
+
+        ChatMessage userMessage = resolved.messages().get(resolved.messages().size() - 1);
+        assertThat(userMessage.role()).isEqualTo("user");
+        // chunkContext's own {{DIFF}} literal is brace-stripped (CSR-08 defense in depth) before
+        // substitution, so it must survive as plain "DIFF.java" text, NOT be expanded into the real diff.
+        assertThat(userMessage.content()).contains("part 1 of 3, file DIFF.java");
+        assertThat(userMessage.content()).contains("real diff content");
+        // The real diff content must appear exactly once in the whole rendered payload -- not duplicated
+        // via the systemMessages' "{{DIFF}}" entry (which stays literal, never substituted) nor via any
+        // cross-talk between the two channels.
+        String allContent = resolved.messages().stream().map(ChatMessage::content).reduce("", (a, b) -> a + b);
+        assertThat(countOccurrences(allContent, "real diff content")).isEqualTo(1);
+    }
+
     @Test
     void systemMessagesAreNotStrippedOfLiteralBraceSequencesUnlikeChunkContext() {
         // The {{ }} stripping (CSR-08 defense in depth) stays scoped to chunkContext; systemMessages are
