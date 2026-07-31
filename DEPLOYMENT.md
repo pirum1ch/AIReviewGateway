@@ -155,20 +155,40 @@ the token is issued in GitLab, not something the application enforces.
 call, and the Gateway compares it against its single configured `WORKER_TOKEN`). Copy the value out-of-band
 (a secrets manager, or manually) when provisioning each Worker host.
 
-**Prompt Manager (V3): a fifth secret, `GITLAB_PROMPT_TOKEN`.** Required only when
-`gateway.prompt.enabled=true` (the default — see `gateway.prompt.*` in
-[§10](#10-config-file-appendix)). A **separate, read-only** GitLab project/group access token
-(`read_api`/`read_repository` scope — never `api`/write), used exclusively for the three Prompt
-Manager reads (`GitLabClientImpl.resolveCommitSha`/`fetchRawFile`/`resolveDefaultBranch`) via the
-dedicated `gitLabPromptRestClient` bean — the write-scoped `GITLAB_TOKEN` above is never sent on a
-read call and vice versa (PMR-15). For the corporate prompt repo specifically, issue a **project
-access token scoped to that one project**; for project reads, prefer a **group access token with
-`read_repository` only** over an `api`-scoped personal token. Like `GITLAB_TOKEN`, this is checked
-only for presence (not the 32-character floor), for the same reason — it is GitLab's own fixed token
-format, not an operator-chosen secret. If you are not ready to configure Prompt Manager yet, set
-`PROMPT_MANAGER_ENABLED=false` instead of provisioning this token — with the kill-switch off,
-`GatewayProperties.validateOnStartup()` skips all `gateway.prompt.*` validation, including this
-token's presence check, and behavior is byte-identical to pre-V3.
+**Prompt Manager (V3): a fifth secret, `GITLAB_PROMPT_TOKEN`, only if you opt in.** Repo-sourced
+corporate/project system prompts are **off by default** (`gateway.prompt.enabled` defaults to
+`${PROMPT_MANAGER_ENABLED:false}` — see `gateway.prompt.*` in [§10](#10-config-file-appendix)); a
+stock or freshly-upgraded Gateway boots with today's Worker-JAR-only behavior and never requires this
+token. This is a deliberate safe-by-default choice recorded in
+`docs/security/feature-prompt-manager-sast-report.md` (F-PM-02): the alternative (defaulting to
+`true`) would mean every existing deployment fails to restart on upgrade until this whole section is
+carried out, and the realistic operator response to an un-bootable Gateway — hard-coding the
+kill-switch off in `application.yml` — would durably disable the control by accident instead of by a
+deliberate decision (`GatewayProperties.validateOnStartup()`/`validatePromptOnStartup()`).
+
+To opt in, set `PROMPT_MANAGER_ENABLED=true` and provision:
+
+- `GITLAB_PROMPT_TOKEN` — a **separate, read-only** GitLab project/group access token
+  (`read_api`/`read_repository` scope — never `api`/write), used exclusively for the three Prompt
+  Manager reads (`GitLabClientImpl.resolveCommitSha`/`fetchRawFile`/`resolveDefaultBranch`) via the
+  dedicated `gitLabPromptRestClient` bean — the write-scoped `GITLAB_TOKEN` above is never sent on a
+  read call and vice versa (PMR-15). For the corporate prompt repo specifically, issue a **project
+  access token scoped to that one project**; for project reads, prefer a **group access token with
+  `read_repository` only** over an `api`-scoped personal token. Like `GITLAB_TOKEN`, this is checked
+  only for presence (not the 32-character floor), for the same reason — it is GitLab's own fixed token
+  format, not an operator-chosen secret.
+- `PROMPT_CORPORATE_PROJECT` — the numeric id or `group/project` path of the corporate prompt repo
+  (mandatory once enabled; `gateway.prompt.corporate.project` has no default and startup fails without
+  it). `PROMPT_CORPORATE_REF` (default `main`), `PROMPT_CORPORATE_BASE_PROMPT_PATH` (default
+  `prompts/base-system-prompt.md`) and `PROMPT_CORPORATE_REVIEW_RULES_PATH` (default
+  `prompts/review-rules.md`) are optional overrides of the corporate source paths.
+- `PROMPT_ON_ERROR` (default `FAIL`) — set to `SKIP_OPTIONAL` to let an unusable/oversized *optional*
+  `PROJECT_*` section degrade the Review rather than block `POST /reviews`; corporate sections are
+  always `FAIL`, not configurable.
+
+With the kill-switch at its default (`false`), `GatewayProperties.validateOnStartup()` skips all
+`gateway.prompt.*` validation, including `GITLAB_PROMPT_TOKEN`'s presence check, and behavior is
+byte-identical to pre-V3.
 
 ## 3. Step 1: PostgreSQL
 
@@ -261,11 +281,18 @@ GITLAB_TOKEN=<GitLab project/group access token, api scope>
 # permissive ".*" default to the actual llama-server network. The Gateway only
 # reaches this host for health probes (GET {url}/health), never for inference. ---
 BACKEND_ALLOWED_HOST_PATTERN=^192\.168\.1\.101$
+
+# --- Prompt Manager (V3, optional -- omit entirely to stay on today's Worker-JAR-only prompts) ---
+# PROMPT_MANAGER_ENABLED=true
+# GITLAB_PROMPT_TOKEN=<separate, read-only GitLab token -- see §2>
+# PROMPT_CORPORATE_PROJECT=group/ai-review-prompts
 ```
 
 `GatewayProperties.validateOnStartup()` will refuse to start if any of the four secrets above is missing,
 if `CI_TOKEN`/`WORKER_TOKEN`/`ADMIN_TOKEN` is under 32 characters, or if `GITLAB_BASE_URL` doesn't start
 with `https://`. `GITLAB_TOKEN` itself is not length-checked — see [§2, Token generation](#2-prerequisites).
+The three commented-out `PROMPT_*` lines are optional: Prompt Manager defaults to disabled
+(`PROMPT_MANAGER_ENABLED` defaults to `false`), so the stock env file above boots without them.
 
 ### 4.2 systemd unit
 
@@ -708,6 +735,11 @@ GITLAB_BASE_URL=https://gitlab.local/api/v4
 GITLAB_TOKEN=<GitLab project/group access token, api scope, Developer+ role>
 
 BACKEND_ALLOWED_HOST_PATTERN=^192\.168\.1\.101$
+
+# Prompt Manager (V3, optional -- defaults to disabled; uncomment all three to opt in, see §2)
+# PROMPT_MANAGER_ENABLED=true
+# GITLAB_PROMPT_TOKEN=<separate, read-only GitLab project/group access token, read_api/read_repository scope>
+# PROMPT_CORPORATE_PROJECT=<numeric project id or "group/project" path -- never a URL>
 ```
 
 ### 10.2 Gateway systemd unit (`/etc/systemd/system/review-gateway.service`)

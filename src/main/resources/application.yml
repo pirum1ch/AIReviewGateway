@@ -68,6 +68,10 @@ gateway:
   gitlab:
     base-url: ${GITLAB_BASE_URL:https://gitlab.example.com/api/v4}
     token: ${GITLAB_TOKEN}          # masked in toString; only Gateway holds this
+    # Prompt Manager (V3, PMR-15): a SEPARATE, read-only GitLab credential -- never the write-scoped
+    # token above. Only required (checked for presence, SR-01) when gateway.prompt.enabled=true; with
+    # the kill-switch at its shipped default (false, see below), this stays unset and unchecked.
+    prompt-token: ${GITLAB_PROMPT_TOKEN:}
     connect-timeout: 5s
     read-timeout: 30s
   backend:
@@ -78,8 +82,47 @@ gateway:
     ci-token: ${CI_TOKEN}
     worker-token: ${WORKER_TOKEN}
     admin-token: ${ADMIN_TOKEN}
+  prompt:
+    # F-PM-02: shipped safe-by-default OFF, deliberately deviating from the architecture doc's original
+    # ${PROMPT_MANAGER_ENABLED:true} example -- a stock/upgraded Gateway must keep booting with today's
+    # Worker-JAR-only behavior (byte-identical to pre-V3, PMR-10's own premise) until an operator has
+    # actually provisioned GITLAB_PROMPT_TOKEN + PROMPT_CORPORATE_PROJECT and opts in explicitly. This
+    # is the same default GatewayProperties.Prompt#enabled now carries in code, so the two can never
+    # disagree with each other the way this finding's root cause did. See docs/security/
+    # feature-prompt-manager-sast-report.md F-PM-02 and DEPLOYMENT.md §2 for the full rationale.
+    enabled: ${PROMPT_MANAGER_ENABLED:false}
+    corporate:
+      project: ${PROMPT_CORPORATE_PROJECT:}   # numeric id or "group/project" path -- NEVER a URL (PMR-14)
+      ref: ${PROMPT_CORPORATE_REF:main}
+      base-prompt-path: ${PROMPT_CORPORATE_BASE_PROMPT_PATH:prompts/base-system-prompt.md}
+      review-rules-path: ${PROMPT_CORPORATE_REVIEW_RULES_PATH:prompts/review-rules.md}
+    project:
+      enabled: true
+      # ref is ALWAYS the project's own default branch unless a gateway.prompt.project.overrides.*.ref
+      # entry sets one explicitly (architecture §0.1) -- no top-level env var for it by design.
+      architecture-path: .ai-review/architecture.md
+      code-rules-path: .ai-review/code-rules.md
+    error-handling:
+      on-error: ${PROMPT_ON_ERROR:FAIL}   # FAIL | SKIP_OPTIONAL -- corporate sections are ALWAYS FAIL, not configurable
+    message-format: MULTI       # MULTI | SINGLE -- default MULTI (PMR-22); backends.prompt_message_format overrides per-backend
+    section-separator: "\n\n---\n\n"   # SINGLE mode only
+    limits:
+      max-file-bytes: 262144
+      max-system-prompt-tokens: 6000
+      min-diff-budget-tokens: 1000
+      max-sections: 4
+      max-concurrent-resolutions: 4          # PMR-19 semaphore permits
+    connect-timeout: 3s
+    read-timeout: 8s
+    total-timeout: 20s
 
 # NOTE: gateway.security.*/gateway.gitlab.token MUST be >=32 chars (SR-01) and
 # gateway.gitlab.base-url MUST be https:// (SR-15) -- GatewayProperties fails startup otherwise.
 # All four secrets come from environment variables, never committed (see systemd EnvironmentFile /
 # a local .env excluded from version control for a dev deployment).
+#
+# Prompt Manager (V3): gateway.prompt.enabled defaults to false (env: PROMPT_MANAGER_ENABLED) -- with
+# it off, none of gateway.prompt.* below is validated at startup (GatewayProperties.
+# validatePromptOnStartup) and GITLAB_PROMPT_TOKEN is never required. To opt in, set
+# PROMPT_MANAGER_ENABLED=true and provision GITLAB_PROMPT_TOKEN + PROMPT_CORPORATE_PROJECT (see
+# DEPLOYMENT.md §2).

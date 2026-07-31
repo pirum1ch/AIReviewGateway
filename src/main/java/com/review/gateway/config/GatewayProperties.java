@@ -696,8 +696,19 @@ public class GatewayProperties {
      * (see {@code docs/prompt-manager-threat-model.md} PMT-24).
      */
     public static class Prompt {
-        /** Kill-switch: {@code false} = today's Worker-JAR-only behavior, zero GitLab calls (PMR-10). */
-        private boolean enabled = true;
+        /**
+         * Kill-switch: {@code false} = today's Worker-JAR-only behavior, zero GitLab calls (PMR-10).
+         *
+         * <p><b>F-PM-02:</b> defaults to {@code false} here, matching {@code application.yml}'s
+         * {@code ${PROMPT_MANAGER_ENABLED:false}} — deliberately, so the two can never disagree the way
+         * they did when this finding was raised (the YAML tree didn't exist at all, so this Java-level
+         * default of {@code true} was silently the one in effect on every stock deployment, requiring a
+         * corporate project and a GitLab token nothing had provisioned yet). An operator opts in
+         * explicitly once {@code gateway.gitlab.prompt-token}/{@code gateway.prompt.corporate.project}
+         * are actually configured; until then, a stock or upgraded Gateway boots exactly as it did before
+         * this feature existed.
+         */
+        private boolean enabled = false;
         private final Corporate corporate = new Corporate();
         private final Project project = new Project();
         private final ErrorHandling errorHandling = new ErrorHandling();
