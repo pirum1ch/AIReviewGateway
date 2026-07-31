@@ -2,6 +2,7 @@ package com.review.gateway.service;
 
 import com.review.gateway.config.GatewayProperties;
 import com.review.gateway.exception.PromptResolutionSaturatedException;
+import com.review.gateway.exception.PromptSourceInvalidException;
 import com.review.gateway.exception.PromptSourceMissingException;
 import com.review.gateway.exception.PromptSourceUnavailableException;
 import com.review.gateway.model.enums.PromptBundleMode;
@@ -143,16 +144,25 @@ public class PromptManager {
                 checkDeadline(deadline);
                 projectCodeRules = fetchOptionalSection(PromptSectionKind.PROJECT_CODE_RULES, proj.project(),
                         proj.codeRulesPath(), ref, projSha, proj.codeRulesPathExplicit(), explicitPathsMissing);
-            } catch (PromptSourceUnavailableException unavailable) {
+            } catch (PromptSourceUnavailableException | PromptSourceInvalidException projectFailure) {
+                // F-PM-01: BOTH failure classes are "a project-section error" per architecture §3 step 4c
+                // ("other error => FAIL or SKIP_OPTIONAL per config"). Catching only
+                // PromptSourceUnavailableException made `on-error=SKIP_OPTIONAL` a no-op for the entire
+                // PromptSourceInvalidException family (file over max-file-bytes, invalid UTF-8, NUL byte,
+                // empty file) -- an *optional* project section could then hard-fail POST /reviews with a
+                // 422 regardless of how the operator configured error handling, and any developer able to
+                // land such a file on their project's default branch could keep AI review permanently
+                // un-runnable for that project with no operator escape hatch. Corporate (mandatory)
+                // sections are unaffected: they are fetched above this try block and always fail hard.
                 if (ON_ERROR_SKIP_OPTIONAL.equals(properties.getPrompt().getErrorHandling().getOnError())) {
-                    log.warn("Project prompt source unavailable; skipping optional PROJECT_* sections "
-                            + "(prompt_degraded=true): {}", unavailable.getClass().getSimpleName());
+                    log.warn("Project prompt source unusable; skipping optional PROJECT_* sections "
+                            + "(prompt_degraded=true): {}", projectFailure.getClass().getSimpleName());
                     degraded = true;
                     projectArchitecture = null;
                     projectCodeRules = null;
                     explicitPathsMissing.clear();
                 } else {
-                    throw unavailable;
+                    throw projectFailure;
                 }
             }
         }

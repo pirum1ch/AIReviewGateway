@@ -2,6 +2,7 @@ package com.review.gateway.service;
 
 import com.review.gateway.config.GatewayProperties;
 import com.review.gateway.exception.PromptResolutionSaturatedException;
+import com.review.gateway.exception.PromptSourceInvalidException;
 import com.review.gateway.exception.PromptSourceMissingException;
 import com.review.gateway.exception.PromptSourceUnavailableException;
 import com.review.gateway.model.enums.PromptBundleMode;
@@ -197,6 +198,68 @@ class PromptManagerTest {
         assertThat(result.mode()).isEqualTo(PromptBundleMode.REPO);
         assertThat(result.degraded()).isTrue();
         assertThat(result.sections()).hasSize(2); // corporate only
+    }
+
+    /**
+     * F-PM-01 regression (appsec SAST round, originally spotted by QA): {@code on-error=SKIP_OPTIONAL}
+     * must absorb {@link com.review.gateway.exception.PromptSourceInvalidException} on an <em>optional</em>
+     * PROJECT_* section exactly the way it absorbs {@link PromptSourceUnavailableException} — architecture
+     * §3 step 4c says "other error =&gt; FAIL or SKIP_OPTIONAL per config", and
+     * {@code PromptSourceInvalidException} (over max-file-bytes / invalid UTF-8 / NUL / empty) is squarely
+     * an "other error". Before the fix the catch clause named only the Unavailable type, so any developer
+     * able to land such a file on their project's default branch could 422 every {@code POST /reviews} for
+     * that project permanently, with no operator escape hatch.
+     */
+    @Test
+    void invalidOptionalProjectSectionIsSkippedUnderSkipOptional() {
+        properties.getPrompt().getErrorHandling().setOnError("SKIP_OPTIONAL");
+        when(gitLabClient.resolveCommitSha("platform/ai-review-prompts", "main")).thenReturn("corpsha");
+        when(gitLabClient.fetchRawFile("platform/ai-review-prompts", "prompts/base.md", "corpsha", 262144))
+                .thenReturn(Optional.of("corporate base"));
+        when(gitLabClient.fetchRawFile("platform/ai-review-prompts", "prompts/rules.md", "corpsha", 262144))
+                .thenReturn(Optional.of("corporate rules"));
+        when(gitLabClient.resolveDefaultBranch("1042")).thenReturn("main");
+        when(gitLabClient.resolveCommitSha("1042", "main")).thenReturn("projsha");
+        when(gitLabClient.fetchRawFile("1042", ".ai-review/architecture.md", "projsha", 262144))
+                .thenThrow(new PromptSourceInvalidException("Prompt source file exceeds max-file-bytes"));
+
+        PromptManager.PromptResolution result = manager.resolve(1042L);
+
+        assertThat(result.mode()).isEqualTo(PromptBundleMode.REPO);
+        assertThat(result.degraded()).isTrue();
+        assertThat(result.sections()).hasSize(2); // corporate only -- the review still runs, under the rulebook
+    }
+
+    /** The other half of the same fix: with the default {@code on-error=FAIL} it must still fail hard. */
+    @Test
+    void invalidOptionalProjectSectionStillFailsHardUnderFail() {
+        properties.getPrompt().getErrorHandling().setOnError("FAIL");
+        when(gitLabClient.resolveCommitSha("platform/ai-review-prompts", "main")).thenReturn("corpsha");
+        when(gitLabClient.fetchRawFile("platform/ai-review-prompts", "prompts/base.md", "corpsha", 262144))
+                .thenReturn(Optional.of("corporate base"));
+        when(gitLabClient.fetchRawFile("platform/ai-review-prompts", "prompts/rules.md", "corpsha", 262144))
+                .thenReturn(Optional.of("corporate rules"));
+        when(gitLabClient.resolveDefaultBranch("1042")).thenReturn("main");
+        when(gitLabClient.resolveCommitSha("1042", "main")).thenReturn("projsha");
+        when(gitLabClient.fetchRawFile("1042", ".ai-review/architecture.md", "projsha", 262144))
+                .thenThrow(new PromptSourceInvalidException("Prompt source file contains a NUL byte"));
+
+        assertThatThrownBy(() -> manager.resolve(1042L)).isInstanceOf(PromptSourceInvalidException.class);
+    }
+
+    /**
+     * F-PM-01 scope guard: a <em>mandatory corporate</em> section that is invalid must keep failing hard
+     * even under {@code SKIP_OPTIONAL} — the widened catch must not have swallowed the corporate path
+     * (corporate fetches happen above the try block; this pins that structural fact behaviourally).
+     */
+    @Test
+    void invalidCorporateSectionAlwaysFailsEvenUnderSkipOptional() {
+        properties.getPrompt().getErrorHandling().setOnError("SKIP_OPTIONAL");
+        when(gitLabClient.resolveCommitSha("platform/ai-review-prompts", "main")).thenReturn("corpsha");
+        when(gitLabClient.fetchRawFile("platform/ai-review-prompts", "prompts/base.md", "corpsha", 262144))
+                .thenThrow(new PromptSourceInvalidException("Prompt source file is not valid UTF-8"));
+
+        assertThatThrownBy(() -> manager.resolve(1042L)).isInstanceOf(PromptSourceInvalidException.class);
     }
 
     // ---- PMR-19: bounded concurrency permit, immediate rejection on saturation ----

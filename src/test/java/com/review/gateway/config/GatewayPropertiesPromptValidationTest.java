@@ -110,6 +110,47 @@ class GatewayPropertiesPromptValidationTest {
         assertThatThrownBy(properties::validateOnStartup).isInstanceOf(IllegalStateException.class);
     }
 
+    /**
+     * F-PM-04 regression (appsec SAST round): PMR-14 requires the project-reference validator to reject
+     * {@code ..}, but a bare {@code ..} segment matches {@code PROJECT_REF_PATTERN}'s
+     * {@code [A-Za-z0-9._-]+} class, so {@code requireProjectRef} accepted it (unlike {@code requireRef}/
+     * {@code requireSourcePath}, which both carry an explicit {@code ..} check). Not exploitable as a URI
+     * traversal today — every project reference is expanded as a strictly-encoded URI template variable,
+     * so {@code /} becomes {@code %2F} — but it is a defense-in-depth rule the requirement names
+     * explicitly, and it is the one validator with no {@code ..} guard.
+     */
+    @Test
+    void corporateProjectRefWithDotDotSegmentRefusesStartup() {
+        GatewayProperties properties = validProperties();
+        properties.getPrompt().getCorporate().setProject("group/../other-group/prompts");
+
+        assertThatThrownBy(properties::validateOnStartup)
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("corporate.project");
+    }
+
+    /** Same rule on the override side, which feeds the same outbound fetch. */
+    @Test
+    void overrideProjectRefWithDotDotSegmentRefusesStartup() {
+        GatewayProperties properties = validProperties();
+        GatewayProperties.Prompt.Project.Override override = new GatewayProperties.Prompt.Project.Override();
+        override.setProject("..");
+        properties.getPrompt().getProject().getOverrides().put("1042", override);
+
+        assertThatThrownBy(properties::validateOnStartup)
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("overrides[1042].project");
+    }
+
+    /** Scope guard: a legitimate dot inside a segment (e.g. a `.github`-style group) still starts. */
+    @Test
+    void projectRefWithSingleDotsIsStillAccepted() {
+        GatewayProperties properties = validProperties();
+        properties.getPrompt().getCorporate().setProject("org.platform/ai-review.prompts");
+
+        assertThatCode(properties::validateOnStartup).doesNotThrowAnyException();
+    }
+
     @Test
     void numericProjectIdIsAccepted() {
         GatewayProperties properties = validProperties();

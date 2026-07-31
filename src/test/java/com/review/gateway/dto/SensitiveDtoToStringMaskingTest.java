@@ -3,6 +3,7 @@ package com.review.gateway.dto;
 import com.review.gateway.model.ReviewPromptSection;
 import com.review.gateway.model.enums.PromptSectionKind;
 import com.review.gateway.model.enums.PromptSectionStatus;
+import com.review.gateway.service.PromptAssembler;
 import com.review.gateway.service.dto.ClaimedJob;
 import org.junit.jupiter.api.Test;
 
@@ -148,5 +149,49 @@ class SensitiveDtoToStringMaskingTest {
                 "b".repeat(40), "hash", 10);
 
         assertThat(section.getContent()).isEqualTo(SECRET_SYSTEM_MESSAGE_2);
+    }
+
+    // ---- F-PM-05: the pre-persistence carriers of the same content (appsec SAST round) ----
+
+    /**
+     * {@code PromptAssembler.SectionCandidate} holds the untrusted {@code PROJECT_*} body in its rawest
+     * in-process form (post-sanitization, pre-delimiter-wrapping). It shipped with the default record
+     * {@code toString()}, i.e. exactly the latent F-DC-07 leak channel that finding closed for
+     * {@code DiffChunk}/{@code ChunkPlan}/{@code CreateReviewCommand}/{@code SubmitResultCommand}.
+     */
+    @Test
+    void sectionCandidateToStringNeverContainsRawSectionContent() {
+        PromptAssembler.SectionCandidate candidate = new PromptAssembler.SectionCandidate(
+                PromptSectionKind.PROJECT_CODE_RULES, true, SECRET_SYSTEM_MESSAGE_1,
+                "1042", ".ai-review/code-rules.md", "main", "b".repeat(40));
+
+        String rendered = candidate.toString();
+
+        assertThat(rendered).doesNotContain(SECRET_SYSTEM_MESSAGE_1);
+        assertThat(rendered).contains("masked, " + SECRET_SYSTEM_MESSAGE_1.length() + " chars");
+        assertThat(rendered).contains("kind=PROJECT_CODE_RULES");
+        assertThat(rendered).contains("sourceCommit=" + "b".repeat(40));
+    }
+
+    /** Interpolation shapes must not fall back to a default rendering either (F-DC-07's own sub-check). */
+    @Test
+    void sectionCandidateMaskingSurvivesListAndFormatInterpolation() {
+        PromptAssembler.SectionCandidate candidate = new PromptAssembler.SectionCandidate(
+                PromptSectionKind.PROJECT_ARCHITECTURE, true, SECRET_SYSTEM_MESSAGE_2,
+                "1042", ".ai-review/architecture.md", "main", "c".repeat(40));
+
+        assertThat(java.util.List.of(candidate).toString()).doesNotContain(SECRET_SYSTEM_MESSAGE_2);
+        assertThat(String.format("%s", candidate)).doesNotContain(SECRET_SYSTEM_MESSAGE_2);
+        assertThat("" + candidate).doesNotContain(SECRET_SYSTEM_MESSAGE_2);
+    }
+
+    /** The accessor must still hand back the real text — masking is a rendering concern only. */
+    @Test
+    void sectionCandidateAccessorStillReturnsRawContentUnmasked() {
+        PromptAssembler.SectionCandidate candidate = new PromptAssembler.SectionCandidate(
+                PromptSectionKind.CORPORATE_BASE, true, SECRET_SYSTEM_MESSAGE_1,
+                "corp/repo", "base.md", "main", "d".repeat(40));
+
+        assertThat(candidate.sanitizedContent()).isEqualTo(SECRET_SYSTEM_MESSAGE_1);
     }
 }

@@ -232,10 +232,13 @@ public class GatewayProperties {
         if (value == null || value.isBlank()) {
             throw new IllegalStateException(propertyName + " must be set — refusing to start");
         }
-        if (!PROJECT_REF_PATTERN.matcher(value).matches()) {
+        // F-PM-04: the '..' check is explicit rather than folded into PROJECT_REF_PATTERN, because a bare
+        // ".." *does* match that pattern's [A-Za-z0-9._-]+ segment class -- PMR-14 requires '..' to be
+        // rejected here, exactly as requireRef/requireSourcePath already do.
+        if (!PROJECT_REF_PATTERN.matcher(value).matches() || value.contains("..")) {
             throw new IllegalStateException(
-                    propertyName + " must be a numeric project id or a 'group/project'-style path, never a URL "
-                            + "(PMR-14) — refusing to start");
+                    propertyName + " must be a numeric project id or a 'group/project'-style path with no '..' "
+                            + "segment, never a URL (PMR-14) — refusing to start");
         }
     }
 

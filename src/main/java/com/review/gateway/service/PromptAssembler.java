@@ -85,6 +85,24 @@ public class PromptAssembler {
     /** One fetched-and-sanitized (or looked-up-and-absent) candidate, prior to delimiter wrapping/token counting. */
     public record SectionCandidate(PromptSectionKind kind, boolean present, String sanitizedContent,
                                     String sourceProject, String sourcePath, String sourceRef, String sourceCommit) {
+
+        /**
+         * F-PM-05/PMR-25: this record carries the rawest form of the untrusted {@code PROJECT_*} section
+         * body in the whole feature (post-sanitization, pre-wrapping), so its default record
+         * {@code toString()} was one accidental {@code log.debug("{}", candidate)} away from dumping full
+         * (possibly proprietary, possibly attacker-authored) section text into a log line or an exception
+         * message. Same masking contract, field for field, as {@link AssembledSection} and
+         * {@code ReviewPromptSection}. (The separate question of {@code sourceRef} being a repo-controlled,
+         * un-sanitized GitLab {@code default_branch} name is tracked as F-PM-06 and is deliberately handled
+         * uniformly across all three renderings, not patched here alone.)
+         */
+        @Override
+        public String toString() {
+            int chars = sanitizedContent == null ? 0 : sanitizedContent.length();
+            return "SectionCandidate[kind=" + kind + ", present=" + present + ", sanitizedContent=<masked, "
+                    + chars + " chars>, sourceProject=" + sourceProject + ", sourcePath=" + sourcePath
+                    + ", sourceRef=" + sourceRef + ", sourceCommit=" + sourceCommit + "]";
+        }
     }
 
     /**
