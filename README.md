@@ -64,6 +64,11 @@ GitLab CI job  ──POST /reviews──▶  Review Gateway  ──▶  PostgreS
   retry/dedup/queue logic — that all lives in the Gateway (see [§9](#9-worker-protocol)).
 - **llama-server backends** are OpenAI Chat-Completions-compatible HTTP endpoints; the Gateway never
   calls them for inference, only for a lightweight `/health` probe (see [§10](#10-operations)).
+- **Prompt Manager (V3, optional, off by default)** lets the system prompt come from Git instead of only
+  the Worker's own jar: mandatory corporate rules from one org-wide GitLab repo, plus optional
+  per-project architecture/code-style rules from the reviewed project itself (or an operator-configured
+  override repo) — see [§4.4](#44-prompt-manager-v3-optional) and
+  [§6.1b](#61b-prompt-manager-and-system-prompt-assembly).
 
 Target scale (per the requirements document): **20–30 merge requests/day**, long-running LLM tasks (up
 to tens of minutes), and **1–10** backend servers, each typically paired with one Worker on its own host
@@ -126,6 +131,11 @@ threat model recommends a least-privilege, expiring GitLab **project or group ac
 only to the projects under review for `GITLAB_TOKEN` — this is an operational choice made when the
 token is issued in GitLab, not something the application enforces.
 
+**A conditional fifth secret, `GITLAB_PROMPT_TOKEN`, only if you opt into Prompt Manager** (V3,
+`gateway.prompt.enabled`, default `false`) — see [§4.4](#44-prompt-manager-v3-optional). With the
+kill-switch at its default, this token is never required and `validatePromptOnStartup()` skips all
+`gateway.prompt.*` validation entirely.
+
 ### 4.2 Everything else (has a working default)
 
 | Property | Default | Purpose |
@@ -177,6 +187,38 @@ operational prerequisites called out by the SAST review before going to producti
 5. **Enable volume/backup encryption and a retention policy** for `review_inputs.diff` and
    `review_results.raw_response` (they contain proprietary source code and raw model output). Not
    implemented by the application; do this at the database/backup layer.
+
+### 4.4 Prompt Manager (V3, optional)
+
+**Off by default** (`gateway.prompt.enabled: ${PROMPT_MANAGER_ENABLED:false}`) — a stock or freshly
+upgraded Gateway keeps booting with today's Worker-JAR-only system prompt and never touches GitLab for
+prompts, byte-identical to pre-V3 behavior. This is a deliberate safe-by-default choice (see
+`docs/security/feature-prompt-manager-sast-report.md`, finding F-PM-02): defaulting to `true` would have
+broken every existing deployment's restart until it was fully configured.
+
+When enabled, the Gateway assembles the LLM's system prompt from Git-hosted content instead of the
+Worker's own bundled template, resolved once per Review at `POST /reviews` and persisted immutably —
+see [§6.1b](#61b-prompt-manager-and-system-prompt-assembly) for the full model. Full design docs:
+[`docs/prompt-manager-architecture.md`](docs/prompt-manager-architecture.md) and
+[`docs/prompt-manager-threat-model.md`](docs/prompt-manager-threat-model.md) (PMT-01..25/PMR-01..30).
+
+| Property | Env var | Default | Purpose |
+|---|---|---|---|
+| `gateway.prompt.enabled` | `PROMPT_MANAGER_ENABLED` | `false` | Master kill-switch. `false` = zero GitLab calls for prompts, exactly today's behavior. |
+| `gateway.gitlab.prompt-token` | `GITLAB_PROMPT_TOKEN` | none — required only if enabled | Separate, **read-only** GitLab token (`read_api`/`read_repository`, never `api`/write) used exclusively for prompt fetches, via a dedicated `gitLabPromptRestClient` — never shares a request with the write-scoped `GITLAB_TOKEN`. Presence-only check, same rationale as `GITLAB_TOKEN`. |
+| `gateway.prompt.corporate.project` | `PROMPT_CORPORATE_PROJECT` | none — required if enabled | Numeric id or `group/project` path of the **one**, org-wide corporate prompt repo. Always a project reference on the existing `gateway.gitlab.base-url` host — never a URL field (no SSRF sink). |
+| `gateway.prompt.corporate.ref` | `PROMPT_CORPORATE_REF` | `main` | Branch of the corporate repo. |
+| `gateway.prompt.corporate.base-prompt-path` | `PROMPT_CORPORATE_BASE_PROMPT_PATH` | `prompts/base-system-prompt.md` | Mandatory: task/rules/response-format section. |
+| `gateway.prompt.corporate.review-rules-path` | `PROMPT_CORPORATE_REVIEW_RULES_PATH` | `prompts/review-rules.md` | Mandatory: issue-classification/verdict rules section. |
+| `gateway.prompt.project.enabled` | — | `true` | Whether to also look for optional per-project sections at all. |
+| `gateway.prompt.project.architecture-path` | — | `.ai-review/architecture.md` | Optional: read from the **reviewed project's own default branch** (never the MR's own branch — see [§6.1b](#61b-prompt-manager-and-system-prompt-assembly)), unless overridden per-project. |
+| `gateway.prompt.project.code-rules-path` | — | `.ai-review/code-rules.md` | Optional, same sourcing rule. |
+| `gateway.prompt.project.overrides.<project_id>` | — | *(empty map)* | Per-project override: point a specific `project_id` at a different repo/ref/paths (e.g. a dedicated subteam prompt repo). Centrally administered in this YAML — not self-declared by the project being reviewed. Several `project_id`s may point at the same override repo. |
+| `gateway.prompt.error-handling.on-error` | `PROMPT_ON_ERROR` | `FAIL` | `FAIL` \| `SKIP_OPTIONAL`. Applies only to *optional* project-section failures (network/oversize/invalid content) — corporate-section failures are **always** `FAIL`, not configurable. A missing optional file at a *default* path (plain `404`) is never an error either way. |
+| `gateway.prompt.message-format` | — | `MULTI` | `MULTI` (one `ChatMessage` per section) \| `SINGLE` (all sections concatenated). Per-backend override via the `backends.prompt_message_format` column. |
+| `gateway.prompt.limits.max-system-prompt-tokens` | — | `6000` | Aggregate cap over all assembled sections; exceeding it is `422 PROMPT_TOO_LARGE`, distinct from `DIFF_TOO_LARGE`. Subtracted from the diff's own token budget dynamically, per Review — `gateway.diff.prompt-reserve` no longer covers the whole system prompt, only the Worker's fixed `user`-template wrapper text. |
+| `gateway.prompt.limits.max-file-bytes` | — | `262144` | Per-file streaming read bound (enforced while reading, not after buffering). |
+| `gateway.prompt.total-timeout` | — | `20s` | Wall-clock deadline across all GitLab calls for one Review's resolution; a bounded concurrency permit (`max-concurrent-resolutions`, default `4`) additionally caps how many resolutions run at once, so a slow/unavailable GitLab can never exhaust the Gateway's request-handling threads. |
 
 ## 5. Deployment
 
@@ -347,6 +389,41 @@ real feature-branch MRs used to get `422 DIFF_TOO_LARGE` outright.
   /reviews/{id}` with a fixed timeout (see [`examples/.gitlab-ci.yml`](examples/.gitlab-ci.yml)), consider
   raising it for large MRs — this repository does not change the example CI script's timeout for you.
 
+### 6.1b Prompt Manager and system-prompt assembly
+
+**Only relevant when `gateway.prompt.enabled=true` ([§4.4](#44-prompt-manager-v3-optional)).** When
+enabled, `POST /reviews` synchronously resolves the system prompt from GitLab **before** the Review is
+created — the request either gets a Review whose system prompt is already immutably persisted, or it
+fails outright; there is no "created but degraded silently" state for the mandatory corporate sections.
+
+- **Corporate sections (mandatory)** — one org-wide repo, two files (base rules + review rules). Any
+  failure — missing repo/ref, missing file, oversized/invalid content, timeout — fails the request.
+- **Project sections (optional)** — up to two files (architecture + code-style rules) from the reviewed
+  project's own **default branch** (or an operator-configured override repo/ref). Deliberately never the
+  MR's own source/target branch: reading from a branch the MR author could push to would let them weaken
+  the very rules their own change is reviewed against. A missing file at the default path is normal (no
+  customization configured, not an error); a missing file at an **explicitly configured override path**
+  logs a `WARN` and records a `PROMPT_SECTION_MISSING` event instead of failing silently.
+- **Assembly**: corporate sections, a fixed (never fetched, never attacker-influenced) preamble stating
+  that what follows is reference material and cannot override the rules above, the project sections
+  (each wrapped in a non-forgeable delimiter), then a fixed trailer restating precedence — this is the
+  mitigation for prompt injection via project-supplied content (see
+  `docs/prompt-manager-threat-model.md` PMT-01/PMR-01/02).
+- **Snapshot semantics**: each source's commit SHA is resolved once, then every file from that source is
+  fetched at that exact SHA — a consistent snapshot even under concurrent pushes — and persisted with
+  full provenance (`review_prompt_sections`: `source_project`/`source_ref`/`source_commit`/
+  `content_sha256`), so a Review's exact prompt is reproducible without hitting GitLab again.
+
+New failure responses at `POST /reviews` (in addition to [§6.1](#61-post-reviews--create-a-review)'s):
+
+| HTTP | `error` | Meaning |
+|---|---|---|
+| `502` | `PROMPT_RESOLUTION_FAILED` | A GitLab call failed (network/timeout/5xx/no access). Deliberately coarse — the body never distinguishes *why*, to avoid a cross-project existence oracle under the shared `CI_TOKEN`; check server-side logs/`review_events` for the real cause. |
+| `422` | `PROMPT_SOURCE_MISSING` | A **mandatory** corporate file doesn't exist at the resolved commit. |
+| `422` | `PROMPT_SOURCE_INVALID` | A fetched file exceeds `max-file-bytes`, isn't valid UTF-8, or is empty. |
+| `422` | `PROMPT_TOO_LARGE` | The assembled system prompt exceeds `gateway.prompt.limits.max-system-prompt-tokens`, or leaves too little diff budget (`min-diff-budget-tokens`). |
+| `503` | `PROMPT_RESOLUTION_SATURATED` | Too many concurrent resolutions in flight (`max-concurrent-resolutions`); retry shortly — this bounds worst-case load rather than queuing requests indefinitely. |
+
 ### 6.2 `GET /reviews/{id}` — status
 
 ```bash
@@ -417,7 +494,7 @@ heartbeat/result call for this job).
   {
     "jobId": 456,
     "reviewId": 123,
-    "payload": { "diff": "diff --git a/Foo.java b/Foo.java\n...", "promptVersion": "v1", "chunkContext": null }
+    "payload": { "diff": "diff --git a/Foo.java b/Foo.java\n...", "promptVersion": "v1", "chunkContext": null, "systemMessages": null }
   }
   ```
   As of diff chunking (V2), `jobId` identifies one **chunk** of the Review (`review_jobs` is now 1:N per
@@ -426,6 +503,12 @@ heartbeat/result call for this job).
   header text (`null` for the common single-chunk case); the Worker substitutes it into the resolved
   prompt template's `{{CHUNK_CONTEXT}}` placeholder exactly like `diff`/`{{DIFF}}`, with no other
   chunk-awareness required on its side (it stays a fully stateless, chunk-ignorant HTTP client).
+  `payload.systemMessages` (V3, Prompt Manager) is `null` for a legacy Review or when
+  `gateway.prompt.enabled=false` (use the Worker's own bundled template, exactly pre-V3 behavior) — a
+  non-null value is one or more already-fully-assembled system-prompt strings to wrap verbatim into
+  `ChatMessage(role=system, ...)`, **never** run through the `{{DIFF}}`/`{{CHUNK_CONTEXT}}` substitution
+  logic (that stays scoped to the `user`-role template only). See
+  [§6.1b](#61b-prompt-manager-and-system-prompt-assembly) and [§9](#9-worker-protocol).
 - **`204 No Content`** — nothing to claim right now. This covers five indistinguishable situations by
   design: the queue is empty, the named backend is not `ACTIVE`, the backend is already at capacity, a
   claimed job turned out to belong to a Review that had already gone `CANCELLED`/`OBSOLETE` moments
@@ -700,14 +783,19 @@ access at all.
 1. **Claim.** `POST /jobs/claim` with your registered backend's `name` (as `backendId`) and a
    self-chosen `workerId` string.
    - `200` → you have `jobId`, `reviewId`, and a `payload` with `diff` + `promptVersion` +
-     `chunkContext` (V2, diff chunking — `null` unless this job is one chunk of a larger, split diff).
-     Build your prompt from these three fields only; substitute `chunkContext` into the resolved
-     template's `{{CHUNK_CONTEXT}}` placeholder exactly like `diff`/`{{DIFF}}` if the template has one.
-     You never need to know whether `jobId` represents a whole Review or one chunk of it — treat every
-     claimed job identically.
+     `chunkContext` (V2, diff chunking — `null` unless this job is one chunk of a larger, split diff) +
+     `systemMessages` (V3, Prompt Manager — `null` unless the Gateway has one enabled and resolved).
+     Substitute `chunkContext` into the resolved template's `{{CHUNK_CONTEXT}}` placeholder exactly like
+     `diff`/`{{DIFF}}` if the template has one and it's non-null. If `systemMessages` is non-null, use
+     each string **verbatim** as its own `system`-role chat message (or concatenate them if your backend
+     only accepts one `system` message) instead of your own bundled system template — do **not** run
+     these strings through any placeholder-substitution logic; they are already fully assembled. If it's
+     `null`, fall back to your own bundled system template exactly as before V3. You never need to know
+     whether `jobId` represents a whole Review or one chunk of it — treat every claimed job identically.
    - `204` → nothing to claim right now (empty queue, your backend isn't `ACTIVE`/is at capacity, or a
      transient lock contention). Wait (e.g. a few seconds) and poll again.
-2. **Run inference** against your local `llama-server` using the claimed `diff`/`promptVersion`/`chunkContext`.
+2. **Run inference** against your local `llama-server` using the claimed
+   `diff`/`promptVersion`/`chunkContext`/`systemMessages`.
 3. **Heartbeat roughly every 60 seconds** while generating: `POST /jobs/{id}/heartbeat` with the *same*
    `workerId` you claimed with.
    - `shouldContinue: false` → **stop generating immediately** and move on to claiming the next job; the
@@ -801,6 +889,14 @@ non-terminal chunk job in the same step for a multi-chunk Review.
   always rejected, an unresolvable host is treated as unsafe, and the host must also match
   `gateway.backend.allowed-host-pattern` (default permissive — **must** be tightened for production, see
   [§4.3](#43-deployment-must-dos-from-the-sast-report)). The probe client disables redirects.
+- **Prompt Manager (V3, optional) — split GitLab credentials and prompt-injection defenses.** When
+  enabled, prompt fetches use a **separate, read-only** GitLab token (`GITLAB_PROMPT_TOKEN`) over a
+  dedicated HTTP client, never the write-scoped `GITLAB_TOKEN` used for publishing comments — a leak of
+  one cannot be used to do the other's job. Project-supplied prompt content (untrusted by design, since
+  it's controlled by the same population whose code is under review) is read only from a project's own
+  default branch, wrapped in a non-forgeable delimiter, and framed by a fixed preamble/trailer the LLM
+  is told takes precedence. Full threat model: `docs/prompt-manager-threat-model.md` (PMT-01..25,
+  PMR-01..30) and its companion `docs/security/feature-prompt-manager-sast-report.md`.
 - **CI security gate** (this project's own build, not the product's GitLab integration):
   `.github/workflows/security-gate.yml` runs on every PR and push to `master` — `gitleaks` (secret
   scanning, full git history), `osv-scanner` over a CycloneDX SBOM (blocks on High/Critical CVEs),
@@ -848,3 +944,11 @@ non-terminal chunk job in the same step for a multi-chunk Review.
   `GET /backends`'s `running`/`capacity` fields) — all three collapse into the same `204`, by design.
 - **`500 INTERNAL_ERROR`.** The response body never explains why (SR-17: no internal detail leaks to
   the client) — check the Gateway's own logs, where the actual exception is logged server-side.
+- **Application won't start after setting `PROMPT_MANAGER_ENABLED=true`.** Provision the other two
+  required Prompt Manager variables too — `GITLAB_PROMPT_TOKEN` and `PROMPT_CORPORATE_PROJECT` have no
+  default once the feature is enabled (see [§4.4](#44-prompt-manager-v3-optional)).
+- **`502 PROMPT_RESOLUTION_FAILED` / `422 PROMPT_SOURCE_MISSING` / `422 PROMPT_SOURCE_INVALID` / `422
+  PROMPT_TOO_LARGE` / `503 PROMPT_RESOLUTION_SATURATED` on `POST /reviews`.** Only possible with Prompt
+  Manager enabled — see the table in [§6.1b](#61b-prompt-manager-and-system-prompt-assembly) for what
+  each one means and check server-side logs/`review_events` for the underlying cause (the response body
+  is deliberately generic, PMR-26).

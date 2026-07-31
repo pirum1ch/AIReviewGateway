@@ -4,13 +4,27 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repository state
 
-This repository currently contains only planning/specification documents — no source code, build files, or tests have been written yet:
+The staged build-out described below is **complete**. This is a working Java 21 / Spring Boot 3.2 repo,
+not a planning-only one:
 
-- `Требования_Review_Gateway_v2.md` — full functional/technical/security requirements (source of truth for behavior).
-- `# Итоговая архитектура AI Code Review Platform.md` — final architecture: component diagram, API contracts, state machine, DB schema, deployment model.
-- `Системный промт для генерации кода Review Gateway.md` — the staged code-generation brief this project is meant to be built from (Java 21 / Spring Boot 3.2).
+- `src/main/java/com/review/gateway/` — the Gateway (this repo's root Maven module): entities, Flyway
+  migrations, repositories, services, REST controllers, security config. Diff chunking (V2) and Prompt
+  Manager (V3, feature-flagged off by default) are both implemented on top of the original build-out.
+- `worker/` — a separate Maven module, the stateless LLM Worker (Executor) that claims jobs and calls
+  `llama-server`. See `worker/README.md`.
+- `README.md` (root) — the authoritative deployment/integration guide: every endpoint, config property,
+  and error code actually implemented. **Read this, not the original spec docs, for current behavior.**
+- `DEPLOYMENT.md` — step-by-step production deployment guide (secrets, PostgreSQL grants, systemd,
+  Docker Compose).
+- `docs/` — architecture and security artifacts per feature: `implementation-architecture.md`,
+  `threat-model.md`/`worker-threat-model.md` (baseline), `prompt-manager-architecture.md`/
+  `prompt-manager-threat-model.md` (V3), and per-feature SAST reports under `docs/security/`.
 
-Read the two spec files in full before generating code — they are the authoritative reference; the summary below is only for quick orientation.
+The original spec docs are still present at the repo root (`Требования_Review_Gateway_v2.md`, `#
+Итоговая архитектура AI Code Review Platform.md`, `Системный промт для генерации кода Review
+Gateway.md`) and remain the source of truth for *intended* behavior/requirements language, but for what
+is actually implemented, current config defaults, and API contracts, `README.md` + `DEPLOYMENT.md` +
+the code itself are authoritative — they get updated as features land; the spec docs do not.
 
 ## Build toolchain
 
@@ -79,6 +93,8 @@ Plus `CANCELLED` and `OBSOLETE`, reachable from any non-terminal state. All tran
 - `review_comments` — parsed comments (file/line/severity/text) plus `discussion_id` for idempotent publishing.
 - `review_events` — full audit trail (CREATED, CLAIMED, RUNNING, HEARTBEAT, RETRY, COMPLETED, PUBLISHED, FAILED, OBSOLETE).
 - `backends` — registry of llama-server instances: url, model, capacity, status (`ACTIVE/SUSPECT/MAINTENANCE/OFFLINE`), last_seen. Backend load is derived from the count of currently-running jobs, not a separate counter.
+- `review_chunks` (V2, diff chunking) — one row per file-based chunk when a diff is too large for one prompt; `review_jobs` is 1:N per Review once chunked.
+- `review_prompt_sections` (V3, Prompt Manager, feature-flagged) — immutable, append-only per-section snapshot of the Git-sourced system prompt actually used for a Review (source project/ref/commit, content hash), written once at Review creation and never mutated. `reviews.prompt_bundle_mode` (`NONE`/`REPO`) records whether a Review was created under this feature at all — see `docs/prompt-manager-architecture.md`.
 
 ## Retry / timeout / backend health
 
@@ -86,15 +102,29 @@ Plus `CANCELLED` and `OBSOLETE`, reachable from any non-terminal state. All tran
 - A job is considered stuck if `now - heartbeat_at` exceeds the configured interval (~3 min); it's returned to the queue. A separate max-total-duration cap is a backstop beyond heartbeat monitoring.
 - Backends flip `ACTIVE → SUSPECT` on health-check failure or unavailability and are excluded from new assignments; a periodic check auto-recovers `SUSPECT → ACTIVE`.
 
-## Code-generation workflow for this project
+## Workflow for new features on this project
 
-The system-prompt doc defines a staged build-out — when asked to "generate code" for this project without further qualification, follow this order and don't jump ahead of the requested stage:
+The original staged build-out (entities/migrations → repositories → services → controllers →
+config/security → tests) is done — it produced the current `master`. New work is a **feature**, not a
+from-scratch build, and goes through a security-gated SDLC on its own branch, driven by subagents (the
+user does not want the main assistant writing code itself for this project):
 
-1. JPA entities + Flyway migrations (schema matching the tables above exactly, plus status enums).
-2. Repositories (including the `FOR UPDATE SKIP LOCKED` claim query and dedup lookups).
-3. Services: `ReviewService`, `QueueManager`, `BackendDispatcher`, `RetryManager`, `TimeoutManager`, `GitLabPublisher`, `StateMachine`, plus `DeduplicationService`/`HeartbeatChecker`/`BackendHealthChecker`.
-4. REST controllers: `ReviewController`, `JobController`, `AdminController`, plus `@ControllerAdvice` error handling.
-5. Config/security: `SecurityConfig` (per-role token checks), `RestClient` setup for GitLab/llama-server calls (not the deprecated `RestTemplate`), `application.yml`, `@Scheduled` background jobs.
-6. (Optional) Integration tests with Testcontainers/PostgreSQL.
+1. `architect` — design/architecture for the feature, checked against the non-negotiable principles
+   above and the existing codebase (don't jump straight to backend-developer for anything non-trivial).
+2. `appsec-engineer` — pre-implementation threat model (extends the existing `docs/threat-model.md` /
+   `docs/worker-threat-model.md`; a feature gets its own `docs/<feature>-threat-model.md` if it's
+   substantial, e.g. `docs/prompt-manager-threat-model.md`).
+3. `backend-developer` — implementation, on `feature/<slug>` (see prior branches:
+   `feature/diff-chunking`, `feature/prompt-manager`). Commit regularly, in logical chunks.
+4. `qa-engineer` — functional/integration testing, beyond the developer's own unit tests.
+5. `appsec-engineer` — SAST/verification round; findings get their own
+   `docs/security/feature-<slug>-sast-report.md` (see the existing ones for format/numbering
+   convention — each feature gets its own prefix, e.g. `F-DC-`/`F-PM-`).
+6. `backend-developer` — fix round against the SAST findings.
+7. `appsec-engineer` — final verification; merge to `master` only after this passes.
 
-Code quality bar from the brief: Java 21, Spring Boot 3.2, constructor injection, `@Transactional` with correct isolation on services, all external calls wrapped with error handling (+ retry where appropriate), `record` for DTOs, INFO logging for main actions / DEBUG for details.
+Work only from the spec docs + what's already in the codebase — invent nothing beyond them; ask when in
+doubt, but keep working on other features while waiting. Code quality bar from the original brief still
+applies to all new code: Java 21, Spring Boot 3.2/3.5, constructor injection, `@Transactional` with
+correct isolation, external calls wrapped with error handling (+ retry where appropriate), `record` for
+DTOs, INFO logging for main actions / DEBUG for details.
