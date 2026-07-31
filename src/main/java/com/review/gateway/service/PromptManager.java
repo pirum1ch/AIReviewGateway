@@ -190,10 +190,15 @@ public class PromptManager {
             if (!hadProjectContent || !ON_ERROR_SKIP_OPTIONAL.equals(properties.getPrompt().getErrorHandling().getOnError())) {
                 throw tooLarge;
             }
-            log.warn("Assembled system prompt exceeds gateway.prompt.limits.max-system-prompt-tokens with "
-                    + "optional PROJECT_* sections included; dropping them and proceeding with the "
-                    + "corporate rulebook only (prompt_degraded=true)");
+            // The WARN is deliberately emitted *after* the corporate-only re-assembly succeeds: if that
+            // re-assembly throws instead, the overflow was attributable to the mandatory corporate
+            // content and this is a hard 422 -- logging "dropping them and proceeding" first would have
+            // described an outcome that never happened, in the one line an operator reads while
+            // diagnosing exactly that failure.
             resolved = assembler.assemble(corpBaseCandidate, corpRulesCandidate, null, null, true);
+            log.warn("Assembled system prompt exceeds gateway.prompt.limits.max-system-prompt-tokens with "
+                    + "optional PROJECT_* sections included; dropped them and proceeded with the "
+                    + "corporate rulebook only (prompt_degraded=true)");
         }
         return new PromptResolution(PromptBundleMode.REPO, resolved.sections(), resolved.estimatedTokens(),
                 resolved.degraded(), List.copyOf(explicitPathsMissing));
