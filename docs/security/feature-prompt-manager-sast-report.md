@@ -1,5 +1,12 @@
 # AppSec SAST Report — feature/prompt-manager (V3: repo-sourced system prompts)
 
+> **STATUS (final): RELEASE GATE OPEN — approved for merge into `master` (verified at `ac4481c`).**
+> Everything below up to "Fixes applied by appsec in this round" is the **round-1** report (verdict
+> *NEEDS A DEV PASS*), kept verbatim as the historical record. The backend-developer fix round and my
+> line-by-line verification of it are in
+> [Round 2 — final verification / release gate](#round-2--final-verification--release-gate) at the end
+> of this document. Read that section for the current status of every finding.
+
 Scope: `master..feature/prompt-manager`, HEAD `6a4dcef` at the start of this round, tree clean apart from
 the three untracked design docs. 9 commits (`7fb03a8`/`eab00a7`/`270e58c`/`2e5f822` dev → `8947483` docs →
 `8c087ff` dev self-review → `8ef36b2`/`ad17cb8`/`6a4dcef` QA), 75 files, +5375/−144. In scope: the new
@@ -31,7 +38,7 @@ from `.github/workflows/security-gate.yml`) over `src/main/java` + `worker/src/m
 verified-clean baseline (`git diff 813ae61 HEAD -- pom.xml worker/pom.xml` is empty) — no new direct or
 transitive dependency, so the feature-diff-chunking dependency verdict carries over unchanged.
 
-## Verdict: **NEEDS A DEV PASS** — 1 Medium release blocker (deployability), 1 Medium fixed here, plus 6 should-/nice-to-fix.
+## Round-1 verdict (superseded by Round 2 below): **NEEDS A DEV PASS** — 1 Medium release blocker (deployability), 1 Medium fixed here, plus 6 should-/nice-to-fix.
 
 Severity counts: Critical 0 · High 0 · **Medium 2** (1 fixed by me) · Low 2 (1 fixed by me) · Info 8.
 
@@ -298,3 +305,246 @@ No other production code was touched. The six throwaway probes were run under `s
 | Gateway, post-fix, run #2 | **`Tests run: 525, Failures: 0, Errors: 0, Skipped: 0`** — BUILD SUCCESS |
 
 525 = 516 + the 9 regression tests added with the three fixes above.
+
+---
+---
+
+# Round 2 — final verification / release gate
+
+**Scope:** `ebc598c..eb13bd3` — the backend-developer fix round: 7 commits, 20 files, +649/−60, plus one
+follow-up commit of my own (below). `git diff ebc598c HEAD -- worker/` is **empty** and
+`git diff 813ae61 HEAD -- pom.xml worker/pom.xml` is **empty**.
+
+**Method:** every commit read as its actual diff *and* as the resulting file state — commit messages
+were treated as claims to check, not as evidence. Both suites, semgrep (the exact SR-23 gate config) and
+gitleaks (full history) were re-run by me. Specifically hunted for fix-induced defects: a widened `catch`
+swallowing more than intended, a sanitizer applied where it changes an outbound identifier, a claim-time
+cap that can silently drop a mandatory row, a "flaky test fix" that is really a relaxed assertion, and a
+config default that disagrees with its own properties class.
+
+## Fix-by-fix verdicts
+
+| Finding | Sev | Fix commit | Verdict |
+|---|---|---|---|
+| **F-PM-02** | Medium (release blocker) | `be4722a` | **CONFIRMED** |
+| **F-PM-03** | Low | `a36459a` | **CONFIRMED** (+ one log-accuracy nit fixed by me) |
+| **F-PM-06** | Info | `632a433` | **CONFIRMED** |
+| **F-PM-10** | Info | `293e160` | **CONFIRMED** |
+| **F-PM-07** | Info | `e67c448` | **CONFIRMED** for the cardinality cap; byte-total clause closed as an accepted deviation |
+| **F-PM-08** | Info | `e67c448` | **CONFIRMED** (one residual recorded, DB-write precondition) |
+| **F-PM-09 / F-PM-11** | Info | `5b7186f` | **CONFIRMED as deferrals** — which is how they were classified; no behavior change, in-code triggers |
+| **F-PM-12** | Info (test) | `eb13bd3` | **CONFIRMED**, and the fix is the right kind — nothing was relaxed |
+
+### F-PM-02 — `application.yml` wiring + shipped default (Medium, release blocker) — CONFIRMED
+
+- The full `gateway.prompt.*` tree is in `src/main/resources/application.yml`, env-overridable throughout,
+  plus `gateway.gitlab.prompt-token: ${GITLAB_PROMPT_TOKEN:}`. `PROMPT_MANAGER_ENABLED`,
+  `PROMPT_CORPORATE_PROJECT`, `PROMPT_CORPORATE_REF`, the two corporate path vars and `PROMPT_ON_ERROR`
+  now genuinely bind.
+- The Java default was flipped `true → false`. I did not stop at that one key: I diffed **every** default
+  in the `Prompt` tree against the YAML — `enabled`, `corporate.ref`, both corporate paths,
+  `project.enabled`, both project paths, `error-handling.on-error`, `message-format`,
+  `section-separator`, all five `limits.*`, all three timeouts — and they agree value for value. The
+  defect *class* (properties class and YAML disagreeing, F-DC-04 one feature earlier) is closed for the
+  whole subtree, not just the key that surfaced it.
+- **`ApplicationYamlBootTest` really does boot the production YAML**, and I verified that mechanically
+  rather than by reading the file path: `spring.config.location=file:${user.dir}/src/main/resources/application.yml`
+  *replaces* the default `classpath:/application.yml` location, so `src/test/resources/application.yml`
+  cannot be what is read — and the test's own assertions make this a proof by contradiction.
+  `promptManagerOptedInWithItsOwnDocumentedEnvVarsAlsoBootsCleanly` asserts `enabled == true` under
+  `PROMPT_MANAGER_ENABLED=true`, which is unsatisfiable **(a)** against the test YAML, which pins
+  `gateway.prompt.enabled: false` as a literal with no placeholder, and **(b)** with no YAML at all, since
+  the Java default is `false` and `PROMPT_MANAGER_ENABLED` is not a relaxed-binding spelling of
+  `gateway.prompt.enabled` (that would be `GATEWAY_PROMPT_ENABLED`). The corporate-project assertion is
+  unsatisfiable the same two ways. Both states are covered — opted-out (stock) and opted-in — plus
+  opted-in-without-a-token still failing fast, which is the guard that keeps the fix from turning into a
+  silent no-op.
+- `DEPLOYMENT.md` no longer contradicts the code: §2 is rewritten around off-by-default with an opt-in
+  checklist (token + `PROMPT_CORPORATE_PROJECT` + the optional `PROMPT_ON_ERROR`), and both env-file
+  appendices (§4.1, §10.1) carry the three variables commented out. Grep-verified: no remaining sentence
+  claims `enabled` defaults to `true`.
+- **On the deployment-policy call itself** (shipping `false`, deviating from the architecture doc's
+  `${PROMPT_MANAGER_ENABLED:true}` example): I agree with it, and it is the choice I would have made.
+  Upgrade-safety wins here precisely because "off" is *not* silent in this design — PMR-10 makes it loud
+  in all three channels, and the startup WARN now fires on the **default** path rather than only on a
+  deliberate opt-out. **Runbook consequence, not a finding:** the feature ships inert, so go-live must
+  include actually setting `PROMPT_MANAGER_ENABLED=true` once the corporate prompt repo exists —
+  otherwise the control this branch exists to add is present in the code and absent in production.
+
+### F-PM-03 — oversized *optional* project section (Low) — CONFIRMED
+
+- The developer took the strong form, not the cheap one. `PromptAssembler.assemble` still throws
+  unconditionally (behavior unchanged, and the reason is now on its javadoc); `PromptManager` is the only
+  place that *interprets* the throw, and it degrades **only after a corporate-only re-assembly
+  demonstrably fits**. A corporate-only overflow therefore cannot be absorbed, by two independent paths:
+  `!hadProjectContent` rethrows immediately, and the attribution re-assembly's own throw propagates.
+- That second path is the one a weak fix would have gotten wrong (dropping the project sections *first*
+  and never re-checking), and it is pinned by a test that exists specifically to catch it —
+  `oversizedCorporateContentAloneAlwaysFailsEvenWhenAProjectSectionIsAlsoPresent`. PMR-21's
+  "never silently truncate the corporate rulebook" is intact.
+- `on-error=FAIL` is unaffected (rethrow), and the degradation is auditable: `degraded=true` flows
+  `ResolvedSystemPrompt` → `PromptResolution` → `review_inputs.prompt_degraded`.
+- **Nit found and fixed by me** (commit `ac4481c`, no behavior change): the WARN was emitted *before* the
+  attribution re-assembly, so a corporate-only overflow logged "dropping them and proceeding with the
+  corporate rulebook only" and then 422'd — describing an outcome that never happened, in the one line an
+  operator reads while diagnosing exactly that failure. Moved after the successful re-assembly.
+
+### F-PM-06 — GitLab-supplied `default_branch` sanitization (Info) — CONFIRMED
+
+- One entry point (`resolveDefaultBranch`, grep-confirmed as the only caller of the project-lookup
+  endpoint), the **shared** `TextSanitizer.sanitizePath(…, 200)` — not a second implementation.
+  `TextSanitizer` itself does not appear in this round's diff at all, which is exactly the outcome the
+  finding asked for.
+- Sanitized *before* it is persisted as `source_ref`, before any `toString()` rendering, and before it
+  keys the subsequent commit-SHA/file fetches — sanitized at the boundary, not masked at each renderer.
+  The 200-char cap sits below `source_ref VARCHAR(256)`, which closes the secondary
+  `DataIntegrityViolationException`-misread-as-dedup-race path the finding named.
+- Fails **closed** when nothing publishable survives (`PromptSourceUnavailableException`) rather than
+  returning `null`/`""` — that was the specific failure mode worth checking in a sanitize-at-boundary fix.
+  Three tests, including a Trojan-Source U+202E case and the sanitizes-to-nothing case.
+- **Accepted residual (Info, no action):** git permits `<`/`>` in ref names and `sanitizePath` strips
+  them, so a branch literally named `feat<x>` would be looked up under a ref GitLab does not have →
+  `PromptSourceUnavailable` (502, or a degrade under `SKIP_OPTIONAL`). Fails closed, effectively
+  unreachable in practice, and the alternative — a branch-specific sanitizer — would re-fork the shared
+  helper this very finding asked the code to converge on.
+
+### F-PM-10 — `followRedirects(NEVER)` on the write client (Info) — CONFIRMED
+
+All three `HttpClient` beans now pin it explicitly (`RestClientConfig` `gitLabRestClient:37`,
+`gitLabPromptRestClient:65`, `backendProbeRestClient:84`). QA's transport-level test now guards a stated
+contract instead of a JDK default, and its javadoc was updated to say so rather than left describing the
+old situation.
+
+### F-PM-07 — claim-time `max-sections` (Info) — CONFIRMED (cardinality); byte-total accepted as delegated
+
+- `max-sections` is no longer dead config: enforced in `PromptMessageFormatter.render`, ordinal-ascending
+  so `CORPORATE_*` survives truncation. The part that actually matters is that the truncation cannot open
+  a hole — dropping below the mandatory pair falls straight into the pre-existing PMR-09 fail-closed
+  check, pinned by `rowCountOverMaxSectionsThatDropsBelowMandatoryCorporateStillFailsClosed`.
+- PMR-08's other clause (a total-assembled-byte cap at claim time) is **not** implemented, and I am
+  closing it as an accepted deviation rather than carrying it as a follow-up: the bound already exists
+  twice — at create time (the 6000-token aggregate, which is what actually sizes the payload) and,
+  independently of the Gateway, at the Worker (`max-system-messages = 8` plus `systemMessages` bytes
+  folded into `max-diff-bytes`). A third check on the same value in between would add config surface
+  without adding a bound.
+
+### F-PM-08 — delimiter wrapping re-derived from `kind` at claim time (Info) — CONFIRMED
+
+- Claim-time rendering now re-derives the PMR-02 wrapping via `PromptAssembler.isDelimited` /
+  `delimitedBlock` instead of trusting what was stored: an unwrapped `PROJECT_*` row is re-wrapped with a
+  WARN, an already-wrapped one is not double-wrapped (both tested). Driven by `kind`, not by insertion
+  order or stored text — the property the finding asked for.
+- **Residual, recorded not fixed (Info):** the re-wrap path does not re-sanitize the body, and
+  `isDelimited` only checks the outer prefix/suffix, so a row whose stored content carries an *interior*
+  U+241E sequence could still forge a boundary. Reaching that state requires direct DB write access to
+  `review_prompt_sections` — the only in-process writer is `PromptAssembler`, downstream of
+  `TextSanitizer`, and there is no dynamic SQL anywhere on this path — i.e. an attacker who already owns
+  the database, at which point the corporate sections themselves are editable and this is the lesser
+  problem. If it is ever cheap: `delimitedBlock(kind, textSanitizer.sanitizeSectionText(body))` on both
+  branches would make the rendered output structurally *exactly* two delimiter lines regardless of row
+  state. I deliberately did not take the constructor churn for it at the release gate.
+
+### F-PM-09 / F-PM-11 — deferred design decisions (Info) — CONFIRMED as deferrals
+
+No behavior change (verified: the diff is javadoc/comments in four files). Each deferral carries the
+project's existing convention — the decision, why it is a policy call rather than a defect fix, and an
+explicit re-evaluation trigger. F-PM-09's second half (the `total-timeout + read-timeout` worst case) is
+now stated on `Prompt#totalTimeout`; that was the only part of it that was a documentation gap rather
+than a design choice. I agree with deferring the first half: making a deadline breach hard-fail under
+`SKIP_OPTIONAL` narrows an availability guarantee for production traffic, which belongs in a deliberate
+change, not in a fix-round.
+
+### F-PM-12 — flaky concurrency test (Info, test defect) — CONFIRMED, and the fix is sound
+
+I checked specifically for the failure mode this task named — a flaky test "fixed" by weakening it. **It
+is not that.** No timeout was raised, no assertion weakened, no status added to `recordIfUnexpected`'s
+whitelist. The only change is the test backend's capacity (`10` → `iterations * 3 + 10` = 34), which
+removes the unrelated confound (leaked `RUNNING` jobs starving the dispatcher, so `/jobs/claim` correctly
+answered `204`) so the test can only fail for the reason it names. Every real assertion — no deadlock
+500s, no unexpected statuses, every chunk claimable — is intact and now actually exercised, and the
+arithmetic is written down in a comment so it stays fixed. This is option 1 of the three I offered;
+option 3 (assert on the RUNNING count so the real cause is reported) would still be better diagnostics,
+but is not required. The test was green in both of my full-suite runs.
+
+## Findings open after this round
+
+**None blocking.** All Info, all recorded here or in-code with triggers: F-PM-07's byte-total clause
+(accepted deviation), F-PM-08's interior-delimiter residual (DB-write precondition), F-PM-06's
+`<`/`>`-in-a-branch-name residual (fails closed), F-PM-09 / F-PM-11 (deferred), PMR-12/20/27/28/29
+(tracked SHOULDs), PMR-07's grant-verification runbook step, and the pre-existing carried-forward set
+(F03-01…F03-06, PMT-08's shared-CI-token residual, PMT-23).
+
+**New findings this round: none.** Nothing the fix round missed, and nothing it got wrong.
+
+## PMR delta vs. round 1
+
+| PMR | Round 1 | Now |
+|---|---|---|
+| **PMR-08** | PARTIAL (claim-time cap unimplemented, dead config key) | **PASS** — cardinality enforced at claim time; byte total accepted as delegated (F-PM-07) |
+| **PMR-15** | PASS, but the env-only clause was literally unimplemented | **PASS** — `GITLAB_PROMPT_TOKEN` → `gateway.gitlab.prompt-token` binds for real |
+| **PMR-16** | PASS (write client inherited the JDK default) | **PASS** — both GitLab clients pin `NEVER` explicitly |
+| **PMR-25** | PASS with one clause open (`default_branch`) | **PASS** — sanitized at its boundary |
+| **PMR-21** | PASS | **PASS** — unchanged; the `SKIP_OPTIONAL` degradation was added *without* weakening "never silently truncate the corporate rulebook" (proven by the attribution tests) |
+| **PMR-07 / PMR-11** | PARTIAL | PARTIAL, unchanged and **accepted** (assembled-output hash, metric label dimensions — deferred with triggers) |
+| PMR-12/20/27/28/29 (SHOULD) | tracked | tracked, unchanged |
+
+**All 25 blocking MUSTs are now closed** (round 1: 23 of 25).
+
+## Non-regression set — explicitly re-verified at HEAD
+
+The starting point that makes this both cheap and reliable: `git diff ebc598c HEAD -- worker/` is
+**empty**, so every Worker-side control carries over by construction rather than by re-reading, and
+`pom.xml`/`worker/pom.xml` are byte-identical to the verified-clean baseline.
+
+| Control | Verdict | Evidence |
+|---|---|---|
+| **WSR-01** `promptVersion` allowlist | **PASS** | `PROMPT_VERSION_PATTERN` + the explicit `..` rejection unchanged (`PromptTemplateService:57`, `:132-133`); Worker tree untouched this round. |
+| **WSR-02 / CSR-08** single-pass substitution, `systemMessages` outside it | **PASS** | `substitute()` unchanged; `systemMessages` still become `ChatMessage`s directly, never entering the matcher. Worker tree untouched. |
+| **CSR-09 / CSR-10 + F-DC-02** path sanitization | **PASS** | `TextSanitizer` and `ChunkContextRenderer` are both **absent from this round's diff** — F-PM-06 *consumed* the shared helper instead of editing or forking it, which is precisely what the finding asked for. |
+| **SR-10** templated URI segments | **PASS** | The four URI templates are unchanged constants; the one new value reaching a path (the sanitized `default_branch`) is still a template variable, never concatenated. semgrep `p/java`+`p/sql-injection`: 0 findings. |
+| **SR-11** edge body cap | **PASS** | This round's `application.yml` diff is **+43/−0** — nothing removed or altered; `max-request-body-bytes` (320000 / 500000) untouched and `RequestBodySizeLimitFilter` is not in the diff. |
+| **SR-12 / SR-14** no tokens or content in logs | **PASS** | The three new log statements emit: an int pair (row count / cap), a `kind` enum, and one fixed string. No section content, no repo path, no token, no branch name. `promptToken` still masked in `GitLab.toString()`; gitleaks clean over the full history including the new commits. |
+| **F-DC-06** no attacker-controlled text in HTTP error bodies | **PASS** | The one new exception message ("GitLab project lookup returned a `default_branch` with no publishable content") is a `PromptSourceUnavailableException`, whose handler discards `getMessage()` and returns the fixed `PROMPT_RESOLUTION_FAILED` body. No new message interpolates external input. |
+| **F-DC-07** masked `toString()` on content-carrying DTOs | **PASS** | No new content-carrying DTO; `SectionCandidate`/`AssembledSection`/`ResolvedSystemPrompt` masking intact (`PromptAssembler`'s diff is the `isDelimited` helper plus javadoc). |
+
+## Scanners and suites — run by me in this round
+
+| Check | Result |
+|---|---|
+| **semgrep**, the exact SR-23 gate config (`p/java` + `p/sql-injection` + `p/secrets`, `--error --severity ERROR`) over `src/main/java` + `worker/src/main/java` | **0 findings** — 147 files, ~100 % parsed, 56 rules run |
+| **gitleaks** `git --redact -c .gitleaks.toml` over the **full history** (73 commits) | **no leaks found** |
+| **SCA** | `pom.xml` / `worker/pom.xml` byte-identical to the verified-clean baseline — no new direct or transitive dependency; previous verdict carries |
+| Gateway `mvn -o test` at `eb13bd3` | **`Tests run: 540, Failures: 0, Errors: 0, Skipped: 0`** — BUILD SUCCESS |
+| Worker `mvn -o -f worker/pom.xml test` | **`Tests run: 125, Failures: 0, Errors: 0, Skipped: 0`** — BUILD SUCCESS |
+| Gateway `mvn -o test` after my `ac4481c` log fix | **`Tests run: 540, Failures: 0, Errors: 0, Skipped: 0`** — BUILD SUCCESS |
+| `ClaimCancelObsoleteConcurrencyTest` | green in **both** full-suite runs — F-PM-12's intermittent failure did not reproduce |
+
+540 = 525 (round-1 post-fix) + the 15 regression tests the fix round added (3 boot, 4 too-large, 3
+default-branch, 3 max-sections, 2 delimiter re-derivation).
+
+**SR-23 CI gate posture: green** on all six jobs. As in round 1, none of this round's findings was
+machine-detectable by the gate — but F-PM-02 now *is*, because `ApplicationYamlBootTest` turned it into a
+mechanical check. That is the single most valuable artifact this fix round produced: the next time
+someone adds a config key to the properties class and forgets the YAML, a test fails instead of a
+deployment.
+
+## Verdict: **READY TO MERGE**
+
+Every finding from round 1 is closed, deferred with an explicit in-code trigger, or accepted as a
+documented deviation — and each fix was verified against the code, not the commit message. The two fixes
+that could plausibly have been done in a way that *looked* right and was not — F-PM-03's degradation
+(could have quietly swallowed a corporate-content overflow) and F-PM-12's flaky test (could have been a
+relaxed assertion) — were both done in the strong form, with the adversarial case explicitly pinned by a
+test. The blocker, F-PM-02, was fixed *and* the defect class behind it was closed for the whole property
+subtree, with a boot test that makes the next occurrence a failing build rather than a failed deploy.
+
+No further appsec round is required before merge. Two things belong on the **go-live checklist**, not on
+the merge decision:
+
+1. **The feature ships inert.** `PROMPT_MANAGER_ENABLED` defaults to `false`; production must set it to
+   `true` (with `GITLAB_PROMPT_TOKEN` + `PROMPT_CORPORATE_PROJECT` provisioned) or the control does not
+   exist in production. The startup WARN, `/metrics` and the per-Review `PROMPT_DISABLED` event are what
+   keep that visible — verify they are actually being read.
+2. **PMR-07's grant step** (`GRANT SELECT, INSERT ON review_prompt_sections`, `DEPLOYMENT.md:229`) has no
+   automated enforcement; add the `\dp` verification step to the deploy checklist, as already applies to
+   `review_events` under SR-19.
