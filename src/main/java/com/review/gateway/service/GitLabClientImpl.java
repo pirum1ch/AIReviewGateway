@@ -46,13 +46,17 @@ public class GitLabClientImpl implements GitLabClient {
     private static final String PROJECT_PATH = "/projects/{projectRef}";
     /** PMR-13: {@code commitSha} must be pinned to this shape before it ever reaches a URI. */
     private static final java.util.regex.Pattern COMMIT_SHA_PATTERN = java.util.regex.Pattern.compile("^[0-9a-f]{40}$");
+    /** F-PM-06: {@code reviews.source_ref}/{@code review_prompt_sections.source_ref} column width. */
+    private static final int MAX_DEFAULT_BRANCH_LENGTH = 200;
 
     private final RestClient gitLabRestClient;
     private final RestClient gitLabPromptRestClient;
+    private final TextSanitizer textSanitizer;
 
-    public GitLabClientImpl(RestClient gitLabRestClient, RestClient gitLabPromptRestClient) {
+    public GitLabClientImpl(RestClient gitLabRestClient, RestClient gitLabPromptRestClient, TextSanitizer textSanitizer) {
         this.gitLabRestClient = gitLabRestClient;
         this.gitLabPromptRestClient = gitLabPromptRestClient;
+        this.textSanitizer = textSanitizer;
     }
 
     @Override
@@ -99,6 +103,18 @@ public class GitLabClientImpl implements GitLabClient {
         }
     }
 
+    /**
+     * F-PM-06/PMR-25: {@code default_branch} is GitLab-repo-controlled (project-maintainer, not
+     * MR-author, but still external input), same class of value as the MR target-branch name PMR-25
+     * already required sanitization for. Sanitized here, once, at the single point this value first
+     * enters the process (grep-verified: {@code resolveDefaultBranch} is the only caller of the GitLab
+     * project-lookup endpoint) -- before it is ever persisted ({@code source_ref}), rendered into a
+     * {@code toString()}, or used to key the subsequent commit-SHA/file-fetch calls. Same {@link
+     * TextSanitizer} entry point section text uses, not a second implementation of the same stripping
+     * logic (Cc/Cf/Zl/Zp, length-capped) -- {@link TextSanitizer#sanitizePath} rather than {@link
+     * TextSanitizer#sanitizeSectionText} because a branch name, like a file path, has no legitimate
+     * newline.
+     */
     @Override
     public String resolveDefaultBranch(String projectRef) {
         try {
@@ -109,7 +125,14 @@ public class GitLabClientImpl implements GitLabClient {
             if (response == null || response.defaultBranch() == null || response.defaultBranch().isBlank()) {
                 throw new PromptSourceUnavailableException("GitLab project lookup returned no default_branch");
             }
-            return response.defaultBranch();
+            String sanitized = textSanitizer.sanitizePath(response.defaultBranch(), MAX_DEFAULT_BRANCH_LENGTH);
+            if (sanitized == null) {
+                // Nothing publishable survived sanitization (e.g. a branch name made entirely of
+                // control/format characters) -- treat exactly like "no default_branch returned" above.
+                throw new PromptSourceUnavailableException(
+                        "GitLab project lookup returned a default_branch with no publishable content");
+            }
+            return sanitized;
         } catch (RestClientException failure) {
             log.warn("GitLab default-branch resolution failed: {}", failure.getClass().getSimpleName());
             throw new PromptSourceUnavailableException("Failed to resolve default branch for prompt source", failure);

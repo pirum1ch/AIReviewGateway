@@ -42,7 +42,7 @@ class GitLabClientImplTest {
                 .defaultHeader("PRIVATE-TOKEN", "test-gitlab-prompt-token-01234567890");
         promptMockServer = MockRestServiceServer.bindTo(promptBuilder).build();
 
-        client = new GitLabClientImpl(builder.build(), promptBuilder.build());
+        client = new GitLabClientImpl(builder.build(), promptBuilder.build(), new TextSanitizer());
     }
 
     // ---- postDiscussion (existing behavior, unchanged) ----
@@ -179,6 +179,53 @@ class GitLabClientImplTest {
     void resolveDefaultBranch404IsUnavailable() {
         promptMockServer.expect(requestTo(BASE_URL + "/projects/42"))
                 .andRespond(withStatus(org.springframework.http.HttpStatus.NOT_FOUND));
+
+        assertThatThrownBy(() -> client.resolveDefaultBranch("42"))
+                .isInstanceOf(PromptSourceUnavailableException.class);
+    }
+
+    /**
+     * F-PM-06 regression: {@code default_branch} is repo-controlled input (PMR-25), sanitized at its
+     * single entry point via the same {@link TextSanitizer} section text uses -- a bidi-override
+     * character (Trojan-Source class, U+202E here) must not survive into the returned branch name.
+     */
+    @Test
+    void resolveDefaultBranchStripsControlAndFormatCharacters() {
+        String rawBranch = "featu‮re/evil";
+        promptMockServer.expect(requestTo(BASE_URL + "/projects/42"))
+                .andExpect(method(GET))
+                .andRespond(withSuccess("{\"id\": 42, \"default_branch\": \"" + rawBranch + "\"}",
+                        MediaType.APPLICATION_JSON));
+
+        String branch = client.resolveDefaultBranch("42");
+
+        assertThat(branch).isEqualTo("feature/evil");
+        assertThat(branch).doesNotContain("‮");
+    }
+
+    /** F-PM-06: caps at 200 chars, below {@code reviews.source_ref VARCHAR(256)}, never overflows the column. */
+    @Test
+    void resolveDefaultBranchCapsExcessiveLength() {
+        String rawBranch = "f".repeat(400);
+        promptMockServer.expect(requestTo(BASE_URL + "/projects/42"))
+                .andExpect(method(GET))
+                .andRespond(withSuccess("{\"id\": 42, \"default_branch\": \"" + rawBranch + "\"}",
+                        MediaType.APPLICATION_JSON));
+
+        String branch = client.resolveDefaultBranch("42");
+
+        assertThat(branch).hasSize(200);
+        assertThat(branch).endsWith("...");
+    }
+
+    /** F-PM-06 scope guard: a branch name that sanitizes to nothing publishable is treated as unavailable, not blank/null. */
+    @Test
+    void resolveDefaultBranchThatSanitizesToNothingIsUnavailable() {
+        String rawBranch = "‮‮‮"; // entirely bidi-override control characters
+        promptMockServer.expect(requestTo(BASE_URL + "/projects/42"))
+                .andExpect(method(GET))
+                .andRespond(withSuccess("{\"id\": 42, \"default_branch\": \"" + rawBranch + "\"}",
+                        MediaType.APPLICATION_JSON));
 
         assertThatThrownBy(() -> client.resolveDefaultBranch("42"))
                 .isInstanceOf(PromptSourceUnavailableException.class);
