@@ -1,9 +1,17 @@
 package com.review.gateway.config;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.slf4j.LoggerFactory;
 
 import java.time.Duration;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
@@ -12,6 +20,20 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  * is on — see {@link GatewayPropertiesValidationTest} for the pre-existing SR-01/SR-15 tokens/URL rules.
  */
 class GatewayPropertiesPromptValidationTest {
+
+    private ListAppender<ILoggingEvent> logAppender;
+
+    @BeforeEach
+    void setUpLogCapture() {
+        logAppender = new ListAppender<>();
+        logAppender.start();
+        ((Logger) LoggerFactory.getLogger(GatewayProperties.class)).addAppender(logAppender);
+    }
+
+    @AfterEach
+    void tearDownLogCapture() {
+        ((Logger) LoggerFactory.getLogger(GatewayProperties.class)).detachAppender(logAppender);
+    }
 
     private GatewayProperties validProperties() {
         GatewayProperties properties = new GatewayProperties();
@@ -41,6 +63,31 @@ class GatewayPropertiesPromptValidationTest {
         properties.getPrompt().getCorporate().setProject(null); // would otherwise fail
 
         assertThatCode(properties::validateOnStartup).doesNotThrowAnyException();
+    }
+
+    /** PMR-10: the kill-switch being off must be logged at WARN on startup, not silent. */
+    @Test
+    void disabledKillSwitchLogsAWarningOnStartup() {
+        GatewayProperties properties = validProperties();
+        properties.getPrompt().setEnabled(false);
+
+        properties.validateOnStartup();
+
+        boolean warnedAboutKillSwitch = logAppender.list.stream()
+                .anyMatch(event -> event.getLevel() == Level.WARN
+                        && event.getFormattedMessage().contains("gateway.prompt.enabled=false"));
+        assertThat(warnedAboutKillSwitch).isTrue();
+    }
+
+    @Test
+    void enabledKillSwitchNeverLogsTheDisabledWarning() {
+        GatewayProperties properties = validProperties();
+
+        properties.validateOnStartup();
+
+        boolean warnedAboutKillSwitch = logAppender.list.stream()
+                .anyMatch(event -> event.getFormattedMessage().contains("gateway.prompt.enabled=false"));
+        assertThat(warnedAboutKillSwitch).isFalse();
     }
 
     // ---- PMR-14: project references only, never a URL/host ----

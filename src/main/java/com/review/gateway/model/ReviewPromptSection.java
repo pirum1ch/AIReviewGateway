@@ -26,6 +26,13 @@ import java.util.Objects;
  * that a configured/optional source was looked up and not found, never silence). {@code
  * content_sha256} is computed over the exact stored (post-sanitization) bytes (PMR-07), enabling the
  * assembled prompt to be reconstructed and verified from the DB alone.
+ *
+ * <p>ponytail: PMR-29 (SHOULD) — no retention/cleanup job nulls {@code content} for terminal Reviews
+ * yet (would fold into the existing SR-22 retention policy, which this codebase has not itself
+ * implemented as a scheduled job either — no precedent to extend). At ~4 rows × 30 Reviews/day this is
+ * ~44k rows/year of provenance metadata plus duplicated repo content (architecture §11) — add the
+ * purge job once at-rest volume or the SR-18 exposure window actually becomes a concern in practice,
+ * not preemptively.
  */
 @Entity
 @Table(name = "review_prompt_sections")

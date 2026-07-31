@@ -44,6 +44,8 @@ public class GitLabClientImpl implements GitLabClient {
     private static final String COMMITS_PATH = "/projects/{projectRef}/repository/commits/{ref}";
     private static final String RAW_FILE_PATH = "/projects/{projectRef}/repository/files/{filePath}/raw?ref={commitSha}";
     private static final String PROJECT_PATH = "/projects/{projectRef}";
+    /** PMR-13: {@code commitSha} must be pinned to this shape before it ever reaches a URI. */
+    private static final java.util.regex.Pattern COMMIT_SHA_PATTERN = java.util.regex.Pattern.compile("^[0-9a-f]{40}$");
 
     private final RestClient gitLabRestClient;
     private final RestClient gitLabPromptRestClient;
@@ -128,9 +130,17 @@ public class GitLabClientImpl implements GitLabClient {
      * {@code maxBytes + 1} — never buffered into a {@code String}/{@code byte[]} first and checked after
      * (F-DC-01's mistake, one feature later). {@code Content-Length}, when present, is checked first as a
      * cheap early reject.
+     *
+     * <p>PMR-13: {@code commitSha} is pinned to {@code ^[0-9a-f]{40}$} before it ever reaches the URI —
+     * defense in depth: every caller of this method only ever passes through a value this class's own
+     * {@link #resolveCommitSha} just returned (never client input), but a URI-construction safety net
+     * must not implicitly trust that invariant forever.
      */
     @Override
     public Optional<String> fetchRawFile(String projectRef, String filePath, String commitSha, int maxBytes) {
+        if (commitSha == null || !COMMIT_SHA_PATTERN.matcher(commitSha).matches()) {
+            throw new PromptSourceUnavailableException("commitSha does not match the expected ^[0-9a-f]{40}$ shape");
+        }
         try {
             return gitLabPromptRestClient.get()
                     .uri(RAW_FILE_PATH, projectRef, filePath, commitSha)

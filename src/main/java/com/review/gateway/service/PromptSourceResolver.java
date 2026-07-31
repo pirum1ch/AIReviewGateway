@@ -11,6 +11,15 @@ import java.util.Optional;
  * branch, or an operator-pinned {@code ref} on an override — never the MR's own target/source branch).
  * No network I/O; every method here reads only already-loaded, deploy-time-validated
  * {@link GatewayProperties}.
+ *
+ * <p>ponytail: the architecture doc's §0.1/PMR-05 also allows an <em>optional</em> "verified-protected
+ * target branch" mode (resolve the MR's own target branch only when {@code GET
+ * /projects/{id}/protected_branches/{name}} confirms it is protected, falling back to the default
+ * branch otherwise, with a {@code PROMPT_REF_FALLBACK} event). That mode is deliberately not
+ * implemented here — this resolver only ever uses the project's own resolved default branch (or an
+ * operator-pinned override ref), which fully satisfies PMR-05's MUST ("never from an unprotected,
+ * MR-author-chosen ref") with less surface area. Add the protected-target-branch mode only if a real
+ * per-release-branch review-rules requirement shows up.
  */
 @Service
 public class PromptSourceResolver {

@@ -189,11 +189,11 @@ class GitLabClientImplTest {
     @Test
     void fetchRawFileReturnsDecodedContentOnSuccess() {
         promptMockServer.expect(requestTo(
-                        BASE_URL + "/projects/42/repository/files/prompts%2Fbase.md/raw?ref=abc123"))
+                        BASE_URL + "/projects/42/repository/files/prompts%2Fbase.md/raw?ref=a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"))
                 .andExpect(method(GET))
                 .andRespond(withSuccess("hello prompt content", MediaType.TEXT_PLAIN));
 
-        Optional<String> content = client.fetchRawFile("42", "prompts/base.md", "abc123", 1000);
+        Optional<String> content = client.fetchRawFile("42", "prompts/base.md", "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2", 1000);
 
         assertThat(content).contains("hello prompt content");
     }
@@ -201,10 +201,10 @@ class GitLabClientImplTest {
     @Test
     void fetchRawFile404ReturnsEmpty() {
         promptMockServer.expect(requestTo(
-                        BASE_URL + "/projects/42/repository/files/missing.md/raw?ref=abc123"))
+                        BASE_URL + "/projects/42/repository/files/missing.md/raw?ref=a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"))
                 .andRespond(withStatus(org.springframework.http.HttpStatus.NOT_FOUND));
 
-        Optional<String> content = client.fetchRawFile("42", "missing.md", "abc123", 1000);
+        Optional<String> content = client.fetchRawFile("42", "missing.md", "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2", 1000);
 
         assertThat(content).isEmpty();
     }
@@ -212,21 +212,21 @@ class GitLabClientImplTest {
     @Test
     void fetchRawFileServerErrorIsUnavailable() {
         promptMockServer.expect(requestTo(
-                        BASE_URL + "/projects/42/repository/files/x.md/raw?ref=abc123"))
+                        BASE_URL + "/projects/42/repository/files/x.md/raw?ref=a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"))
                 .andRespond(withServerError());
 
-        assertThatThrownBy(() -> client.fetchRawFile("42", "x.md", "abc123", 1000))
+        assertThatThrownBy(() -> client.fetchRawFile("42", "x.md", "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2", 1000))
                 .isInstanceOf(PromptSourceUnavailableException.class);
     }
 
     @Test
     void fetchRawFileOversizedByContentLengthIsRejectedWithoutReadingBody() {
         promptMockServer.expect(requestTo(
-                        BASE_URL + "/projects/42/repository/files/big.md/raw?ref=abc123"))
+                        BASE_URL + "/projects/42/repository/files/big.md/raw?ref=a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"))
                 .andRespond(withSuccess("x".repeat(50), MediaType.TEXT_PLAIN)
                         .header("Content-Length", "50"));
 
-        assertThatThrownBy(() -> client.fetchRawFile("42", "big.md", "abc123", 10))
+        assertThatThrownBy(() -> client.fetchRawFile("42", "big.md", "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2", 10))
                 .isInstanceOf(PromptSourceInvalidException.class);
     }
 
@@ -234,41 +234,54 @@ class GitLabClientImplTest {
     void fetchRawFileOversizedByStreamingIsRejectedEvenWithoutContentLengthHeader() {
         // PMR-17: the bound must be enforced while reading, not just via Content-Length.
         promptMockServer.expect(requestTo(
-                        BASE_URL + "/projects/42/repository/files/big.md/raw?ref=abc123"))
+                        BASE_URL + "/projects/42/repository/files/big.md/raw?ref=a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"))
                 .andRespond(withSuccess("x".repeat(50), MediaType.TEXT_PLAIN));
 
-        assertThatThrownBy(() -> client.fetchRawFile("42", "big.md", "abc123", 10))
+        assertThatThrownBy(() -> client.fetchRawFile("42", "big.md", "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2", 10))
                 .isInstanceOf(PromptSourceInvalidException.class);
     }
 
     @Test
     void fetchRawFileEmptyBodyIsInvalid() {
         promptMockServer.expect(requestTo(
-                        BASE_URL + "/projects/42/repository/files/empty.md/raw?ref=abc123"))
+                        BASE_URL + "/projects/42/repository/files/empty.md/raw?ref=a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"))
                 .andRespond(withSuccess("", MediaType.TEXT_PLAIN));
 
-        assertThatThrownBy(() -> client.fetchRawFile("42", "empty.md", "abc123", 1000))
+        assertThatThrownBy(() -> client.fetchRawFile("42", "empty.md", "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2", 1000))
                 .isInstanceOf(PromptSourceInvalidException.class);
     }
 
     @Test
     void fetchRawFileContainingNulByteIsInvalid() {
         promptMockServer.expect(requestTo(
-                        BASE_URL + "/projects/42/repository/files/nul.md/raw?ref=abc123"))
+                        BASE_URL + "/projects/42/repository/files/nul.md/raw?ref=a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"))
                 .andRespond(withSuccess("hello\u0000world", MediaType.TEXT_PLAIN));
 
-        assertThatThrownBy(() -> client.fetchRawFile("42", "nul.md", "abc123", 1000))
+        assertThatThrownBy(() -> client.fetchRawFile("42", "nul.md", "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2", 1000))
                 .isInstanceOf(PromptSourceInvalidException.class);
     }
 
     @Test
     void fetchRawFileNestedPathIsUrlEncodedAsOneOpaqueSegment() {
         promptMockServer.expect(requestTo(
-                        BASE_URL + "/projects/42/repository/files/.ai-review%2Fcode-rules.md/raw?ref=abc123"))
+                        BASE_URL + "/projects/42/repository/files/.ai-review%2Fcode-rules.md/raw?ref=a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"))
                 .andRespond(withSuccess("rules content", MediaType.TEXT_PLAIN));
 
-        Optional<String> content = client.fetchRawFile("42", ".ai-review/code-rules.md", "abc123", 1000);
+        Optional<String> content = client.fetchRawFile("42", ".ai-review/code-rules.md", "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2", 1000);
 
         assertThat(content).contains("rules content");
+    }
+
+    @Test
+    void fetchRawFileRejectsACommitShaNotMatchingTheExpectedShapeBeforeIssuingAnyRequest() {
+        // PMR-13: defense in depth -- pinned to ^[0-9a-f]{40}$ before it ever reaches the URI, even
+        // though every real caller only ever passes through resolveCommitSha's own output.
+        assertThatThrownBy(() -> client.fetchRawFile("42", "base.md", "not-a-real-sha", 1000))
+                .isInstanceOf(PromptSourceUnavailableException.class);
+        assertThatThrownBy(() -> client.fetchRawFile("42", "base.md", "abc123", 1000))
+                .isInstanceOf(PromptSourceUnavailableException.class);
+        assertThatThrownBy(() -> client.fetchRawFile("42", "base.md", null, 1000))
+                .isInstanceOf(PromptSourceUnavailableException.class);
+        promptMockServer.verify(); // no request was ever issued for any of the three
     }
 }

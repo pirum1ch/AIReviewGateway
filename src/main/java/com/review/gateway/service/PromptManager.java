@@ -28,6 +28,20 @@ import java.util.concurrent.Semaphore;
  * deadline ({@code gateway.prompt.total-timeout}) checked between every outbound call, so a slow/hung
  * GitLab cannot silently consume far more than the configured budget across the up to 6 calls one
  * resolve can make.
+ *
+ * <p>ponytail: PMR-20 (SHOULD) — a small in-memory, content-addressed cache keyed on
+ * {@code (project, path, commitSha)} (immutable by construction, so no staleness risk) is not
+ * implemented; every resolve re-fetches the corporate sections from GitLab even though they are
+ * identical across every Review until the corporate repo's next commit. Not needed at 20-30 MR/day (§11
+ * of the architecture doc: add it when GitLab starts rate-limiting, or when {@code POST /reviews} p95
+ * latency exceeds ~2-3s — a bounded {@code ConcurrentHashMap}, not Caffeine, per the project's stdlib-
+ * only convention for this feature).
+ *
+ * <p>ponytail: PMR-27 (SHOULD) — no {@code gateway.prompt.allowed-project-ids} allowlist gate is
+ * implemented; any project the shared CI token can name may have its default branch/prompt sections
+ * read (PMT-08, an amplification of the pre-existing T-21/SR-16 residual, not a new one — see
+ * {@code docs/prompt-manager-threat-model.md} §4's PMR-27 note). Add the allowlist once per-project CI
+ * tokens are not yet available but cross-project reach needs to be bounded sooner.
  */
 @Service
 public class PromptManager {

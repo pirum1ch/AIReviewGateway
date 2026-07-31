@@ -1,6 +1,8 @@
 package com.review.gateway.config;
 
 import jakarta.annotation.PostConstruct;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.stereotype.Component;
 
@@ -32,6 +34,8 @@ import java.util.regex.Pattern;
 @Component
 @ConfigurationProperties(prefix = "gateway")
 public class GatewayProperties {
+
+    private static final Logger log = LoggerFactory.getLogger(GatewayProperties.class);
 
     private static final int MIN_SECRET_LENGTH = 32;
 
@@ -130,9 +134,24 @@ public class GatewayProperties {
      * refuse to start over an unrelated, unset new config tree; that would break "kill-switch off is
      * identical to today" (PMR-10's own premise). When enabled, every rule below is fail-fast, same
      * {@code @PostConstruct} pattern as SR-15.
+     *
+     * <p>ponytail: PMR-12 (SHOULD) — a startup dry-run that resolves every {@code overrides} entry once
+     * and logs a consolidated WARN for unresolvable ones (so a typo surfaces at deploy, not "the
+     * override silently never applied") is not implemented here; a misconfigured override still
+     * degrades safely today (PMR-11: WARN + event + ABSENT row on every affected Review, not silence).
+     * Add the dry-run once the {@code overrides} map is large enough that per-Review discovery of a
+     * typo is too slow an operator feedback loop (rule of thumb: more than a handful of entries, or the
+     * first time an override typo goes unnoticed for more than a few Reviews in practice).
      */
     private void validatePromptOnStartup() {
         if (!prompt.isEnabled()) {
+            // PMR-10: the kill-switch is a legitimate operational control, but every Review created
+            // while it's off must be traceable back to a deliberate, visible decision -- not just a
+            // silent config default nobody noticed. The per-Review audit trail is PROMPT_DISABLED
+            // events (ReviewService.persistNewReview) and GET /metrics (AdminController); this startup
+            // WARN is the third, operator-facing signal, fired once per Gateway boot.
+            log.warn("gateway.prompt.enabled=false: Reviews will be created without repo-sourced "
+                    + "corporate/project prompt sections (legacy behavior) until this is re-enabled");
             return;
         }
         requireGitLabToken("gateway.gitlab.prompt-token", gitlab.getPromptToken());
