@@ -1,6 +1,14 @@
 package com.review.worker.gateway.dto;
 
-/** Mirrors the Gateway's {@code com.review.gateway.dto.ClaimJobResponse} field-for-field. */
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+
+/**
+ * Mirrors the Gateway's {@code com.review.gateway.dto.ClaimJobResponse} field-for-field.
+ *
+ * <p>{@code @JsonIgnoreProperties(ignoreUnknown = true)} (PMT-05/PMR-24): see {@link JobPayload}'s
+ * javadoc — forward compatibility across independent Gateway/Worker deploys is a stated contract.
+ */
+@JsonIgnoreProperties(ignoreUnknown = true)
 public record ClaimResponse(long jobId, long reviewId, JobPayload payload) {
 
     /**

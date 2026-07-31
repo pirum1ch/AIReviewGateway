@@ -8,6 +8,8 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import java.util.List;
+
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
@@ -212,6 +214,155 @@ class PromptTemplateServiceTest {
 
         // Neither the diff nor the chunkContext alone exceeds 20 bytes, but their sum does.
         assertThatThrownBy(() -> smallLimitService.resolve("v2", "12345678901", "1234567890"))
+                .isInstanceOf(AbandonJobException.class);
+    }
+
+    // ---- Prompt Manager (V3): systemMessages, verbatim, no substitute() (PMR-23) ----
+
+    @Test
+    void systemMessagesBecomeVerbatimChatMessagesInOrder() {
+        ResolvedPrompt resolved = service.resolve("v1", "a diff", null,
+                List.of("corporate base rules", "corporate review rules"));
+
+        List<ChatMessage> systemMessages = resolved.messages().stream()
+                .filter(m -> "system".equals(m.role())).toList();
+        assertThat(systemMessages).hasSize(2);
+        assertThat(systemMessages.get(0).content()).isEqualTo("corporate base rules");
+        assertThat(systemMessages.get(1).content()).isEqualTo("corporate review rules");
+    }
+
+    @Test
+    void systemMessagesReplaceTheTemplatesOwnSystemBlockEntirelyNeverDuplicated() {
+        // v1's own template has a system: block (verified by the legacy-null-behavior test below); when
+        // systemMessages is supplied, that template block must be entirely ignored, not appended alongside.
+        ResolvedPrompt resolved = service.resolve("v1", "a diff", null, List.of("only this system message"));
+
+        List<ChatMessage> systemMessages = resolved.messages().stream()
+                .filter(m -> "system".equals(m.role())).toList();
+        assertThat(systemMessages).hasSize(1);
+        assertThat(systemMessages.get(0).content()).isEqualTo("only this system message");
+    }
+
+    @Test
+    void systemMessagesAreNeverPassedThroughSubstituteVerbatimEvenWithDiffPlaceholderLiteralText() {
+        // PMR-23: a section whose literal text is "{{DIFF}}" must arrive byte-identical -- never expanded
+        // into the actual diff content, and the diff itself must not be duplicated into the system role.
+        String diff = "diff --git a/A.java b/A.java\n+ real diff content";
+        ResolvedPrompt resolved = service.resolve("v2", diff, null, List.of("{{DIFF}}", "{{CHUNK_CONTEXT}}", "$1", "\\"));
+
+        List<ChatMessage> systemMessages = resolved.messages().stream()
+                .filter(m -> "system".equals(m.role())).toList();
+        assertThat(systemMessages).extracting(ChatMessage::content)
+                .containsExactly("{{DIFF}}", "{{CHUNK_CONTEXT}}", "$1", "\\");
+        // The diff must not have been duplicated into the system role via a placeholder expansion.
+        ChatMessage userMessage = resolved.messages().get(resolved.messages().size() - 1);
+        assertThat(userMessage.content()).contains("real diff content");
+        String allContent = resolved.messages().stream().map(ChatMessage::content)
+                .reduce("", (a, b) -> a + b);
+        assertThat(countOccurrences(allContent, "real diff content")).isEqualTo(1);
+    }
+
+    @Test
+    void systemMessagesAreNotStrippedOfLiteralBraceSequencesUnlikeChunkContext() {
+        // The {{ }} stripping (CSR-08 defense in depth) stays scoped to chunkContext; systemMessages are
+        // verbatim, so a section containing "{{" must survive unmodified.
+        ResolvedPrompt resolved = service.resolve("v1", "a diff", null, List.of("rule: never use {{ in code"));
+
+        List<ChatMessage> systemMessages = resolved.messages().stream()
+                .filter(m -> "system".equals(m.role())).toList();
+        assertThat(systemMessages.get(0).content()).isEqualTo("rule: never use {{ in code");
+    }
+
+    // ---- PMR-24: null vs [] semantics, no NPE either way ----
+
+    @Test
+    void nullSystemMessagesFallsBackToTheTemplatesOwnSystemBlockLegacyBehavior() {
+        ResolvedPrompt resolved = service.resolve("v1", "a diff", null, null);
+
+        List<ChatMessage> systemMessages = resolved.messages().stream()
+                .filter(m -> "system".equals(m.role())).toList();
+        // v1's template.yml ships its own system: block -- exactly today's behavior, no NPE.
+        assertThat(systemMessages).hasSize(1);
+    }
+
+    @Test
+    void emptySystemMessagesListProducesNoSystemChatMessageAtAll() {
+        // Distinct from null: an empty list means "the Gateway resolved zero sections", not "use the
+        // template's own block" -- template.system() must still be ignored (empty list is non-null).
+        ResolvedPrompt resolved = service.resolve("v1", "a diff", null, List.of());
+
+        List<ChatMessage> systemMessages = resolved.messages().stream()
+                .filter(m -> "system".equals(m.role())).toList();
+        assertThat(systemMessages).isEmpty();
+        // The user message is still present -- no NPE, no dropped job.
+        assertThat(resolved.messages()).anyMatch(m -> "user".equals(m.role()));
+    }
+
+    @Test
+    void threeArgOverloadStillDelegatesWithNullSystemMessages() {
+        ResolvedPrompt resolved = service.resolve("v1", "a diff", null);
+
+        assertThat(resolved.messages().stream().filter(m -> "system".equals(m.role()))).hasSize(1);
+    }
+
+    @Test
+    void twoArgOverloadStillDelegatesWithNullSystemMessages() {
+        ResolvedPrompt resolved = service.resolve("v1", "a diff");
+
+        assertThat(resolved.messages().stream().filter(m -> "system".equals(m.role()))).hasSize(1);
+    }
+
+    // ---- WSR-03 sibling: independent Worker-side systemMessages limits ----
+
+    @Test
+    void systemMessagesCountAboveMaxSystemMessagesIsAbandoned() {
+        WorkerProperties properties = new WorkerProperties("127.0.0.1", "8081", "", "");
+        properties.getGateway().setUrl("https://gateway.internal");
+        properties.getGateway().setApiKey("a".repeat(40));
+        properties.getWorker().setId("worker-1");
+        properties.getWorker().getLimits().setMaxSystemMessages(2);
+        properties.getBackend().setId("backend-1");
+        properties.getLlama().setUrl("http://127.0.0.1:8000");
+        properties.getLlama().setModel("default-model");
+        PromptTemplateService smallLimitService = new PromptTemplateService(properties);
+
+        assertThatThrownBy(() -> smallLimitService.resolve("v1", "a diff", null, List.of("a", "b", "c")))
+                .isInstanceOf(AbandonJobException.class);
+    }
+
+    @Test
+    void systemMessagesTotalBytesCombinedWithDiffBytesIsBounded() {
+        WorkerProperties properties = new WorkerProperties("127.0.0.1", "8081", "", "");
+        properties.getGateway().setUrl("https://gateway.internal");
+        properties.getGateway().setApiKey("a".repeat(40));
+        properties.getWorker().setId("worker-1");
+        properties.getWorker().getLimits().setMaxDiffBytes(20);
+        properties.getBackend().setId("backend-1");
+        properties.getLlama().setUrl("http://127.0.0.1:8000");
+        properties.getLlama().setModel("default-model");
+        PromptTemplateService smallLimitService = new PromptTemplateService(properties);
+
+        // Neither the diff nor the systemMessages alone exceeds 20 bytes, but their sum does.
+        assertThatThrownBy(() -> smallLimitService.resolve("v1", "1234567890", null, List.of("1234567890123")))
+                .isInstanceOf(AbandonJobException.class);
+    }
+
+    @Test
+    void oversizedSystemMessagesAreAbandonedNotOom() {
+        // "An oversized section is abandoned, not OOM'd" -- resolve() must reject before ever handing
+        // the payload to the LLM client, never attempt to process/allocate around it further.
+        WorkerProperties properties = new WorkerProperties("127.0.0.1", "8081", "", "");
+        properties.getGateway().setUrl("https://gateway.internal");
+        properties.getGateway().setApiKey("a".repeat(40));
+        properties.getWorker().setId("worker-1");
+        properties.getWorker().getLimits().setMaxDiffBytes(100);
+        properties.getBackend().setId("backend-1");
+        properties.getLlama().setUrl("http://127.0.0.1:8000");
+        properties.getLlama().setModel("default-model");
+        PromptTemplateService smallLimitService = new PromptTemplateService(properties);
+        String oversizedSection = "x".repeat(1000);
+
+        assertThatThrownBy(() -> smallLimitService.resolve("v1", "small diff", null, List.of(oversizedSection)))
                 .isInstanceOf(AbandonJobException.class);
     }
 }

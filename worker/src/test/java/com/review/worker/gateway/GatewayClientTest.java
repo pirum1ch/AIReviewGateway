@@ -77,6 +77,68 @@ class GatewayClientTest {
         mockServer.verify();
     }
 
+    // ---- Prompt Manager (V3): systemMessages / forward-compat (PMR-24) ----
+
+    @Test
+    void claimResponseWithSystemMessagesArrayParsesCorrectly() {
+        mockServer.expect(requestTo("https://gateway.test/jobs/claim"))
+                .andRespond(withSuccess("""
+                        {"jobId":42,"reviewId":7,"payload":{"diff":"diff content","promptVersion":"v2",
+                         "systemMessages":["corporate base","corporate rules"]}}
+                        """, MediaType.APPLICATION_JSON));
+
+        Optional<com.review.worker.gateway.dto.ClaimResponse> result = gatewayClient.claim("backend-1", "worker-1");
+
+        assertThat(result).isPresent();
+        assertThat(result.get().payload().systemMessages()).containsExactly("corporate base", "corporate rules");
+    }
+
+    @Test
+    void claimResponseWithSystemMessagesAbsentFromJsonDeserializesAsNullNotEmpty() {
+        // PMR-24: null vs [] are distinct semantics -- when the field is entirely absent (an old
+        // Gateway, or a legacy/kill-switch-off Review), Jackson must leave it null, not default to [].
+        mockServer.expect(requestTo("https://gateway.test/jobs/claim"))
+                .andRespond(withSuccess("""
+                        {"jobId":42,"reviewId":7,"payload":{"diff":"diff content","promptVersion":"v1"}}
+                        """, MediaType.APPLICATION_JSON));
+
+        Optional<com.review.worker.gateway.dto.ClaimResponse> result = gatewayClient.claim("backend-1", "worker-1");
+
+        assertThat(result).isPresent();
+        assertThat(result.get().payload().systemMessages()).isNull();
+    }
+
+    @Test
+    void claimResponseWithEmptySystemMessagesArrayDeserializesAsEmptyListNotNull() {
+        mockServer.expect(requestTo("https://gateway.test/jobs/claim"))
+                .andRespond(withSuccess("""
+                        {"jobId":42,"reviewId":7,"payload":{"diff":"diff content","promptVersion":"v1",
+                         "systemMessages":[]}}
+                        """, MediaType.APPLICATION_JSON));
+
+        Optional<com.review.worker.gateway.dto.ClaimResponse> result = gatewayClient.claim("backend-1", "worker-1");
+
+        assertThat(result).isPresent();
+        assertThat(result.get().payload().systemMessages()).isNotNull().isEmpty();
+    }
+
+    @Test
+    void claimResponseWithUnknownFieldsFromANewerGatewayIsToleratedNotRejected() {
+        // PMT-05/PMR-24: an old Worker talking to a newer Gateway that adds fields must not fail
+        // deserialization -- @JsonIgnoreProperties(ignoreUnknown = true) makes this a stated contract.
+        mockServer.expect(requestTo("https://gateway.test/jobs/claim"))
+                .andRespond(withSuccess("""
+                        {"jobId":42,"reviewId":7,"someBrandNewTopLevelField":"ignored",
+                         "payload":{"diff":"diff content","promptVersion":"v1",
+                         "someBrandNewPayloadField":{"nested":true}}}
+                        """, MediaType.APPLICATION_JSON));
+
+        Optional<com.review.worker.gateway.dto.ClaimResponse> result = gatewayClient.claim("backend-1", "worker-1");
+
+        assertThat(result).isPresent();
+        assertThat(result.get().jobId()).isEqualTo(42L);
+    }
+
     @Test
     void claimReturnsEmptyOn204() {
         mockServer.expect(requestTo("https://gateway.test/jobs/claim"))

@@ -44,6 +44,8 @@ worker:
   limits:
     max-diff-bytes: ${WORKER_MAX_DIFF_BYTES:262144}
     max-response-bytes: ${WORKER_MAX_RESPONSE_BYTES:200000}
+    # Prompt Manager (V3, WSR-03 sibling): independent of gateway.prompt.limits.max-sections.
+    max-system-messages: ${WORKER_MAX_SYSTEM_MESSAGES:8}
 
 backend:
   id: ${BACKEND_ID}
