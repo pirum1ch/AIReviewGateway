@@ -43,6 +43,17 @@ public class TextSanitizer {
      * characters) — callers must treat {@code null} as "drop this value", never render/persist an empty
      * string in its place.
      */
+    /**
+     * WOC-25/WOR-06: delegating alias for untrusted, single-line free text that must be sanitized before
+     * it ever touches a log line, {@code review_events.details}, or {@code review_jobs.last_error} (e.g.
+     * the Worker-supplied {@code detail} field on {@code POST /jobs/{id}/fail}). Byte-for-byte the same
+     * stripping/capping as {@link #sanitizePath} — no second implementation of the F-DC-02 lesson — kept
+     * as a separate method purely for call-site readability (a {@code detail} string is not a path).
+     */
+    public String sanitizeSingleLine(String rawText, int maxLength) {
+        return sanitizePath(rawText, maxLength);
+    }
+
     public String sanitizePath(String rawPath, int maxLength) {
         if (rawPath == null) {
             return null;
