@@ -48,6 +48,17 @@ public class Backend {
     private Instant lastSeen;
 
     /**
+     * Worker Observability & Claim Latency (V4, WOC-10): restart-safe start-of-streak timestamp for a
+     * continuous run of failed health probes; {@code NULL} means the backend is not currently failing.
+     * Set on the first failed probe of a streak, cleared on any successful probe -- PostgreSQL stays the
+     * single source of truth (no in-memory failure counter). {@code ACTIVE -> SUSPECT} requires this
+     * streak to be at least {@code gateway.backend.failure-grace} old (WOC-11); {@code BackendDispatcher}
+     * also declines a backend whose streak is past grace regardless of persisted status (WOR-10).
+     */
+    @Column(name = "probe_failed_since")
+    private Instant probeFailedSince;
+
+    /**
      * Prompt Manager (V3, PMR-22): per-backend override of {@code gateway.prompt.message-format}
      * ({@code MULTI}/{@code SINGLE}), or {@code null} to use the configured global default. Deliberately
      * a plain {@code String}, not {@code @Enumerated} bound directly to
@@ -136,6 +147,14 @@ public class Backend {
 
     public void setLastSeen(Instant lastSeen) {
         this.lastSeen = lastSeen;
+    }
+
+    public Instant getProbeFailedSince() {
+        return probeFailedSince;
+    }
+
+    public void setProbeFailedSince(Instant probeFailedSince) {
+        this.probeFailedSince = probeFailedSince;
     }
 
     public String getPromptMessageFormat() {
