@@ -195,7 +195,10 @@ public class GatewayProperties {
         // WOR-01: the attempt budget must not be exhaustible inside one backend-demotion grace window --
         // requeue-delay * (max-attempts - 1) is the minimum wall-clock time to burn every attempt via
         // worker-reported failures, and that must be at least the grace window a dead backend is allowed
-        // to keep receiving claims for.
+        // to keep receiving claims for. Kept as a defense-in-depth check even though F-WOC-01 makes
+        // BackendDispatcher's dispatch decline no longer wait for failure-grace to elapse (see below):
+        // this still bounds how long a dead-but-not-yet-demoted backend can flap ACTIVE/SUSPECT status,
+        // which is independently useful for alerting even though it no longer gates claim eligibility.
         int maxAttempts = retry.getMaxAttempts();
         if (maxAttempts < 1) {
             throw new IllegalStateException("gateway.retry.max-attempts must be >= 1; got: " + maxAttempts);
@@ -207,6 +210,27 @@ public class GatewayProperties {
                             + "gateway.backend.failure-grace (WOR-01) — got requeue-delay=" + requeueDelay
                             + ", max-attempts=" + maxAttempts + " (budget window=" + attemptBudgetWindow
                             + "), failure-grace=" + failureGrace + " — refusing to start");
+        }
+
+        // F-WOC-01: with BackendDispatcher's fail-fast dispatch decline (any non-null probe_failed_since,
+        // except the WOC-13 at-capacity exemption -- see BackendDispatcher's javadoc), the property WOR-01
+        // actually needs to guarantee -- "the attempt budget must not be exhaustible before a dead backend
+        // stops receiving new claims" -- is bounded by outage-*detection* latency, not by failure-grace:
+        // a claim is declined starting at the very first failed probe, which lands at most one
+        // backend-health-interval plus one probe's own read-timeout after the backend actually died. The
+        // old failure-grace-only formula omitted this detection latency entirely (that omission is
+        // F-WOC-01 itself), so it is insufficient on its own even though it is kept above for the status
+        // flip. This is the corrected, load-bearing bound; the shipped defaults (90s/3 attempts vs.
+        // 60s+10s) satisfy it with margin, so no default changes are required by this check.
+        Duration dispatchDetectionLatency = scheduler.getBackendHealthInterval().plus(backend.getReadTimeout());
+        if (attemptBudgetWindow.compareTo(dispatchDetectionLatency) < 0) {
+            throw new IllegalStateException(
+                    "gateway.retry.requeue-delay * (gateway.retry.max-attempts - 1) must be >= "
+                            + "gateway.scheduler.backend-health-interval + gateway.backend.read-timeout "
+                            + "(WOR-01, F-WOC-01 dispatch fail-fast) — got requeue-delay=" + requeueDelay
+                            + ", max-attempts=" + maxAttempts + " (budget window=" + attemptBudgetWindow
+                            + "), backend-health-interval=" + scheduler.getBackendHealthInterval()
+                            + ", backend.read-timeout=" + backend.getReadTimeout() + " — refusing to start");
         }
 
         // A grace window shorter than one probe interval is meaningless (scheduler jitter could demote

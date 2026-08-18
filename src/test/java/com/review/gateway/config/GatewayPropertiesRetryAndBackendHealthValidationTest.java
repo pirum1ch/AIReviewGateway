@@ -136,6 +136,49 @@ class GatewayPropertiesRetryAndBackendHealthValidationTest {
     }
 
     @Test
+    void shippedDefaultsAlsoPassTheDispatchDetectionLatencyCheck() {
+        // F-WOC-01: requeue-delay=90s * (max-attempts-1=2) = 180s budget window must also be >=
+        // backend-health-interval (60s) + backend.read-timeout (10s) = 70s -- the property that is now
+        // actually load-bearing for WOR-01, given BackendDispatcher's fail-fast dispatch decline.
+        assertThatCode(() -> validProperties().validateOnStartup()).doesNotThrowAnyException();
+    }
+
+    @Test
+    void requeueDelayTooSmallForTheDispatchDetectionLatencyFailsStartupEvenWhenTheOldFailureGraceCheckWouldPass() {
+        // F-WOC-01: construct a case that passes the OLD (failure-grace-only) formula but fails the NEW
+        // (detection-latency) one -- proves the new check is independently load-bearing, not redundant
+        // with the existing failure-grace check. requeue-delay=8s, max-attempts=2 -> budget window=8s,
+        // which is < backend-health-interval(60s)+read-timeout(10s)=70s, but also chosen so
+        // failure-grace itself is lowered to 8s (>= the 8s min-nonzero-requeue-delay bound and >= the
+        // 60s... no: failure-grace must also be >= backend-health-interval, so this scenario instead
+        // lowers backend-health-interval to make the old check pass while the new one still fails).
+        GatewayProperties properties = validProperties();
+        properties.getRetry().setMaxAttempts(2);
+        properties.getRetry().setRequeueDelay(Duration.ofSeconds(15)); // WOR-16 floor
+        properties.getBackend().setFailureGrace(Duration.ofSeconds(15)); // old check: 15*(2-1)=15 >= 15, passes
+        properties.getScheduler().setBackendHealthInterval(Duration.ofSeconds(15)); // >= failure-grace, passes
+        properties.getBackend().setReadTimeout(java.time.Duration.ofSeconds(60)); // new check: 15 < 15+60=75
+
+        assertThatThrownBy(properties::validateOnStartup)
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("requeue-delay")
+                .hasMessageContaining("backend-health-interval")
+                .hasMessageContaining("read-timeout");
+    }
+
+    @Test
+    void requeueDelayExactlyMeetingTheDispatchDetectionLatencyPasses() {
+        GatewayProperties properties = validProperties();
+        properties.getRetry().setMaxAttempts(2);
+        properties.getBackend().setFailureGrace(Duration.ofSeconds(15));
+        properties.getScheduler().setBackendHealthInterval(Duration.ofSeconds(15));
+        properties.getBackend().setReadTimeout(java.time.Duration.ofSeconds(60));
+        properties.getRetry().setRequeueDelay(Duration.ofSeconds(75)); // 75*(2-1)=75 >= 15+60=75
+
+        assertThatCode(properties::validateOnStartup).doesNotThrowAnyException();
+    }
+
+    @Test
     void failureGraceShorterThanTheProbeIntervalFailsStartup() {
         GatewayProperties properties = validProperties();
         properties.getScheduler().setBackendHealthInterval(Duration.ofSeconds(60));
