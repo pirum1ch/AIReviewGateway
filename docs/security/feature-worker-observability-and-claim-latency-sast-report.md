@@ -40,7 +40,7 @@ delta to analyse. `.github/workflows/security-gate.yml` and `docker-compose.yml`
 
 ---
 
-## Verdict: **NEEDS ONE MORE DEV PASS** — 1 High + 1 Medium block the merge.
+## Round-1 verdict (superseded by the verification round at the end of this document): **NEEDS ONE MORE DEV PASS** — 1 High + 1 Medium block the merge.
 
 Severity counts: Critical 0 · **High 1** · **Medium 1** · Low 2 · Info 9.
 
@@ -289,3 +289,341 @@ Prefix note: the threat model's §5 refers to this report as
 `docs/security/feature-worker-observability-sast-report.md` with prefix `F-WO-`; it is filed here under the
 full feature slug with prefix `F-WOC-`, consistent with `F-DC-`/`F-PM-` and with the branch's other two
 documents.
+
+---
+
+# Verification round (final) — fix commits `e6cf943` / `35a076c` / `a219857` / `c920100`, 2026-08-18
+
+Scope: `62d8877..c920100` on `fix/worker-observability-and-claim-latency` (HEAD `c920100`) — 4 commits,
+11 files, +962/−52, of which the production delta is **four files only**: `BackendHealthChecker.java`
+(+the F-WOC-02 reorder), `BackendDispatcher.java` (F-WOC-01), `GatewayProperties.java` (one new startup
+check), `WorkerLoop.java` (one widened catch). Everything else is tests. No `pom.xml`, no migration, no
+YAML, no controller/DTO, no security config, no CI workflow touched in this round (`git diff --stat`
+verified). Working tree carries only the same three pre-existing unrelated items as round 1 (modified
+`docs/security/feature-diff-chunking-sast-report.md`, untracked `.claude/skills/`, untracked `.eml`).
+
+Method: **fresh re-derivation, not re-reading my own round-1 text.** For each finding I read the shipped
+code (not the commit message, not the test names), re-derived the timing/ordering argument from the
+actual constants, then attacked the tests themselves — round 1's central lesson was that a green suite
+had pinned F-WOC-02 as expected behavior, so a test is treated as evidence only after I have checked what
+it would do against the *pre-fix* code. For F-WOC-01 I did that empirically (revert experiment below).
+
+**Suites (run by me, this session, from the branch HEAD):** Gateway `mvn -q test` → exit 0,
+`Tests=627, Failures=0, Errors=0, Skipped=0` (surefire aggregate). Worker `mvn -q -f worker/pom.xml test`
+→ exit 0, `Tests=137, Failures=0, Errors=0, Skipped=0`. Delta vs. round 1 is exactly the promised new
+coverage and nothing else: Gateway 618 → 627 (`BackendDispatcherTest` 7 → 12, the three new
+`GatewayPropertiesRetryAndBackendHealthValidationTest` cases, `BackendDispatchFailFastEndToEndTest` +1),
+Worker 135 → 137 (`WorkerLoopReportFailureCrashGuardTest` +1, `WorkerObservabilityLoggingContentTest`
+5 → 6). All four new/changed test classes confirmed present in the surefire reports and passing.
+
+**Scanners (run by me):** `semgrep --config p/java --config p/sql-injection --config p/secrets` (the
+gate config from `.github/workflows/security-gate.yml`) over `src/main/java` + `worker/src/main/java` →
+**0 findings**, exit 0. `gitleaks detect` over the full history (100 commits, 2.56 MB) → **no leaks
+found**. No dependency delta to analyse (no `pom.xml` change in this round either).
+
+## Verdict summary
+
+| # | Round-1 severity | Round-2 verdict |
+|---|---|---|
+| **F-WOC-01** | High (blocking) | ✅ **VERIFIED-FIXED** — and proven load-bearing by a revert experiment |
+| **F-WOC-02** | Medium (blocking) | ✅ **VERIFIED-FIXED** — including both defective tests |
+| **F-WOC-03** | Low (should-fix) | ✅ **VERIFIED-FIXED** |
+| **F-WOC-04** | Low (should-fix) | ✅ **VERIFIED-FIXED** |
+| F-WOC-05 … F-WOC-13 | Info/Low | Untouched, still open, still non-blocking (spot-checked, see below) |
+| **F-WOC-14** (new) | **Low** | README/`DEPLOYMENT.md` now describe the *old* claim-eligibility rule and omit the new startup check — docs-only, non-blocking |
+| **F-WOC-15** (new) | Info | Residual: ≤ one probe interval of declined claims after a busy backend's job ends — accepted trade-off, no worse than pre-branch |
+| **F-WOC-16** (new) | Info | The WOR-11 stall WARN can now fire for a busy-but-alive backend (intended, but ops-noise worth wording for) |
+| **F-WOC-17** (new) | Info | The new startup check's detection-latency term models a *single* probe, not a whole multi-backend pass |
+
+No Critical/High/Medium remains open. Nothing in the four new observations blocks the merge.
+
+---
+
+## Per-finding verdicts
+
+### F-WOC-01 (High) — **VERIFIED-FIXED**
+
+**The shipped change** (`BackendDispatcher.java:93-110`) is remedy option (b) from my round-1 write-up,
+implemented as specified: `resolveClaimableBackend` now declines on `probeFailedSince != null` outright,
+with no `failure-grace` comparison anywhere in the class (`isPastGraceFailureStreak` is gone, grep-
+verified: `getProbeFailedSince()` outside `Backend`/`BackendHealthChecker` now appears only in the
+dispatcher's new predicate and in `StatisticsService:61`). Status handling is untouched — `applyFailure`
+still only flips `ACTIVE → SUSPECT` after a continuous `failure-grace` streak, so the fail-slow/
+fail-fast decoupling is real and not a disguised re-introduction of single-probe demotion.
+
+**I re-derived the timing argument from the constants, not from the commit message.** Detection latency
+(the quantity my round-1 formula omitted) is bounded above by `scheduler.backend-health-interval` (60s)
++ `backend.read-timeout` (10s) = **70s**: `probe_failed_since` is now written by the *first* failed probe
+on every path (F-WOC-02), including while the backend is at capacity mid-job, so no phase alignment can
+push the record later than the next scheduled pass plus that pass's own probe timeout. The attempt clock
+is unchanged: the failure-driving claim of the *final* attempt lands at `T + requeue-delay ×
+(max-attempts − 1)` = `T + 180s`, and the *first* retry claim at `T + 90s`. Both are ≥ 70s, so both are
+declined; and because `attempts` is incremented in exactly one place (`QueueManager.claimJobRow:200`,
+reached only *after* `resolveClaimableBackend` returns non-empty), a declined claim burns nothing. The
+job parks in `QUEUED` — the pre-branch behavior, WOC-44 — instead of the Review going permanently
+`FAILED` and `ChunkCoordinator` cascading `CANCELLED` to its siblings. **WOT-01 is closed.**
+
+**The new end-to-end test is genuine and load-bearing — I proved it rather than assumed it.**
+`BackendDispatchFailFastEndToEndTest` uses the real Spring-managed `QueueManager` +
+`BackendHealthChecker` beans against a real (Zonky) PostgreSQL with only `BackendProber` (the HTTP
+boundary) mocked, real wall-clock `Instant.now()`, a real `probeAll()` pass, a genuinely claimable
+`QUEUED` job (Review + `review_chunks` row), a positive control before the probe, an `attempts == 0`
+assertion after the decline, and a recovery leg proving the job becomes claimable again once a
+successful probe clears the streak. That is exactly the test WOR-01 called for and round 1 found missing.
+To confirm it is not tautological I temporarily restored the pre-fix predicate in the working tree
+(`probeFailedSince != null && elapsed >= failure-grace && !exempt`) and ran only that class:
+
+```
+[ERROR] Tests run: 1, Failures: 1 -- BackendDispatchFailFastEndToEndTest
+  aSingleFailedFirstProbeImmediatelyMakesTheBackendUnclaimable:135
+  [F-WOC-01: a backend that has failed at least one probe must not receive new claims, even though its
+   status is still ACTIVE and failure-grace has not elapsed ...]
+```
+
+Restored with `git checkout -- src/main/java/com/review/gateway/service/BackendDispatcher.java`;
+`git status --short` re-verified afterwards (only the three pre-existing unrelated items). **No
+production code was changed by me.**
+
+**Does it re-introduce the bug the branch exists to fix? No — but not for the reason the commit message
+gives.** The commit claims the WOC-13 at-capacity exemption is what protects a backend that is merely
+busy mid-generation. Reading the code, that exemption is a genuine **no-op for claim outcomes**: when
+`atCapacity` is true the method falls through to `if (atCapacity) return empty` regardless (the commit
+message concedes this in its parenthetical, and `BackendDispatcherTest`
+`atCapacityWithFreshHeartbeatExemptionIsConsultedButStillDeclinedByTheCapacityCheck` asserts exactly
+that). What actually protects the busy case is (i) status no longer flaps — `ACTIVE → SUSPECT` still
+needs the full grace streak, so there is no minutes-long `SUSPECT` lockout, which was symptom 2 of the
+original incident; and (ii) the decline self-clears on the *first* successful probe once the job ends
+(`applySuccess` nulls the streak, WOC-12 recover-fast, unchanged), bounding the post-job exclusion at one
+probe interval. That is strictly no worse than pre-branch `master`, where the same missed probe demoted
+the backend to `SUSPECT` on the spot and recovery also took until the next successful probe. Filed as
+**F-WOC-15** (Info) because it does narrow WOC-13's dispatch benefit to the in-flight window, which is
+worth knowing operationally — but it does not reopen the incident this branch was cut for.
+
+**The added startup check** (`GatewayProperties.java:216-232`) states the property correctly this time:
+`requeue-delay × (max-attempts − 1) ≥ backend-health-interval + backend.read-timeout`, i.e. the last
+attempt cannot be claimed before the earliest possible decline. It sits *after* the paired
+`requeue-delay=0`/`failure-grace=0` escape hatch's early `return` (`:167-181`), so WOR-16's documented
+revert-to-pre-V4 path still boots (confirmed in the test log: the WARN fires, no exception). It is
+strictly additive and can only reject configs where `failure-grace ∈ [backend-health-interval,
+backend-health-interval + read-timeout)`, since the pre-existing checks already force
+`budget ≥ failure-grace ≥ backend-health-interval` — so it is not a startup-compat trap for existing
+tunings. Shipped defaults pass with 110s of margin. The `>=` boundary is a benign tie (detection latency
+is an upper bound, not a schedule), and the multi-backend caveat is recorded as F-WOC-17.
+
+### F-WOC-02 (Medium) — **VERIFIED-FIXED**
+
+The reorder is real, not cosmetic. `BackendHealthChecker.applyFailure:171-195` now sets
+`probeFailedSince` **before** `shouldDeferDemotion` is consulted **and persists it on the deferral path**
+(`backendRepository.save(backend)` immediately before the early `return false` — that save was the half
+of the fix that could have been forgotten, and it is present). The three consequences I traced in round 1
+are therefore all reversed:
+
+- **WOR-10** — the dispatcher now sees a non-null streak for a backend that died mid-job on a capacity-1
+  1:1-paired host, so the WOT-07 window (claimable the instant the slot frees, while known-dead) is shut.
+- **WOR-11** — `hasEligibleActiveBackend()` no longer counts that backend as eligible once its streak
+  passes grace, so the stall WARN can fire (see F-WOC-16 for the flip side).
+- **WOR-13** — `shouldDeferDemotion`'s cap is now keyed on a value that actually exists, so the deferral
+  is genuinely bounded. Side effect worth noting as an improvement, not a defect: with the streak always
+  recorded, `defer-demotion-max: 0` now means "never defer" rather than "defer forever", which is the
+  sane reading of a cap.
+
+No off-by-one introduced: on the very first failure `Duration.between(now, now) = 0` is compared
+`>= defer-demotion-max` (45m) → false → the deferral still applies on the first pass, as intended
+(verified by the rewritten `deferralCapIsEnforced`, whose first pass asserts `flips == 0` and status
+`ACTIVE`). Repeat failures mid-streak leave the field untouched, so the extra `save` is a Hibernate no-op
+and does not rewrite the row every 60s. The `WOC-21` guard in `applyProbeResult` (re-read by id, skip
+`MAINTENANCE`/`OFFLINE`) still wraps everything, unchanged.
+
+**Both defective tests are corrected.** `atCapacityWithFreshHeartbeatDefersDemotionAndPreservesStreak`
+→ renamed `...ButStillRecordsTheStreak` and now asserts `getProbeFailedSince()).isNotNull()` *and*
+status still `ACTIVE` — the assertion that had encoded the defect is inverted, not deleted. The
+misleading javadoc/comments that claimed "preserved" behavior the code did not have are rewritten in
+both `BackendHealthChecker`'s class javadoc and at the deferral site. `deferralCapIsEnforced` no longer
+hand-constructs a post-state the deferral path could not produce: it now runs a **real** first pass
+through `probeAll() → applyFailure → shouldDeferDemotion` (asserting `flips == 0` and that the streak was
+recorded by that path), then backdates only the elapsed time — the same simulate-elapsed-time technique
+T-2.2/T-2.6 already use — and asserts the second real pass demotes despite the backend still being at
+capacity with a fresh heartbeat. That is the real code path being exercised, as required.
+
+### F-WOC-03 (Low) — **VERIFIED-FIXED**
+
+`WorkerLoop.reportFailureBestEffort:302-310` now catches `Throwable` — broader than the
+`RuntimeException` I asked for, and deliberately so: it matches the existing WSR-15 precedent verbatim
+(`HeartbeatScheduler.java:99`, whose comment says the catch "must never be narrowed"). Metrics/logging
+behavior is unchanged (`incrementGatewayErrors()` + one WARN carrying `jobId` and the throwable).
+
+I checked the two things a `catch (Throwable)` can break here and neither applies: (a) shutdown is
+flag-based — `requestShutdown()` only sets `shuttingDown`, and `runLoop`'s `while` re-tests it at the top
+of every iteration, so swallowing an interrupt-derived exception cannot wedge shutdown
+(`abandonCurrentJob()`'s interrupt still reaches the abort signal and the loop still exits via the flag);
+(b) no new disclosure — the API key is a default header on the `RestClient`, never in a URI, and the URI
+template takes only a `long jobId`, so the widened catch cannot log a credential; a
+`RestClientResponseException`'s body excerpt was already reaching this WARN pre-fix via the
+`GatewayUnavailableException` cause chain, and the Gateway's `/fail` responses carry no rejected input
+(SR-17). `Error`s are now swallowed at this one site too, which is consistent with WSR-15 and acceptable
+for a call the design defines as best-effort.
+
+`WorkerLoopReportFailureCrashGuardTest` is a real regression guard: it drives a genuine
+`LlamaException` into `processJob`'s handler, makes `reportFailure` throw an `IllegalStateException`
+(unmapped — the old narrow catch would never have caught it), then asserts via
+`verify(..., timeout(3000).atLeast(2)).claim(...)` that the loop went on to claim again, that
+`isRunning()` is still true, and that the failure was counted (`incrementGatewayErrors` ×1,
+`incrementFailuresReported` ×0). Against the pre-fix catch the thread would have exited after the first
+claim and that verification could not pass.
+
+### F-WOC-04 (Low) — **VERIFIED-FIXED**
+
+`WorkerObservabilityLoggingContentTest#startingInferenceLogNeverRendersRawDiffOrSystemMessageContent`
+exercises the real WOC-03 call site: a real `WorkerLoop` claims a payload whose `diff` **and**
+`systemMessages` both contain `SECTIONMARKER`, and the test first asserts the `"Starting inference"` line
+actually fired (a deliberate guard against a trivially-passing test — it polls until the line appears and
+fails if it never does), then asserts the line is INFO, carries `jobId`/`reviewId`/`diffChars=<length>`/
+`systemMessages=2`/`model`/`maxTokens`, and finally that **no** captured event at level ≤ INFO contains
+the marker anywhere. It would fail immediately if anyone "improved" the line to log the list or the diff.
+Scope note: the appender is attached to the `WorkerLoop` logger, which is where all four new INFO sites
+of this feature that could carry content live; the test's own comment says so.
+
+---
+
+## Fresh-eyes pass over the fix commits themselves
+
+Things a rushed fix in this exact code could have broken, each checked directly:
+
+- **Lock discipline / hot path.** `resolveClaimableBackend` has exactly one call site
+  (`QueueManager.claimJobRow:189`) and it runs **before** `findNextQueuedJobIdForUpdate()` takes the
+  `FOR UPDATE SKIP LOCKED` row lock — so the added `existsFreshRunningJobForBackend` query can never
+  lengthen a row-lock hold. It is also short-circuited twice over (`probeFailedSince != null &&
+  atCapacity`), i.e. it never runs on the common path; `BackendDispatcherTest` pins that with two
+  `verify(..., never())` assertions. `countRunningJobsForBackend` merely moved earlier in the same
+  method. No new repository method, no new query, no dynamic SQL — both queries are the pre-existing
+  static native ones with `@Param` binding. Nothing became `@Transactional`, so the round-1
+  transactional-AOP trap (`BackendDispatcherClaimDeclineTransactionBugTest`) stays closed.
+- **Race conditions.** The dispatcher reads `probe_failed_since` without a lock inside claim's
+  `REQUIRES_NEW` transaction while the checker writes it in its own short phase-C transaction; under
+  READ COMMITTED the worst case is one claim decided against a value that is one probe pass stale, in
+  the conservative direction on the write side (streak set earlier) and self-correcting on the clear side
+  (the next poll, ≤3s later, sees the cleared value). No lock ordering changed, no new lock taken.
+- **Boundary conditions.** Checked all four: `probeFailedSince == null` → claimable
+  (`aBackendThatHasNeverFailedAProbeStaysClaimable`); streak of 0s → declined; `atCapacity` uses the
+  unchanged `running >= capacity`; the deferral cap comparison is `>=` on a `Duration.ZERO` first
+  failure. No off-by-one.
+- **`GET /backends` semantics.** Unchanged shape — `StatisticsService:61` is the only other reader of
+  the field and `BackendSnapshot`/`BackendView` were not touched. `probeFailedSince` is simply non-null
+  more often now, which is the honest record and is ADMIN-only; the URL is still withheld. If anything
+  the README's existing description of that field (round-1 text, `README.md:644-646`) became *correct*
+  as a result of F-WOC-02, having been wrong before.
+- **The WOC-13 exemption in other cases.** Enumerated: `atCapacity=false` → exemption cannot apply
+  (correct: a free backend that failed a probe must be declined, that is the fix); `atCapacity=true` →
+  declined by the capacity check anyway; `MAINTENANCE`/`OFFLINE`/`SUSPECT` → rejected earlier by the
+  status check, before either query. There is no input under which the exemption makes a
+  probe-failing backend claimable.
+- **Contracts and surfaces.** No change to any `/jobs/*` or `/reviews` request/response, no new field, no
+  status-code change, no `EventType`, no migration, no `application.yml`, no security config, no CI
+  workflow. Round-1's verified-good properties (WOR-03…WOR-09, WOR-12, WOR-14…WOR-20, the
+  `RequestBodySizeLimitFilter` percent-encoding fix, the V4 migration) are untouched by these commits and
+  their tests still pass in the 627/137 runs above.
+- **Round-1 Info findings spot-checked as genuinely untouched** (i.e. no silent partial fix to
+  re-verify): `V4__...sql:10` is still session-scoped `SET lock_timeout` (F-WOC-06);
+  `GatewayPropertiesApplicationYamlBindingTest`'s stale javadoc is unchanged (F-WOC-05); `DEPLOYMENT.md`
+  §8b still omits the SR-06 residual sentence (F-WOC-08).
+
+### F-WOC-14 (Low, **NEW**) — `README.md`/`DEPLOYMENT.md` describe the pre-fix claim rule
+
+The behavior change shipped without its documentation, in a repo where `README.md` is by CLAUDE.md's own
+rule the authority on current behavior (this is the F-DC-04/F-PM-02 lineage of finding):
+
+- `README.md:942` — "the claim path independently declines any backend whose `probe_failed_since` streak
+  is **already past `failure-grace`**, regardless of its persisted `status`" — that is now the *old*
+  rule. The claim path declines on the first failed probe.
+- `README.md:161` and `DEPLOYMENT.md:739-743` document only the `requeue-delay × (max-attempts − 1) ≥
+  failure-grace` startup check. The second, now load-bearing check (`≥ backend-health-interval +
+  backend.read-timeout`) is undocumented, so an operator who raises `gateway.backend.read-timeout` past
+  ~110s with shipped defaults hits an unexplained boot refusal. The exception message is explicit and the
+  failure is fail-fast at startup rather than at runtime, which is why this is Low and not Medium.
+
+Remediation: three short doc edits (the two `README` passages + the `DEPLOYMENT.md` §8b arithmetic
+bullet). **Does not block the merge** — nothing behaves incorrectly — but it should land as a docs-only
+commit on this branch or immediately after, or `README` stops being the authority CLAUDE.md says it is.
+(`CLAUDE.md:109` carries the same now-stale "excluded from new assignments [at `SUSPECT`]" phrasing; that
+file is the user's, so I am flagging it rather than proposing an edit.)
+
+### F-WOC-15 (Info, **NEW**) — residual: ≤ one probe interval of declined claims after a busy backend frees up
+
+Consequence of F-WOC-01 + F-WOC-02 together, in the deployment this branch was written for: if
+`llama-server` does not answer `/health` while generating, the streak is now recorded during the
+deferral, so when the job ends the backend stays undispatchable until its next *successful* probe — up to
+`backend-health-interval` + one probe (≈70s), typically ~30s. Pre-branch `master` behaved the same way
+(single-probe `SUSPECT`, recovery on next success), so this is not a regression against the merge target;
+it is a regression against the pre-fix state of this branch, where the streak was never recorded at all
+(that was the F-WOC-02 defect). The branch's stated symptom-2 goal — "blocking new claims for *minutes*"
+— is still met: bounded, self-healing, and with no status flapping. Optional future mitigation, out of
+scope here: probe a backend immediately when a claim is declined on a non-null streak, or on job
+completion, instead of waiting for the next scheduled tick. Operators for whom this matters can lower
+`gateway.scheduler.backend-health-interval` (`failure-grace ≥ backend-health-interval` still holds).
+
+### F-WOC-16 (Info, **NEW**) — the WOR-11 stall WARN can now fire for a backend that is alive but busy
+
+Also a direct consequence of F-WOC-02 recording the streak during a deferral, and formally what WOR-11
+asked for. On a single-backend, multi-chunk review where `/health` is unresponsive during a >180s
+generation, `hasEligibleActiveBackend()` returns false while sibling chunks sit `QUEUED`, so
+`"Queue stalled: N job(s) QUEUED but 0 eligible ACTIVE backend(s) (suspect=0, maintenance=0, offline=0)"`
+is logged once per pass for the duration. The statement is true (those jobs genuinely cannot be
+dispatched) but an operator will read it as an outage. Suggested one-line improvement, non-blocking: add
+the at-capacity count to the message so "busy" and "dead" are distinguishable at a glance.
+
+### F-WOC-17 (Info, **NEW**) — the new startup check models one probe, not a whole pass
+
+`dispatchDetectionLatency = backend-health-interval + backend.read-timeout` assumes the target backend is
+probed at the start of its pass. Phase B is sequential over all `ACTIVE`/`SUSPECT` candidates, so with
+several simultaneously-timing-out backends ahead of it (plus a WOC-17-skipped tick) real detection
+latency can reach `interval + (N−1)×(connect+read) + read`. At the documented scale ceiling (10 backends,
+all dead) that is ≈187s against the 180s default budget window — a marginal, self-limiting case (if every
+backend is dead the Review cannot succeed anyway; the 110s default margin covers ~8 timing-out peers).
+Recording it so the formula is not mistaken for a tight bound: it is a sufficient condition for the
+single/few-backend deployments in scope, not a proof for arbitrary N.
+
+---
+
+## WOR delta vs. round 1
+
+| Req | Round 1 | Round 2 |
+|---|---|---|
+| **WOR-01** | ⚠️ PARTIAL (F-WOC-01) | ✅ **Met** — property re-derived against shipped constants, end-to-end test present and proven load-bearing |
+| **WOR-10** | ⚠️ inoperative (F-WOC-02) | ✅ **Met** — and now strictly stronger than specified (any streak, not only past-grace) |
+| **WOR-11** | ⚠️ inoperative (F-WOC-02) | ✅ **Met** — streak recorded on the deferral path, WARN eligibility engages (see F-WOC-16) |
+| **WOR-13** | ⚠️ inoperative (F-WOC-02) | ✅ **Met** — cap keyed on a value that now exists, exercised through the real deferral path |
+| **WOR-17** | ✅ code / ⚠️ test gap | ✅ **Met** — marker regression test added at the WOC-03 call site |
+| All other WOR-* | ✅ | ✅ unchanged (not touched by these commits; suites re-run green) |
+
+18/18 blocking MUSTs now verified closed in shipped code.
+
+## Findings open after this round
+
+| # | Severity | Status |
+|---|---|---|
+| F-WOC-14 | Low | Open — docs-only, should ride on this branch or immediately after merge |
+| F-WOC-05 … F-WOC-13, F-WOC-15, F-WOC-16, F-WOC-17 | Info (F-WOC-13 pre-existing/structural) | Open, accepted, none blocking |
+
+---
+
+## FINAL VERDICT: **PASS — APPROVED FOR MERGE** (`fix/worker-observability-and-claim-latency` → `master`)
+
+Both blocking findings are genuinely fixed in shipped code, not papered over:
+
+- **F-WOC-01** is fixed by the remedy I preferred in round 1, the timing property now holds when
+  re-derived from the actual constants (70s worst-case detection vs. a 90s first retry and a 180s final
+  attempt), the fix is guarded by a new end-to-end test that I confirmed *fails* against the pre-fix
+  predicate, and it does not reopen the flapping/lockout symptom the branch was cut for.
+- **F-WOC-02** is fixed by the exact reorder specified, *including* persisting on the deferral path, and
+  both tests that had encoded the defect (one asserting `null`, one seeding an impossible state) are
+  corrected to exercise the real path.
+- **F-WOC-03** and **F-WOC-04** are closed with real regression tests, the former matching the WSR-15
+  catch-all precedent already in the Worker.
+
+The fix commits introduce no new injection, access-control, disclosure, lock-ordering, resource or
+contract surface: four small production edits, no query/migration/dependency/config/CI change, semgrep 0
+findings, gitleaks clean, both suites green at 627/137 with the delta accounted for test-by-test. The
+four new observations are one Low docs-drift item and three Info-grade residuals, all recorded above;
+none of them warrants another pipeline iteration.
+
+Recommend merging to `master`, with the F-WOC-14 doc edits as the only follow-up worth doing promptly.
