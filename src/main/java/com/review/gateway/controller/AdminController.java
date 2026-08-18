@@ -41,11 +41,12 @@ public class AdminController {
         // DB) so an operator can see at a glance whether the kill-switch is currently on.
         return new MetricsResponse(snapshot.total(), byStatus, snapshot.avgQueueMs(),
                 snapshot.avgRunMs(), snapshot.totalComments(), snapshot.retries(),
-                properties.getPrompt().isEnabled(), snapshot.promptDisabledCount(), snapshot.promptSectionMissingCount());
+                properties.getPrompt().isEnabled(), snapshot.promptDisabledCount(), snapshot.promptSectionMissingCount(),
+                snapshot.ownershipMismatches(), snapshot.workerFailureReportsIgnored());
     }
 
     private BackendView toView(BackendSnapshot snapshot) {
         return new BackendView(snapshot.id(), snapshot.name(), snapshot.model(), snapshot.capacity(),
-                snapshot.status().name(), (int) snapshot.running(), snapshot.lastSeen());
+                snapshot.status().name(), (int) snapshot.running(), snapshot.lastSeen(), snapshot.probeFailedSince());
     }
 }

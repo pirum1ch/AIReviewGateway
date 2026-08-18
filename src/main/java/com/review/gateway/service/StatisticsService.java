@@ -30,17 +30,20 @@ public class StatisticsService {
     private final ReviewCommentRepository reviewCommentRepository;
     private final ReviewEventRepository reviewEventRepository;
     private final BackendRepository backendRepository;
+    private final MetricsCounters metricsCounters;
 
     public StatisticsService(ReviewRepository reviewRepository,
                               ReviewJobRepository reviewJobRepository,
                               ReviewCommentRepository reviewCommentRepository,
                               ReviewEventRepository reviewEventRepository,
-                              BackendRepository backendRepository) {
+                              BackendRepository backendRepository,
+                              MetricsCounters metricsCounters) {
         this.reviewRepository = reviewRepository;
         this.reviewJobRepository = reviewJobRepository;
         this.reviewCommentRepository = reviewCommentRepository;
         this.reviewEventRepository = reviewEventRepository;
         this.backendRepository = backendRepository;
+        this.metricsCounters = metricsCounters;
     }
 
     /** Backs {@code GET /backends} (ADMIN-only). */
@@ -54,7 +57,8 @@ public class StatisticsService {
     private BackendSnapshot toSnapshot(Backend backend) {
         long running = reviewJobRepository.countRunningJobsForBackend(backend.getId());
         return new BackendSnapshot(backend.getId(), backend.getName(), backend.getModel(),
-                backend.getCapacity(), backend.getStatus(), running, backend.getLastSeen());
+                backend.getCapacity(), backend.getStatus(), running, backend.getLastSeen(),
+                backend.getProbeFailedSince());
     }
 
     @Transactional(readOnly = true)
@@ -95,7 +99,8 @@ public class StatisticsService {
         long promptSectionMissingCount = reviewEventRepository.countByEventType(EventType.PROMPT_SECTION_MISSING);
 
         return new MetricsSnapshot(total, byStatus, avgQueueMs, avgRunMs, totalComments, retries,
-                promptDisabledCount, promptSectionMissingCount);
+                promptDisabledCount, promptSectionMissingCount,
+                metricsCounters.ownershipMismatchSnapshot(), metricsCounters.workerFailureReportsIgnoredCount());
     }
 
     private double nullToZero(Double value) {
