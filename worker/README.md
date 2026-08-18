@@ -65,17 +65,21 @@ all queue/retry/dedup/timeout/routing/publish logic lives in the Gateway (see th
    literal {{DIFF}} substitution                       │
       │                                                 │
       │ unknown promptVersion / oversized diff          │
-      │  ──▶ AbandonJobException, jobs_failed++, loop   │
+      │  ──▶ AbandonJobException, jobs_failed++,        │
+      │      POST /jobs/{id}/fail (best-effort), loop   │
       ▼                                                 │
  start heartbeat scheduler ─────────────────────────────┤
       │                                                 ▼
       ▼                                       POST /jobs/{id}/heartbeat  (every heartbeat.interval-sec)
- POST /v1/chat/completions  (async, cancellable)         │
-   on llama-server                                       │ shouldContinue:false / 403 / 404
-      │                                                  │  ──▶ abort signal + cancel llama future
-      │ timeout / 5xx / malformed / oversize             │
-      │  ──▶ LlamaException, abandon, jobs_failed++      ▼
-      │                                       job aborted: submit nothing, no completed/failed metric
+      │                                       "Job in progress" INFO once per tick
+ "Starting inference" INFO                               │
+      ▼                                                  │ shouldContinue:false / 403 / 404
+ POST /v1/chat/completions  (async, cancellable)          │  ──▶ abort signal + cancel llama future
+   on llama-server                                        │
+      │                                                  ▼
+      │ timeout / 5xx / malformed / oversize   job aborted: submit nothing, no completed/failed metric,
+      │  ──▶ LlamaException, abandon, jobs_failed++,     NO /jobs/{id}/fail report (Gateway already owns it)
+      │      POST /jobs/{id}/fail (best-effort)
       │ aborted mid-flight (see left) ──────────────────▶│
       │
       ▼ success
@@ -109,7 +113,10 @@ Step by step, matching the code in `core.WorkerLoop`/`core.HeartbeatScheduler`:
    silently) and, after 3 consecutive failures, also aborts the job as a fail-safe.
 4. **Call llama-server.** `POST /v1/chat/completions` (OpenAI Chat-Completions shape) is issued
    asynchronously on the single shared `java.net.http.HttpClient`, so the abort signal above can cancel it
-   mid-generation instead of waiting out the full `network.request-timeout-sec`. A timeout, a non-2xx
+   mid-generation instead of waiting out the full `network.request-timeout-sec`. Immediately before this
+   call, the Worker logs one INFO line (`"Starting inference (jobId=..., reviewId=..., diffChars=...,
+   systemMessages=..., model=..., maxTokens=...)"` — sizes/counts only, never diff/prompt content) so
+   there is no silent gap between "job claimed" and the first heartbeat tick. A timeout, a non-2xx
    status, a malformed/empty body, or a response exceeding `worker.limits.max-response-bytes` all result
    in the job being **abandoned** — no synthetic result is ever submitted for a llama failure.
 5. **Submit the result.** `POST /jobs/{id}/result` with `{workerId, rawResponse, promptTokens,
@@ -117,15 +124,29 @@ Step by step, matching the code in `core.WorkerLoop`/`core.HeartbeatScheduler`:
    capped exponential backoff (holding the already-computed result in memory only, never on disk) until
    the Gateway responds `200`/`403`/`404` — this is transport-level redelivery of an idempotent,
    already-produced result, not a re-invocation of the LLM.
-6. **Loop.** Back to step 1, whether the previous job completed, was abandoned, or was aborted.
+6. **On abandonment, report it (outbound call, `gateway.GatewayClient.reportFailure`).** If step 2 or step
+   4 abandons the job (`AbandonJobException`/`LlamaException`), the Worker sends a single best-effort
+   `POST /jobs/{id}/fail` **synchronously**, after `HeartbeatScheduler.stop()` has already run and before
+   the loop returns to step 1 — `{workerId, reason, detail}`, where `reason` is one of
+   `LLM_EMPTY_RESPONSE`/`LLM_ERROR`/`LLM_TIMEOUT`/`LLM_RESPONSE_TOO_LARGE`/`PROMPT_INVALID`/`WORKER_ERROR`
+   (classified from the exception, `error.JobFailureReason`) and `detail` is a **fixed, Worker-side
+   constant per reason** (never `e.getMessage()`/`e.getCause().getMessage()`/`e.toString()` — a wrapped
+   Jackson parse failure can quote the offending llama response verbatim, which must never leave this
+   process). No retry/backoff of its own: any failure (Gateway unreachable, non-2xx, a `404` from an older
+   Gateway build with no such endpoint) is logged at `WARN`, counted in `worker.gateway.errors`, and
+   swallowed. Not sent at all when the job was aborted via `shouldContinue:false`/`403`/`404`
+   (step 3) or via an interrupted result redelivery (step 5) or graceful-shutdown force-abandonment — in
+   all three of those cases the Gateway already owns the transition, or a result may already be in flight,
+   so a failure report would be redundant or contradictory.
+7. **Loop.** Back to step 1, whether the previous job completed, was abandoned, or was aborted.
 
-**Abandon-on-failure semantics.** The Gateway has no `POST /jobs/{id}/failed` endpoint — the Worker
-never reports a llama/prompt failure to the Gateway directly. Instead it simply stops heartbeating and
-submits nothing; the Gateway's own stale-heartbeat sweep (default every 30s, `~180s` staleness threshold
-per the root README's [§4.2](../README.md#42-everything-else-has-a-working-default)) notices the job's
-heartbeat has gone stale and requeues or fails it according to its own retry policy. This trades up to
-~180s of reclaim latency (and the backend's capacity slot held meanwhile) for not needing any Gateway API
-this Worker does not otherwise call.
+**The Gateway's stale-heartbeat sweep remains the correctness backstop**, regardless of whether step 6's
+report is ever delivered — nothing in the system depends on it. If the Worker stops heartbeating entirely
+(crash, network partition, before it can even attempt step 6), the sweep (default every 30s, `~180s`
+staleness threshold per the root README's [§4.2](../README.md#42-everything-else-has-a-working-default))
+still notices the stale heartbeat and requeues/fails the job on its own. Step 6 exists purely to collapse
+that ~180-210s passive window down to well under a second for the common case of a Worker that is still
+alive enough to report.
 
 ## 3. Requirements
 
@@ -200,6 +221,7 @@ on any violation below; every failure message names the property only, never its
 | `WORKER_GATEWAY_TIMEOUT_SEC` | `network.gateway-timeout-sec` | `10` | Read timeout for every Gateway call (claim/heartbeat/result) — deliberately short; Gateway calls must never block as long as an LLM completion. Must be `> 0`. |
 | `WORKER_HEARTBEAT_INTERVAL_SEC` | `heartbeat.interval-sec` | `60` | Cadence of `POST /jobs/{id}/heartbeat` while a job is running. **Hard-rejected at startup if `>= 180`** (the Gateway's stale-heartbeat threshold — a misconfiguration here could not otherwise cause every job to self-evict); **logs a WARN if `> 90`** (little margin left). Must also be `> 0`. |
 | `WORKER_HTTP_PORT` | `server.port` | `8081` | Port for the embedded server, which hosts **only** Actuator (see [§8](#8-observability)) — the Worker has no business REST endpoints. |
+| `WORKER_IDLE_SUMMARY_INTERVAL_SEC` | `worker.log.idle-summary-interval-sec` | `300` | Worker Observability & Claim Latency. At most one INFO idle-liveness summary line (`"Idle: no job available in the last N poll(s) (backend=...)"`) per this many seconds while no job is available; the poll counter resets on a successful claim. `0` disables it entirely. Must be `>= 0`. |
 
 ### 5.3 Hardcoded in `application.yml` (no environment-variable placeholder)
 
@@ -393,7 +415,7 @@ Slotting a Worker into an existing Review Gateway deployment:
 
 ### 7.1 Troubleshooting curl examples
 
-The three Gateway endpoints this Worker calls, useful for testing a Gateway/Worker pairing by hand
+The four Gateway endpoints this Worker calls, useful for testing a Gateway/Worker pairing by hand
 (`$WORKER_TOKEN` below is the Gateway's configured token, i.e. this Worker's `GATEWAY_API_KEY`):
 
 ```bash
@@ -426,6 +448,15 @@ curl -s -X POST "$GATEWAY_URL/jobs/456/result" \
         "model": "qwen2.5-coder"
       }'
 # 200 -> {"reviewId":123,"status":"COMPLETED"}  (idempotent: safe to resend the exact same body)
+
+# 4. Report a failure (Worker Observability & Claim Latency) -- sent instead of step 3 when the job is
+# abandoned; best-effort, no retry.
+curl -s -X POST "$GATEWAY_URL/jobs/456/fail" \
+  -H "Authorization: Bearer $WORKER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{ "workerId": "worker-mac-mini-01", "reason": "LLM_TIMEOUT", "detail": "llama-server did not respond within the configured timeout" }'
+# 200 -> {"accepted":true}  (identical whether applied or an idempotent no-op)
+# 404/403 -> unknown job / not this job's owner (same opaque semantics as heartbeat/result)
 ```
 
 ## 8. Observability
@@ -436,7 +467,7 @@ at the default `/actuator` base path:
 
 - `GET /actuator/health` (and, since health probes are enabled, `/actuator/health/liveness` /
   `/actuator/health/readiness`).
-- `GET /actuator/prometheus` — the six `worker_*` metrics below, in Prometheus exposition format.
+- `GET /actuator/prometheus` — the `worker_*` metrics below, in Prometheus exposition format.
 
 ### 8.1 Metrics (`metrics.WorkerMetrics`)
 
@@ -446,7 +477,8 @@ at the default `/actuator` base path:
 | `worker_jobs_completed_total` | Counter | Incremented only once the Gateway has actually acknowledged the result (`POST /jobs/{id}/result` returned `200`/`403`/`404` — all three are terminal, idempotent-acknowledged outcomes from the Worker's perspective). An interrupted/abandoned result redelivery (e.g. shutdown grace period elapsing mid-retry) does **not** increment this. |
 | `worker_jobs_failed_total` | Counter | Incremented when a job is abandoned: unknown `promptVersion`, oversized diff, any llama failure (timeout/5xx/malformed/oversize), or a result redelivery that was interrupted/abandoned before the Gateway ever acknowledged it. |
 | `worker_llama_duration_seconds_count` / `_sum` | Timer | Latency of successful llama-server chat-completion calls only (a call that fails before a result is parsed is not recorded here). |
-| `worker_gateway_errors_total` | Counter | Incremented every time a Gateway call (claim, or result-submission during redelivery) fails with a connection error or `5xx`, i.e. every `GatewayUnavailableException`. Heartbeat failures are **not** counted here (see the log-based signal below instead). |
+| `worker_gateway_errors_total` | Counter | Incremented every time a Gateway call (claim, result-submission during redelivery, or a `POST /jobs/{id}/fail` report) fails with a connection error or `5xx`/other non-2xx, i.e. every `GatewayUnavailableException`. Heartbeat failures are **not** counted here (see the log-based signal below instead). |
+| `worker_failures_reported_total` | Counter | Worker Observability & Claim Latency. Incremented once per `POST /jobs/{id}/fail` attempt the Worker made (whether or not the Gateway ultimately accepted it — see `worker_gateway_errors_total` for delivery failures). Distinguishes "failed and told the Gateway" from "failed silently" in `worker_jobs_failed_total`. |
 | `worker_uptime_seconds` | Gauge | Seconds since the `WorkerMetrics` bean was constructed (process start, effectively). |
 
 A job that is aborted mid-flight because the Gateway said `shouldContinue:false`/`403`/`404` on a
@@ -463,9 +495,14 @@ noted):
 
 | Log line (abbreviated) | Level | Meaning |
 |---|---|---|
+| `Claimed job (jobId=…, reviewId=…)` | INFO | A job was actually claimed. **Worker Observability & Claim Latency:** the empty-poll (`204`) case now drops to DEBUG, so this line only fires when there is real work — a busy Worker used to be silent while an idle one logged every poll; that is now inverted. |
+| `Job in progress (jobId=…, workerId=…, elapsedSec=…, heartbeats=…)` | INFO | One line per heartbeat tick (`heartbeat.interval-sec`, default once a minute) while a job is genuinely running — closes what was previously up to `network.request-timeout-sec` (1800s) of silence for a busy Worker. |
+| `Starting inference (jobId=…, reviewId=…, diffChars=…, systemMessages=…, model=…, maxTokens=…)` | INFO | Immediately before the llama-server call — sizes/counts only, never diff/prompt/response content. |
+| `Idle: no job available in the last {N} poll(s) (backend=…)` | INFO | Rate-limited idle-liveness summary (`worker.log.idle-summary-interval-sec`, default once per 5 minutes) — proves a genuinely idle Worker is still alive without spamming one line per poll. |
 | `Gateway unavailable while claiming a job; backing off {N} ms` | WARN | Gateway is unreachable/erroring on claim; the loop is backing off (capped at 60s) and will keep retrying — not itself an outage requiring restart, but worth alerting if sustained. |
 | `Gateway unavailable while submitting result; retrying in {N} ms` | WARN | Same, but for an already-computed result stuck in redelivery — a sustained run of these means completed work is not reaching the Gateway. |
-| `Job abandoned (jobId=…): …` | WARN | A job was abandoned (prompt/llama failure) — expected occasionally, worth alerting on a sustained rate (points at a broken `llama-server` or a bad prompt template). |
+| `Job abandoned (jobId=…, reason=…, exceptionType=…)` | WARN | A job was abandoned (prompt/llama failure), classified into one of `LLM_EMPTY_RESPONSE`/`LLM_ERROR`/`LLM_TIMEOUT`/`LLM_RESPONSE_TOO_LARGE`/`PROMPT_INVALID`/`WORKER_ERROR`. **Worker Observability & Claim Latency:** never logs the exception's message any more (only its class name) — a wrapped Jackson parse failure can quote the offending llama response verbatim, which must never reach a log line. Expected occasionally; worth alerting on a sustained rate (points at a broken `llama-server` or a bad prompt template). |
+| `Failed to report job failure to the Gateway; the stale-heartbeat sweep will recover it (jobId=…)` | WARN | The best-effort `POST /jobs/{id}/fail` report failed (Gateway unreachable, non-2xx, or an older Gateway build without the endpoint) — swallowed, no retry; the passive sweep remains the backstop. |
 | `Result redelivery abandoned before the Gateway ever acknowledged it; counting job as failed` | WARN | A result redelivery was interrupted (typically the shutdown grace period elapsing) before the Gateway confirmed receipt. |
 | `Heartbeat tick failed ({N} consecutive) (jobId=…)` | WARN | A single heartbeat attempt failed (e.g. transient Gateway error); the scheduler keeps running. |
 | `Heartbeat failed {N} times in a row (jobId=…); aborting fail-safe rather than running blind` | ERROR | Fail-safe abort after 3 consecutive heartbeat failures (`WSR-15`) — the Gateway may believe this job is still running while the Worker has actually given up on it; the Gateway's own heartbeat-timeout sweep will eventually reclaim it. |

@@ -38,6 +38,7 @@ GitLab CI job  ──POST /reviews──▶  Review Gateway  ──▶  PostgreS
        │                          POST /jobs/claim
        │                          POST /jobs/{id}/heartbeat
        │                          POST /jobs/{id}/result
+       │                          POST /jobs/{id}/fail  (best-effort)
        │                                  │  │
        │                                  ▼  │
        │                          stateless Worker(s)
@@ -157,7 +158,9 @@ kill-switch at its default, this token is never required and `validatePromptOnSt
 | `gateway.heartbeat.timeout` | `180s` | A `RUNNING` job is considered stale if `now - heartbeat_at` exceeds this; it is then requeued or failed. |
 | `gateway.heartbeat.interval` | `60s` | **Documents** the expected Worker heartbeat cadence; as of this codebase it is not bound to any `GatewayProperties` field (only `gateway.heartbeat.timeout` is read by the application), so changing it has no runtime effect — it exists purely as the value Worker implementations should target for `POST /jobs/{id}/heartbeat` frequency. |
 | `gateway.retry.max-attempts` | `3` | Max claim attempts before a Review is marked `FAILED` instead of requeued. |
+| `gateway.retry.requeue-delay` | `90s` | **Worker Observability & Claim Latency.** Delay before a requeued job becomes claimable again (`review_jobs.not_before`). **90s, not the more obvious-looking 30s** — a startup check enforces `requeue-delay × (max-attempts − 1) ≥ gateway.backend.failure-grace`, so a dead/restarting backend's attempt budget can never be exhausted faster than it can be detected and demoted (see §10). `0` disables the mechanism entirely (immediate requeue, today's pre-this-feature behavior) and **must** be paired with `gateway.backend.failure-grace: 0` — neither may be zeroed alone. |
 | `gateway.job.max-duration` | `45m` | Hard backstop: a `RUNNING` job older than this is requeued/failed even if heartbeats are still arriving. |
+| `gateway.job.max-fail-body-bytes` | `4096` | Hard byte cap on the whole `POST /jobs/{id}/fail` body (edge filter, see [§6.9](#69-body-size-limits)). |
 | `gateway.publish.max-comment-count` | `50` | Max parsed comments kept per Review; excess is dropped. |
 | `gateway.publish.max-comment-length` | `4000` | Max characters per parsed comment; excess is truncated. |
 | `gateway.publish.max-raw-response-length` | `200000` | Max characters of the raw LLM response actually persisted; oversized responses are truncated (not rejected) before storage and parsing. |
@@ -167,8 +170,12 @@ kill-switch at its default, this token is never required and `validatePromptOnSt
 | `gateway.scheduler.publish-retry-interval` | `60s` | Tick interval for retrying publication of `COMPLETED` reviews. |
 | `gateway.gitlab.base-url` (`GITLAB_BASE_URL`) | `https://gitlab.example.com/api/v4` | GitLab API base URL. **Must** start with `https://` or the application refuses to start. |
 | `gateway.gitlab.connect-timeout` / `read-timeout` | `5s` / `30s` | Timeouts for the GitLab HTTP client. |
-| `gateway.backend.connect-timeout` / `read-timeout` | `3s` / `5s` | Timeouts for the backend `/health` probe client (which also disables following redirects). |
+| `gateway.backend.connect-timeout` / `read-timeout` | `3s` / `10s` | Timeouts for the backend `/health` probe client (which also disables following redirects). `read-timeout` was raised from `5s` — safe because the probe's HTTP call no longer runs inside a database transaction (see §10). |
 | `gateway.backend.allowed-host-pattern` (`BACKEND_ALLOWED_HOST_PATTERN`) | `.*` (matches any host) | Regex a backend's URL host must match before it is probed, on top of an always-on block of loopback/link-local/any-local/multicast addresses. **See the deployment must-do below — the default is permissive.** |
+| `gateway.backend.failure-grace` | `180s` | **Worker Observability & Claim Latency.** A backend flips `ACTIVE → SUSPECT` only after this many seconds of *continuous* failed health probes (fail-slow); recovery (`SUSPECT → ACTIVE`) stays single-success (recover-fast). Must be `≥ gateway.scheduler.backend-health-interval`; see the `requeue-delay` coupling above. |
+| `gateway.backend.defer-demotion-while-busy` | `true` | A failed probe does not demote a backend that is at capacity with at least one `RUNNING` job whose heartbeat is still fresh (dispatch-neutral: an at-capacity backend is already unclaimable). |
+| `gateway.backend.defer-demotion-max` | `45m` | Upper bound on how long the deferral above may postpone a demotion; past it, demotion proceeds regardless of capacity/heartbeat freshness. |
+| `worker.log.idle-summary-interval-sec` (`WORKER_IDLE_SUMMARY_INTERVAL_SEC`, **Worker module**) | `300` | At most one INFO idle-liveness summary line per this many seconds while a Worker finds no job to claim; `0` disables it. See [§9](#9-worker-protocol). |
 
 ### 4.3 Deployment must-dos (from `docs/security/feature-03-sast-report.md`)
 
@@ -291,7 +298,7 @@ by Jackson with default (camelCase) field naming — no custom naming strategy i
 | `/reviews` | `POST` | `CI` |
 | `/reviews/{id}` | `GET` | `CI` |
 | `/reviews/{id}` | `DELETE` | `ADMIN` |
-| `/jobs/claim`, `/jobs/{id}/heartbeat`, `/jobs/{id}/result` | `POST` | `WORKER` |
+| `/jobs/claim`, `/jobs/{id}/heartbeat`, `/jobs/{id}/result`, `/jobs/{id}/fail` | `POST` | `WORKER` |
 | `/backends` | `GET` | `ADMIN` |
 | `/metrics` | `GET` | `ADMIN` |
 | `/health` | `GET` | none (public) |
@@ -569,6 +576,49 @@ optional), `model` (`String`, optional).
   status with no further state change.
 - **`404 Not Found`** / **`403 Forbidden`** — same semantics as heartbeat.
 
+### 6.6a `POST /jobs/{id}/fail` — report a Worker-side failure (Worker)
+
+**Worker Observability & Claim Latency.** Best-effort, latency-only: it lets the Gateway requeue/fail a
+job in well under a second instead of waiting out the passive stale-heartbeat sweep (up to ~210s). The
+Worker sends this **once**, synchronously, right after it gives up on a job (`AbandonJobException`/
+`LlamaException`) and **before** it claims the next one — never as a retry loop, and never for a job that
+was cancelled/superseded via heartbeat (that case needs no report: the Gateway already owns that
+transition).
+
+```bash
+curl -s -X POST http://localhost:8080/jobs/456/fail \
+  -H "Authorization: Bearer $WORKER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{ "workerId": "worker-mac-mini-01", "reason": "LLM_TIMEOUT", "detail": "llama-server did not respond within the configured timeout" }'
+```
+
+Request fields (`FailJobRequest`): `workerId` (non-blank, `≤64` chars, `^[A-Za-z0-9._:-]{1,64}$`),
+`reason` (non-blank, `≤32` chars — one of `LLM_EMPTY_RESPONSE`/`LLM_ERROR`/`LLM_TIMEOUT`/
+`LLM_RESPONSE_TOO_LARGE`/`PROMPT_INVALID`/`WORKER_ERROR`; the Gateway whitelist-parses this and treats
+any other value as `UNKNOWN` — it **never** rejects an unrecognized code with `400`, so an
+independently-versioned Worker fleet degrades safely), `detail` (optional, `≤500` chars — a fixed,
+Worker-side-constant description **never** derived from an exception message; sanitized and truncated to
+200 chars server-side before it can reach a log line, `review_events.details`, or
+`review_jobs.last_error`).
+
+- **`200 OK`** — `{ "accepted": true }`, identical whether the report was actually applied (job was
+  `RUNNING` and owned — it is now `QUEUED`/`FAILED`) or was an idempotent no-op (job already left
+  `RUNNING`). The Worker has no use for the distinction.
+- **`404 Not Found`** / **`403 Forbidden`** — same opaque semantics as heartbeat/result (unknown `jobId` /
+  `workerId` does not match the current owner). Unlike `/result`, the `200` response **never** carries a
+  `reviewId` or Review status.
+- `reason`/`detail` are audit-only: they are recorded on the resulting `RETRY`/`FAILED` `review_events`
+  row (`details` prefixed `"worker-reported: reason=<CODE>[; detail=<sanitized>]"`) and never influence
+  the requeue-vs-fail decision, which stays exactly `attempts >= gateway.retry.max-attempts` — "retry
+  logic lives only in the Gateway" holds even though the Worker now speaks about failures.
+- Delivery is best-effort: a single attempt, no retry/backoff of its own. If this call fails or an older
+  Gateway build returns `404` for the path itself, the Worker logs a `WARN`, counts it, and moves on — the
+  passive stale-heartbeat sweep remains the correctness backstop regardless.
+- `review_jobs.not_before` (set on the requeue branch to `now() + gateway.retry.requeue-delay`, computed
+  against the database clock) prevents a fast-fail storm: without it, a deterministic worker-side failure
+  could burn all `gateway.retry.max-attempts` attempts within seconds. See §4.2's note on
+  `gateway.retry.requeue-delay` for the coupling to `gateway.backend.failure-grace`.
+
 ### 6.7 `GET /backends` / `GET /metrics` (Admin)
 
 ```bash
@@ -583,12 +633,19 @@ curl -s http://localhost:8080/backends -H "Authorization: Bearer $ADMIN_TOKEN"
     "capacity": 1,
     "status": "ACTIVE",
     "running": 0,
-    "lastSeen": "2026-07-13T10:05:00Z"
+    "lastSeen": "2026-07-13T10:05:00Z",
+    "probeFailedSince": null
   }
 ]
 ```
 `running` is derived live from the count of currently-`RUNNING` jobs on that backend — there is no
 separate counter to drift out of sync. The backend's URL is deliberately **not** included in this view.
+`lastSeen` now means "last time this backend answered a health probe **successfully**" (previously
+written on every probe pass, success or failure). `probeFailedSince` (Worker Observability & Claim
+Latency) is non-`null` while a continuous failed-probe streak is in progress but hasn't yet reached
+`gateway.backend.failure-grace` (still `ACTIVE`) or while a failed-but-at-capacity backend's demotion is
+being deferred (§10) — an operator can read "failing for 2 of 3 minutes' grace" directly from this field
+without querying PostgreSQL.
 
 ```bash
 curl -s http://localhost:8080/metrics -H "Authorization: Bearer $ADMIN_TOKEN"
@@ -600,9 +657,18 @@ curl -s http://localhost:8080/metrics -H "Authorization: Bearer $ADMIN_TOKEN"
   "avgQueueMs": 4210.5,
   "avgRunMs": 96340.2,
   "totalComments": 214,
-  "retries": 5
+  "retries": 5,
+  "ownershipMismatches": { "heartbeat": 0, "result": 0, "fail": 0 },
+  "workerFailureReportsIgnored": 0
 }
 ```
+`ownershipMismatches` (broken down by endpoint) and `workerFailureReportsIgnored` (Worker Observability &
+Claim Latency, WOR-03) are process-local, in-memory counters — they reset on a Gateway restart, unlike
+every other field on this endpoint, which is derived from PostgreSQL. This is deliberate: writing a
+`review_events` row for every rejected/no-op `POST /jobs/{id}/fail` report would turn the endpoint into an
+authenticated, unbounded `INSERT` primitive for any worker-token holder — a worse problem than the
+repudiation gap these counters close. A `workerId`-guessing campaign against `/jobs/**` is necessarily
+noisy; these counters (plus the existing `WARN` logs) are what makes that noise visible without that risk.
 
 ### 6.8 Error format
 
@@ -618,7 +684,7 @@ short machine-readable code plus a human-readable message, never a stack trace o
 | 403 | `FORBIDDEN` | Valid token, wrong role for this endpoint. (Written by `SecurityConfig`.) |
 | 404 | `NOT_FOUND` | Unknown review id. |
 | 409 | `INVALID_STATE_TRANSITION` | Admin cancel on an already-terminal Review. |
-| 413 | `PAYLOAD_TOO_LARGE` | Request body exceeds the configured edge cap. (Written by `RequestBodySizeLimitFilter`, not `GlobalExceptionHandler`.) |
+| 413 | `PAYLOAD_TOO_LARGE` | Request body exceeds the configured edge cap (`POST /reviews`, `POST /jobs/{id}/result`, or `POST /jobs/{id}/fail`). (Written by `RequestBodySizeLimitFilter`, not `GlobalExceptionHandler`.) |
 | 422 | `DIFF_TOO_LARGE` | Diff exceeds the token budget. |
 | 500 | `INTERNAL_ERROR` | Anything unmapped; the real exception is logged server-side only. |
 
@@ -630,14 +696,20 @@ at-capacity backend. This mapping is dead code kept for forward-compatibility; d
 
 A servlet filter (`RequestBodySizeLimitFilter`, registered ahead of Spring Security) rejects an
 oversized body based on the `Content-Length` header, before authentication or JSON parsing: `320,000`
-bytes for `POST /reviews` (`gateway.diff.max-request-body-bytes`, CSR-02 — see [§4.2](#42-everything-else-has-a-working-default))
-and `500,000` bytes for
-`POST /jobs/{id}/result` (`gateway.publish.max-request-body-bytes`). `POST /jobs/claim` and
+bytes for `POST /reviews` (`gateway.diff.max-request-body-bytes`, CSR-02 — see [§4.2](#42-everything-else-has-a-working-default)),
+`500,000` bytes for
+`POST /jobs/{id}/result` (`gateway.publish.max-request-body-bytes`), and `4,096` bytes for
+`POST /jobs/{id}/fail` (`gateway.job.max-fail-body-bytes`). `POST /jobs/claim` and
 `POST /jobs/{id}/heartbeat` bodies are not size-capped (their DTOs are small and Worker-authenticated
 only — a documented, accepted low-risk gap, see the SAST report's F03-03 finding). This
 `Content-Length`-based check does not catch a client that both omits `Content-Length` and streams an
 unbounded chunked body; that residual gap is accepted at this project's scale (internal CI/Worker
 clients, not a public API).
+
+The filter matches on the **decoded, normalized** request path (not the raw, possibly percent-encoded
+`request.getRequestURI()`), so a percent-encoded path segment (e.g. `POST /jobs/1/%66ail` decoding to
+`/jobs/1/fail`) cannot bypass any of the three caps above — this mirrors exactly how Spring MVC itself
+resolves the path it ultimately routes on.
 
 ## 7. GitLab CI integration
 
@@ -745,8 +817,8 @@ transition is validated and applied in exactly one place (`StateMachine`) and wr
 | `NEW → QUEUED` | `POST /reviews` (same transaction as the initial insert). |
 | `QUEUED → RUNNING` | A Worker successfully claims the job (`POST /jobs/claim`). |
 | `RUNNING → COMPLETED` | `POST /jobs/{id}/result` is processed successfully. |
-| `RUNNING → QUEUED` | Heartbeat timeout or max-duration backstop, **and** attempts remaining (retry). |
-| `RUNNING → FAILED` | Heartbeat timeout/max-duration with attempts exhausted, **or** the result could not be parsed at all. |
+| `RUNNING → QUEUED` | Heartbeat timeout, max-duration backstop, **or** a Worker-reported failure (`POST /jobs/{id}/fail`) — any of the three, **and** attempts remaining (retry). |
+| `RUNNING → FAILED` | Any of the three triggers above with attempts exhausted, **or** the result could not be parsed at all. |
 | `COMPLETED → PUBLISHED` | All parsed comments were successfully posted to the MR. |
 | `COMPLETED → COMPLETED` | A transient GitLab API failure during publish — stays `COMPLETED`, retried later; not a state change, no new event. |
 | `(NEW/QUEUED/RUNNING/COMPLETED) → OBSOLETE` | A new `head_sha` arrives for the same `(projectId, mergeRequestId)`. |
@@ -761,6 +833,11 @@ Retry and timeout parameters (defaults; see [§4](#4-configuration) to change th
   (`gateway.scheduler.heartbeat-check-interval`).
 - **Max-duration backstop, 45 minutes** (`gateway.job.max-duration`): a hard cap beyond heartbeat
   monitoring, in case a Worker keeps heartbeating a job that will never finish.
+- **Worker-reported failure** (`POST /jobs/{id}/fail`, [§6.6a](#66a-post-jobsidfail--report-a-worker-side-failure-worker)):
+  best-effort, latency-only — collapses the above sweeps' passive wait (up to ~210s) down to well under a
+  second for the common case of a Worker that is still alive enough to report its own failure.
+  `gateway.retry.requeue-delay` (default 90s) then bounds how soon the requeued job becomes claimable
+  again, preventing a fast-fail storm.
 
 `GET /reviews/{id}` exposes exactly the current `status` value from this table, plus `attempts` (so a
 caller can tell "will retry" from "exhausted retries" once a Review reaches `FAILED`).
@@ -808,11 +885,30 @@ access at all.
    your process crashes after a successful submission and you (or a retry mechanism) resend the exact
    same result, the Gateway detects the job is no longer `RUNNING` and returns the current status
    without any further state change or duplicate data.
+5. **On abandonment, report it.** If you give up on a job (llama-server error/timeout/oversized response,
+   an invalid `promptVersion`, etc.) **without** ever calling step 4, send a single best-effort
+   `POST /jobs/{id}/fail` ([§6.6a](#66a-post-jobsidfail--report-a-worker-side-failure-worker)) with the
+   same `workerId`, a `reason` code, and — optionally — a short, **fixed, non-sensitive** `detail` string
+   you chose ahead of time per failure class. **Never** derive `detail` from an exception message: a JSON
+   parse failure on a malformed llama-server response can quote that response's content verbatim, and
+   that must never leave your process. Do **not** report if the job was aborted via a `shouldContinue:
+   false`/`403`/`404` heartbeat response — the Gateway already owns that transition. One attempt only, no
+   retry/backoff of your own; swallow any failure and move on to the next claim.
 
 What a Worker deliberately does **not** need to know or have access to: GitLab (no API calls, no
 token), PostgreSQL (no driver, no credentials, no schema knowledge), retry counting or the max-attempts
 limit, deduplication, or how the raw response gets parsed into structured comments — all of that is the
 Gateway's responsibility.
+
+### Worker log visibility (implementation guidance, non-normative)
+
+The reference Worker implementation in `worker/` (see [worker/README.md](worker/README.md)) emits one
+INFO line per heartbeat tick while a job is in progress (`"Job in progress (jobId=..., elapsedSec=...,
+heartbeats=...)"`), one INFO line at the start of inference (sizes/counts only — never diff/prompt/
+response content), and an INFO only when a job is actually claimed (the empty-poll case drops to DEBUG),
+plus a rate-limited idle-liveness summary (`worker.log.idle-summary-interval-sec`, default 300s) so a
+genuinely idle Worker still proves liveness without spamming one line per poll. If you implement your own
+Worker, matching this log shape is recommended but not required by the API contract.
 
 ## 10. Operations
 
@@ -828,10 +924,32 @@ Backend status (`GET /backends`, ADMIN) is one of:
 | `OFFLINE` | Same as `MAINTENANCE` — operator-managed, ignored by the automatic health checker. |
 
 The health checker probes every `ACTIVE`/`SUSPECT` backend's `{url}/health` on the
-`gateway.scheduler.backend-health-interval` tick (default 60s), flipping `ACTIVE → SUSPECT` on failure
-and `SUSPECT → ACTIVE` on recovery, and updates `last_seen`. Capacity for claim purposes is always the
+`gateway.scheduler.backend-health-interval` tick (default 60s). Capacity for claim purposes is always the
 live count of currently-`RUNNING` jobs on that backend versus its configured `capacity` — there is no
 separate counter to go stale.
+
+**Fail-slow / recover-fast (Worker Observability & Claim Latency).** A single failed probe no longer
+demotes a backend: `ACTIVE → SUSPECT` now requires a **continuous** failed-probe streak of at least
+`gateway.backend.failure-grace` (default 180s), tracked in the restart-safe `backends.probe_failed_since`
+column so the streak survives a Gateway restart. `SUSPECT → ACTIVE` stays **single-success**
+(recover-fast, unchanged). `last_seen` is now updated only on a *successful* probe (previously written
+unconditionally). Two independent safeguards work together here:
+
+- **At-capacity deferral.** A failed probe does not demote a backend that is at capacity with at least
+  one `RUNNING` job whose heartbeat is still fresh (`gateway.backend.defer-demotion-while-busy`, default
+  `true`) — dispatch-neutral by construction, since an at-capacity backend is already unclaimable, and
+  kept dispatch-neutral *over time* too: the claim path independently declines any backend whose
+  `probe_failed_since` streak is already past `failure-grace`, regardless of its persisted `status`.
+  Capped by `gateway.backend.defer-demotion-max` (default 45m) so a backend held busy indefinitely (e.g.
+  by a misbehaving Worker) cannot defer demotion forever.
+- **Probe I/O runs outside any database transaction** (previously it ran inside one), which is what makes
+  raising `gateway.backend.read-timeout` from `5s` to `10s` safe — a slow/hanging probe no longer pins a
+  Hikari connection.
+
+If `gateway.scheduler.heartbeat-check-interval`/`backend-health-interval` findings ever WARN
+`"Queue stalled: N job(s) QUEUED but 0 eligible ACTIVE backend(s)"`, that condition now fires whenever
+there is no backend that is both `ACTIVE` **and** not past a grace-elapsed failure streak — not merely "no
+`ACTIVE` backend" — so a deferred-but-effectively-dead backend can't silently suppress the alarm.
 
 ### Scheduled jobs
 

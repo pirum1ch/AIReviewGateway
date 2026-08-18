@@ -82,25 +82,31 @@ Plus `CANCELLED` and `OBSOLETE`, reachable from any non-terminal state. All tran
 - `POST /jobs/claim` — claim next job (`FOR UPDATE SKIP LOCKED`, priority DESC then created_at ASC).
 - `POST /jobs/{id}/heartbeat` — Worker pings every ~60s; response's `continue` flag tells it to stop if the Review went `OBSOLETE`/`CANCELLED`.
 - `POST /jobs/{id}/result` — submit raw response + tokens + duration; idempotent no-op if job is no longer `RUNNING`.
+- `POST /jobs/{id}/fail` — best-effort Worker-reported failure (Worker Observability & Claim Latency);
+  drives `RetryManager.requeueOrFail` immediately instead of waiting out the passive stale-heartbeat
+  sweep. Ownership re-checked under the job-row lock; `200`/`403`/`404` mirror heartbeat/result's opacity
+  and never echo `reviewId`/status. `reason`/`detail` are audit-only, never influence the retry decision.
 
 **Service:** `GET /health`, `GET /metrics`, `GET /backends`.
 
 ## Data model (PostgreSQL, via Flyway migrations)
 
 - `review_inputs` — immutable input payload (diff, SHAs, prompt version) — enables re-running a Review without hitting GitLab again.
-- `review_jobs` — the queue: status, priority, backend_id, worker_id, attempts, heartbeat_at, timestamps.
+- `review_jobs` — the queue: status, priority, backend_id, worker_id, attempts, heartbeat_at, timestamps,
+  last_error, `not_before` (V4, Worker Observability & Claim Latency — earliest instant a requeued job is
+  claimable again; `NULL` = immediately).
 - `review_results` — raw model response (mandatory, stored before parsing), summary, tokens, duration, model.
 - `review_comments` — parsed comments (file/line/severity/text) plus `discussion_id` for idempotent publishing.
 - `review_events` — full audit trail (CREATED, CLAIMED, RUNNING, HEARTBEAT, RETRY, COMPLETED, PUBLISHED, FAILED, OBSOLETE).
-- `backends` — registry of llama-server instances: url, model, capacity, status (`ACTIVE/SUSPECT/MAINTENANCE/OFFLINE`), last_seen. Backend load is derived from the count of currently-running jobs, not a separate counter.
+- `backends` — registry of llama-server instances: url, model, capacity, status (`ACTIVE/SUSPECT/MAINTENANCE/OFFLINE`), last_seen (updated on successful probe only, as of V4), `probe_failed_since` (V4 — restart-safe continuous-failure-streak start, `NULL` = not currently failing). Backend load is derived from the count of currently-running jobs, not a separate counter.
 - `review_chunks` (V2, diff chunking) — one row per file-based chunk when a diff is too large for one prompt; `review_jobs` is 1:N per Review once chunked.
 - `review_prompt_sections` (V3, Prompt Manager, feature-flagged) — immutable, append-only per-section snapshot of the Git-sourced system prompt actually used for a Review (source project/ref/commit, content hash), written once at Review creation and never mutated. `reviews.prompt_bundle_mode` (`NONE`/`REPO`) records whether a Review was created under this feature at all — see `docs/prompt-manager-architecture.md`.
 
 ## Retry / timeout / backend health
 
 - Retry logic lives only in Gateway (attempts < 3 by default); Worker/Backend have no retry logic of their own.
-- A job is considered stuck if `now - heartbeat_at` exceeds the configured interval (~3 min); it's returned to the queue. A separate max-total-duration cap is a backstop beyond heartbeat monitoring.
-- Backends flip `ACTIVE → SUSPECT` on health-check failure or unavailability and are excluded from new assignments; a periodic check auto-recovers `SUSPECT → ACTIVE`.
+- A job is considered stuck if `now - heartbeat_at` exceeds the configured interval (~3 min); it's returned to the queue. A separate max-total-duration cap is a backstop beyond heartbeat monitoring. As of Worker Observability & Claim Latency, a Worker can also report its own abandonment via `POST /jobs/{id}/fail` (best-effort, never required for correctness) to collapse that passive wait to well under a second.
+- Backends flip `ACTIVE → SUSPECT` only after a *continuous* failed-probe streak of `gateway.backend.failure-grace` (default 180s, fail-slow) and are excluded from new assignments; a single successful probe still auto-recovers `SUSPECT → ACTIVE` (recover-fast, unchanged). `gateway.retry.requeue-delay` (default 90s) is coupled to `failure-grace` at startup so a dead/restarting backend's attempt budget can never be exhausted faster than the backend can be detected and demoted.
 
 ## Workflow for new features on this project
 
