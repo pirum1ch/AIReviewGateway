@@ -46,6 +46,10 @@ worker:
     max-response-bytes: ${WORKER_MAX_RESPONSE_BYTES:200000}
     # Prompt Manager (V3, WSR-03 sibling): independent of gateway.prompt.limits.max-sections.
     max-system-messages: ${WORKER_MAX_SYSTEM_MESSAGES:8}
+  log:
+    # Worker Observability & Claim Latency (WOC-04): at most one idle-liveness INFO line per this many
+    # seconds while no job is available; 0 disables it.
+    idle-summary-interval-sec: ${WORKER_IDLE_SUMMARY_INTERVAL_SEC:300}
 
 backend:
   id: ${BACKEND_ID}

@@ -139,6 +139,9 @@ public class WorkerProperties {
         requirePositive("worker.limits.maxDiffBytes", worker.getLimits().getMaxDiffBytes());
         requirePositive("worker.limits.maxResponseBytes", worker.getLimits().getMaxResponseBytes());
         requirePositive("worker.limits.maxSystemMessages", worker.getLimits().getMaxSystemMessages());
+        if (worker.getLog().getIdleSummaryIntervalSec() < 0) {
+            throw new IllegalStateException("worker.log.idleSummaryIntervalSec must be >= 0 (0 disables it) — refusing to start");
+        }
         validatePromptLocation();
         validateServerBinding();
         warnIfHeapDumpOnOutOfMemoryEnabled();
@@ -335,6 +338,8 @@ public class WorkerProperties {
         private boolean allowInsecureGateway = false;
         @Valid
         private final Limits limits = new Limits();
+        @Valid
+        private final Log log = new Log();
 
         public String getId() {
             return id;
@@ -362,6 +367,29 @@ public class WorkerProperties {
 
         public Limits getLimits() {
             return limits;
+        }
+
+        public Log getLog() {
+            return log;
+        }
+
+        /**
+         * Worker Observability &amp; Claim Latency (WOC-04): idle-liveness log summary config.
+         */
+        public static class Log {
+            /**
+             * At most one INFO idle-summary line per this many seconds while no job is available;
+             * {@code 0} disables it entirely. Default {@code 300} (5 minutes).
+             */
+            private int idleSummaryIntervalSec = 300;
+
+            public int getIdleSummaryIntervalSec() {
+                return idleSummaryIntervalSec;
+            }
+
+            public void setIdleSummaryIntervalSec(int idleSummaryIntervalSec) {
+                this.idleSummaryIntervalSec = idleSummaryIntervalSec;
+            }
         }
 
         /** WSR-03/WSR-04: independent Worker-side caps on Gateway-/llama-supplied data (treated as untrusted). */
