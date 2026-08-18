@@ -116,6 +116,7 @@ public class BackendHealthChecker {
         }
 
         checkQueueStalled();
+        checkStuckQueuedJobs();
         return flips;
     }
 
@@ -246,5 +247,22 @@ public class BackendHealthChecker {
             }
         }
         return false;
+    }
+
+    /**
+     * WOR-15(a): reuses this same tick (no new scheduled job) to surface a distinct failure mode from
+     * {@link #checkQueueStalled()} — a {@code QUEUED} job whose {@code not_before} has been in the past
+     * for longer than {@code gateway.job.max-duration} even though backends are otherwise healthy (e.g.
+     * a {@code not_before} far in the future from clock skew, a misconfigured {@code requeue-delay}, or a
+     * bug). Nothing else sweeps {@code QUEUED} jobs (WOT-08), so without this a stalled queue of this
+     * kind is silent forever.
+     */
+    private void checkStuckQueuedJobs() {
+        Instant cutoff = Instant.now().minus(properties.getJob().getMaxDuration());
+        long stuck = reviewJobRepository.countStuckQueuedJobs(cutoff);
+        if (stuck > 0) {
+            log.warn("Queue stalled: {} QUEUED job(s) with not_before in the past for longer than {} (job.max-duration)",
+                    stuck, properties.getJob().getMaxDuration());
+        }
     }
 }

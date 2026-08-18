@@ -142,6 +142,25 @@ public interface ReviewJobRepository extends JpaRepository<ReviewJob, Long> {
     long countQueuedJobs();
 
     /**
+     * WOR-15(a): number of {@code QUEUED} jobs whose {@code not_before} has been in the past for longer
+     * than {@code gateway.job.max-duration} — i.e. {@code not_before < :cutoff} where
+     * {@code cutoff = now() - gateway.job.max-duration}. A {@code NULL not_before} is immediately
+     * claimable and never stuck by this definition, so it is excluded. Distinct from
+     * {@code countQueuedJobs()}/WOC-18 (which fires only when there is no eligible {@code ACTIVE}
+     * backend at all): this covers the case where backends are healthy but a job is nonetheless
+     * permanently parked in {@code QUEUED} — e.g. a {@code not_before} far in the future from clock
+     * skew, a misconfigured {@code requeue-delay}, or a bug — a scenario nothing else sweeps (WOT-08).
+     */
+    @Query(value = """
+            SELECT count(*)
+            FROM review_jobs j
+            WHERE j.status = 'QUEUED'
+              AND j.not_before IS NOT NULL
+              AND j.not_before < :cutoff
+            """, nativeQuery = true)
+    long countStuckQueuedJobs(@Param("cutoff") Instant cutoff);
+
+    /**
      * Average time (ms) a job waits in {@code QUEUED} before being claimed, over every job that has
      * been claimed at least once. Backs {@code StatisticsService}/{@code GET /metrics}.
      */

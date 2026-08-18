@@ -314,4 +314,36 @@ class ReviewJobRepositoryTest extends AbstractPostgresIntegrationTest {
 
         assertThat(reviewJobRepository.countQueuedJobs()).isEqualTo(2L);
     }
+
+    // WOR-15(a): countStuckQueuedJobs -- a QUEUED job whose not_before has been in the past for longer
+    // than gateway.job.max-duration (i.e. not_before < cutoff, cutoff = now() - max-duration).
+    @Test
+    void countStuckQueuedJobsCountsOnlyQueuedJobsWithNotBeforePastTheCutoff() {
+        Backend backend = persistBackend("backend-count-stuck-queued");
+        Instant cutoff = Instant.now().minus(45, ChronoUnit.MINUTES);
+
+        // Stuck: QUEUED, not_before well before the cutoff.
+        Review stuck = persistReview(8L, 70L, "sha-stuck");
+        ReviewJob stuckJob = jobWithStatus(stuck, backend, null, JobStatus.QUEUED);
+        stuckJob.setNotBefore(Instant.now().minus(50, ChronoUnit.MINUTES));
+        entityManager.persistAndFlush(stuckJob);
+
+        // Not stuck: QUEUED, not_before recent (after the cutoff) -- e.g. a normal requeue-delay wait.
+        Review recentlyRequeued = persistReview(8L, 71L, "sha-recently-requeued");
+        ReviewJob recentlyRequeuedJob = jobWithStatus(recentlyRequeued, backend, null, JobStatus.QUEUED);
+        recentlyRequeuedJob.setNotBefore(Instant.now().minus(1, ChronoUnit.MINUTES));
+        entityManager.persistAndFlush(recentlyRequeuedJob);
+
+        // Not stuck: QUEUED, not_before is NULL (immediately claimable, never "stuck" by this definition).
+        Review immediatelyClaimable = persistReview(8L, 72L, "sha-immediately-claimable");
+        entityManager.persistAndFlush(jobWithStatus(immediatelyClaimable, backend, null, JobStatus.QUEUED));
+
+        // Not stuck: RUNNING with a stale-looking not_before -- wrong status, must not be counted.
+        Review running = persistReview(8L, 73L, "sha-running-not-counted");
+        ReviewJob runningJob = jobWithStatus(running, backend, "worker-1", JobStatus.RUNNING);
+        runningJob.setNotBefore(Instant.now().minus(60, ChronoUnit.MINUTES));
+        entityManager.persistAndFlush(runningJob);
+
+        assertThat(reviewJobRepository.countStuckQueuedJobs(cutoff)).isEqualTo(1L);
+    }
 }
