@@ -76,7 +76,8 @@ gateway:
     read-timeout: 30s
   backend:
     connect-timeout: 3s
-    read-timeout: 5s
+    read-timeout: 10s               # WOC-16: raised from 5s -- safe because WOC-14 moved probe I/O
+                                     # outside any DB transaction (see GatewayProperties.Backend#readTimeout)
     allowed-host-pattern: ${BACKEND_ALLOWED_HOST_PATTERN:.*}   # SR-10: tighten per deployment
   security:
     ci-token: ${CI_TOKEN}
