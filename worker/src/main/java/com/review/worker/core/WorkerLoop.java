@@ -286,15 +286,25 @@ public class WorkerLoop {
      * failure is logged at WARN, counted in {@code worker.gateway.errors}, and swallowed -- the
      * Gateway's stale-heartbeat sweep remains the correctness backstop (WOC-36); nothing in the system
      * may become dependent on this report being delivered.
+     *
+     * <p><b>F-WOC-03:</b> the catch is deliberately {@link Throwable}, not just {@link
+     * GatewayUnavailableException} -- {@code GatewayClient.reportFailure} maps only {@code
+     * RestClientResponseException}/{@code ResourceAccessException} into that type, so any other
+     * unmapped exception from this call (an unrelated {@code RestClientException} subtype, an {@code
+     * IllegalArgumentException} from URI templating, etc.) would otherwise propagate out of {@code
+     * processJob}'s only handler and out of {@code runLoop}'s {@code while}, killing the worker-loop
+     * thread -- exactly the silent-stall failure class WOC-35 exists to eliminate (a wedged/dead Worker
+     * that logs nothing further and claims no more jobs). Same precedent as {@code
+     * HeartbeatScheduler.tick}'s WSR-15 crash guard.
      */
     private void reportFailureBestEffort(long jobId, String workerId, JobFailureReason reason) {
         try {
             gatewayClient.reportFailure(jobId, new FailRequest(workerId, reason.name(), DETAIL_BY_REASON.get(reason)));
             metrics.incrementFailuresReported();
-        } catch (GatewayUnavailableException e) {
+        } catch (Throwable t) {
             metrics.incrementGatewayErrors();
             log.warn("Failed to report job failure to the Gateway; the stale-heartbeat sweep will recover "
-                    + "it (jobId={})", jobId, e);
+                    + "it (jobId={})", jobId, t);
         }
     }
 
