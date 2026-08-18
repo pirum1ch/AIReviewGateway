@@ -266,6 +266,43 @@ class ReviewJobRepositoryTest extends AbstractPostgresIntegrationTest {
     }
 
     @Test
+    void findNextQueuedJobIdForUpdateSkipsAFutureNotBeforeJobAndStillReturnsTheNextEligibleOneInPriorityOrder() {
+        // QA-added (T-3.7, second half): the architecture doc's own test guidance explicitly calls out
+        // that not_before must not disturb ordering among OTHER, unrelated QUEUED jobs -- i.e. a blocked
+        // job must be transparently skipped, not just "the only job present is blocked" (already covered
+        // above). Three jobs, same priority: the highest-priority-and-oldest one is blocked by a future
+        // not_before and must be skipped entirely; the query must still return the next eligible job by
+        // the normal priority DESC, created_at ASC ordering, not fall through to something arbitrary.
+        Backend backend = persistBackend("backend-not-before-ordering");
+        Review reviewBlocked = persistReview(8L, 70L, "sha-ordering-blocked");
+        Review reviewEligibleOlder = persistReview(8L, 71L, "sha-ordering-eligible-older");
+        Review reviewEligibleNewer = persistReview(8L, 72L, "sha-ordering-eligible-newer");
+
+        // Highest priority, oldest -- would normally be first, but its not_before is in the future.
+        ReviewJob blocked = jobWithStatus(reviewBlocked, backend, null, JobStatus.QUEUED);
+        blocked.setPriority(10);
+        blocked.setNotBefore(Instant.now().plus(1, ChronoUnit.HOURS));
+        entityManager.persistAndFlush(blocked);
+
+        // Lower priority than the blocked job, but immediately claimable and older than its sibling below
+        // -- this is the one the query must actually return.
+        ReviewJob eligibleOlder = jobWithStatus(reviewEligibleOlder, backend, null, JobStatus.QUEUED);
+        eligibleOlder.setPriority(5);
+        ReviewJob eligibleOlderSaved = entityManager.persistFlushFind(eligibleOlder);
+
+        ReviewJob eligibleNewer = jobWithStatus(reviewEligibleNewer, backend, null, JobStatus.QUEUED);
+        eligibleNewer.setPriority(5);
+        entityManager.persistAndFlush(eligibleNewer);
+
+        Optional<Long> claimable = reviewJobRepository.findNextQueuedJobIdForUpdate();
+
+        assertThat(claimable)
+                .as("the future-not_before job must be skipped and normal priority/created_at ordering "
+                        + "must still govern which of the remaining eligible jobs is returned")
+                .contains(eligibleOlderSaved.getId());
+    }
+
+    @Test
     void countQueuedJobsCountsOnlyQueuedStatus() {
         Backend backend = persistBackend("backend-count-queued");
         Review queued1 = persistReview(7L, 60L, "sha-queued-1");
