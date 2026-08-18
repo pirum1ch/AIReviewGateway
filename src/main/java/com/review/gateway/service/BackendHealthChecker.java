@@ -36,11 +36,16 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *
  * <p><b>At-capacity deferral (WOC-13, bounded by WOR-13):</b> a failed probe does not demote a backend
  * that is at capacity with a fresh-heartbeat {@code RUNNING} job — dispatch-neutral by construction (an
- * at-capacity backend is already unclaimable), and made dispatch-neutral <em>over time</em> too by {@code
- * BackendDispatcher} independently declining a past-grace {@code probe_failed_since} regardless of
- * persisted status (WOR-10). The deferral itself is capped by {@code gateway.backend.defer-demotion-max}
- * so a backend held busy indefinitely (e.g. by a misbehaving Worker pinning {@code backendId}, WOR-11)
- * cannot defer demotion forever.
+ * at-capacity backend is already unclaimable). {@code probe_failed_since} is recorded on the very first
+ * failed probe of a streak <em>before</em> the deferral decision is made and is never cleared or
+ * restarted by a deferral (F-WOC-02) — only the {@code ACTIVE -> SUSPECT} status flip is deferred.
+ * {@code BackendDispatcher} makes dispatch fail-fast, independent of this fail-slow status: it declines
+ * any backend with a non-null {@code probe_failed_since} the instant the first probe fails, exempting
+ * only that same at-capacity-with-fresh-heartbeat condition (F-WOC-01/WOR-10) — so the deferral stays
+ * genuinely dispatch-neutral both at evaluation time and afterward, without waiting for the (much slower)
+ * {@code failure-grace} status-flip window. The deferral itself is capped by {@code
+ * gateway.backend.defer-demotion-max} so a backend held busy indefinitely (e.g. by a misbehaving Worker
+ * pinning {@code backendId}, WOR-11) cannot defer the status flip forever.
  *
  * <p><b>WOC-17:</b> a non-blocking {@link AtomicBoolean} re-entrancy guard — a raised read timeout
  * (WOC-16) plus enough backends can make one pass exceed the scheduler interval; {@code
@@ -165,16 +170,28 @@ public class BackendHealthChecker {
 
     private boolean applyFailure(Backend backend) {
         Instant now = Instant.now();
-        if (shouldDeferDemotion(backend, now)) {
-            // WOC-13: dispatch-neutral deferral -- probe_failed_since is preserved (neither cleared nor
-            // restarted), status is untouched, so the very next pass demotes immediately once the grace
-            // window has already elapsed.
-            log.info("Backend '{}' failed health probe but is at capacity with a fresh heartbeat; "
-                    + "deferring demotion (WOC-13, dispatch-neutral)", backend.getName());
-            return false;
-        }
+        // F-WOC-02: probe_failed_since MUST be recorded (first failure sets it, a failure mid-streak
+        // leaves it unchanged) BEFORE the WOC-13 at-capacity-deferral decision, not after -- otherwise a
+        // failure streak that *begins* while the backend is at capacity (a llama-server dying mid-job on
+        // a capacity-1, 1:1-paired host -- the documented deployment) is never recorded at all, silently
+        // disabling WOR-10 (BackendDispatcher's dispatch decline), WOR-11 (stall-WARN eligibility) and
+        // WOR-13 (the deferral cap itself, which is keyed on this same field) in exactly the scenario
+        // each exists for.
         if (backend.getProbeFailedSince() == null) {
             backend.setProbeFailedSince(now);
+        }
+        if (shouldDeferDemotion(backend, now)) {
+            // WOC-13: dispatch-neutral deferral -- defers only the ACTIVE -> SUSPECT status flip (and,
+            // symmetrically, BackendDispatcher's WOR-10 dispatch decline exempts this same at-capacity-
+            // with-fresh-heartbeat condition, F-WOC-01). probe_failed_since itself is never deferred: it
+            // was already recorded above and is persisted here unchanged, so the moment the deferral
+            // condition no longer holds (job ends, heartbeat goes stale, or the defer-demotion-max cap is
+            // reached) the very next pass sees an honest, uninterrupted streak.
+            log.info("Backend '{}' failed health probe but is at capacity with a fresh heartbeat; "
+                    + "deferring demotion (WOC-13, dispatch-neutral); probe_failed_since recorded at {}",
+                    backend.getName(), backend.getProbeFailedSince());
+            backendRepository.save(backend);
+            return false;
         }
         boolean flipped = false;
         if (backend.getStatus() == BackendStatus.ACTIVE) {

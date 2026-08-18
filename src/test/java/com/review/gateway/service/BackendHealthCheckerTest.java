@@ -155,9 +155,13 @@ class BackendHealthCheckerTest extends AbstractPostgresIntegrationTest {
         assertThat(reloaded.getProbeFailedSince()).isNull();
     }
 
-    // T-2.5: at-capacity + fresh heartbeat defers demotion and preserves probe_failed_since.
+    // T-2.5 / F-WOC-02: at-capacity + fresh heartbeat defers the STATUS flip only -- probe_failed_since
+    // is still recorded (a failure streak that begins while the backend is busy must not go unrecorded,
+    // or WOR-10/WOR-11/WOR-13 all silently stop working in exactly the scenario each exists for -- see
+    // BackendHealthChecker.applyFailure's javadoc). This assertion was previously (incorrectly) pinned
+    // as `isNull()`, which encoded the F-WOC-02 defect as expected behavior.
     @Test
-    void atCapacityWithFreshHeartbeatDefersDemotionAndPreservesStreak() {
+    void atCapacityWithFreshHeartbeatDefersDemotionButStillRecordsTheStreak() {
         Backend backend = persistBackend("mac-t25", BackendStatus.ACTIVE, 1);
         persistRunningJob(backend, Instant.now());
         BackendProber prober = mock(BackendProber.class);
@@ -167,8 +171,15 @@ class BackendHealthCheckerTest extends AbstractPostgresIntegrationTest {
 
         assertThat(flips).isZero();
         Backend reloaded = backendRepository.findById(backend.getId()).orElseThrow();
-        assertThat(reloaded.getStatus()).isEqualTo(BackendStatus.ACTIVE);
-        assertThat(reloaded.getProbeFailedSince()).isNull();
+        assertThat(reloaded.getStatus())
+                .as("F-WOC-02: only the status flip is deferred while at capacity with a fresh heartbeat")
+                .isEqualTo(BackendStatus.ACTIVE);
+        assertThat(reloaded.getProbeFailedSince())
+                .as("F-WOC-02: the failure streak itself must be recorded even though the status flip is "
+                        + "deferred -- this is what makes WOR-10's dispatch decline, WOR-11's stall WARN, "
+                        + "and WOR-13's deferral cap all actually engage once the backend is no longer at "
+                        + "capacity or the cap is exceeded")
+                .isNotNull();
     }
 
     // T-2.6: once the job ends, the next failed probe demotes immediately if the grace already elapsed.
@@ -210,21 +221,42 @@ class BackendHealthCheckerTest extends AbstractPostgresIntegrationTest {
         assertThat(afterSuccess.getLastSeen()).isNotNull();
     }
 
-    // WOR-13: past the defer-demotion-max cap, demotion proceeds regardless of capacity/heartbeat.
+    // WOR-13 / F-WOC-02: past the defer-demotion-max cap, demotion proceeds regardless of
+    // capacity/heartbeat. Rewritten (F-WOC-02 SAST fix round): the streak's origin is now produced by an
+    // actual failed probe through the real deferral code path (applyFailure -> shouldDeferDemotion),
+    // not by hand-constructing a `probe_failed_since` the (pre-fix) deferral path could never itself
+    // have produced -- only the elapsed-time-past-the-cap part is simulated by backdating that
+    // genuinely-recorded timestamp, the same "simulate elapsed time" technique T-2.2/T-2.6 already use
+    // elsewhere in this file.
     @Test
     void deferralCapIsEnforced() {
         Backend backend = persistBackend("mac-wor13", BackendStatus.ACTIVE, 1);
-        backend.setProbeFailedSince(Instant.now().minus(Duration.ofMinutes(50))); // past a 45m cap
-        backendRepository.saveAndFlush(backend);
-        persistRunningJob(backend, Instant.now()); // still at capacity, still fresh heartbeat
+        persistRunningJob(backend, Instant.now()); // at capacity, fresh heartbeat -- deferral applies
         GatewayProperties properties = defaultProperties();
         properties.getBackend().setDeferDemotionMax(Duration.ofMinutes(45));
         BackendProber prober = mock(BackendProber.class);
         doThrow(new BackendUnavailableException("wedged")).when(prober).probe(Mockito.any());
 
-        int flips = newChecker(prober, properties).probeAll();
+        // Pass 1: a genuine failed probe while at capacity -- exercises the real deferral path and
+        // records probe_failed_since for the first time (F-WOC-02); status must stay ACTIVE.
+        int firstPassFlips = newChecker(prober, properties).probeAll();
+        assertThat(firstPassFlips).isZero();
+        Backend afterFirstPass = backendRepository.findById(backend.getId()).orElseThrow();
+        assertThat(afterFirstPass.getStatus()).isEqualTo(BackendStatus.ACTIVE);
+        assertThat(afterFirstPass.getProbeFailedSince()).as("F-WOC-02: recorded by the real deferral path")
+                .isNotNull();
 
-        assertThat(flips).isEqualTo(1);
+        // Simulate 50 minutes of continuous failure (past the 45m cap) by backdating that
+        // genuinely-recorded timestamp -- the backend remains at capacity with a fresh heartbeat
+        // throughout, so only the cap (not capacity/heartbeat) is what stops the deferral here.
+        afterFirstPass.setProbeFailedSince(Instant.now().minus(Duration.ofMinutes(50)));
+        backendRepository.saveAndFlush(afterFirstPass);
+
+        // Pass 2: the cap is now exceeded -- shouldDeferDemotion must stop deferring and the continuous
+        // streak (50m, already also past the 180s failure-grace) demotes the backend despite it still
+        // being at capacity with a fresh heartbeat.
+        int secondPassFlips = newChecker(prober, properties).probeAll();
+        assertThat(secondPassFlips).isEqualTo(1);
         Backend reloaded = backendRepository.findById(backend.getId()).orElseThrow();
         assertThat(reloaded.getStatus()).isEqualTo(BackendStatus.SUSPECT);
     }
