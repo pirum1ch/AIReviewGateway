@@ -13,8 +13,11 @@ import com.review.gateway.repository.ReviewChunkRepository;
 import com.review.gateway.repository.ReviewJobRepository;
 import com.review.gateway.repository.ReviewPromptSectionRepository;
 import com.review.gateway.repository.ReviewRepository;
+import com.review.gateway.model.enums.JobFailureReason;
 import com.review.gateway.service.dto.ClaimedJob;
+import com.review.gateway.service.dto.FailureReportOutcome;
 import com.review.gateway.service.dto.HeartbeatResult;
+import com.review.gateway.service.dto.RequeueOutcome;
 import com.review.gateway.service.dto.SubmitResultCommand;
 import com.review.gateway.service.dto.SubmitResultOutcome;
 import jakarta.persistence.EntityManager;
@@ -64,6 +67,9 @@ public class QueueManager {
     private final ResultProcessor resultProcessor;
     private final ChunkContextRenderer chunkContextRenderer;
     private final PromptMessageFormatter promptMessageFormatter;
+    private final RetryManager retryManager;
+    private final TextSanitizer textSanitizer;
+    private final MetricsCounters metricsCounters;
     private final EntityManager entityManager;
     private final TransactionTemplate requiresNewTransactionTemplate;
 
@@ -78,6 +84,9 @@ public class QueueManager {
                          ResultProcessor resultProcessor,
                          ChunkContextRenderer chunkContextRenderer,
                          PromptMessageFormatter promptMessageFormatter,
+                         RetryManager retryManager,
+                         TextSanitizer textSanitizer,
+                         MetricsCounters metricsCounters,
                          EntityManager entityManager,
                          PlatformTransactionManager transactionManager) {
         this.reviewRepository = reviewRepository;
@@ -91,6 +100,9 @@ public class QueueManager {
         this.resultProcessor = resultProcessor;
         this.chunkContextRenderer = chunkContextRenderer;
         this.promptMessageFormatter = promptMessageFormatter;
+        this.retryManager = retryManager;
+        this.textSanitizer = textSanitizer;
+        this.metricsCounters = metricsCounters;
         this.entityManager = entityManager;
         this.requiresNewTransactionTemplate = new TransactionTemplate(transactionManager);
         this.requiresNewTransactionTemplate.setPropagationBehavior(TransactionTemplate.PROPAGATION_REQUIRES_NEW);
@@ -199,6 +211,7 @@ public class QueueManager {
         job.setStartedAt(now);
         job.setFinishedAt(null);
         job.setLastError(null);
+        job.setNotBefore(null);
         jobStateMachine.transition(job, JobStatus.RUNNING, EventType.CLAIMED, workerId, backend.getId(),
                 "attempt=" + job.getAttempts());
         reviewJobRepository.save(job);
@@ -341,6 +354,7 @@ public class QueueManager {
 
         if (!isOwner(job, workerId)) {
             log.warn("Heartbeat ownership mismatch: jobId={} claimedBy={} callerWorkerId={}", jobId, job.getWorkerId(), workerId);
+            metricsCounters.incrementOwnershipMismatch("heartbeat");
             return HeartbeatResult.ownershipMismatch();
         }
 
@@ -374,6 +388,7 @@ public class QueueManager {
 
         if (!isOwner(job, workerId)) {
             log.warn("Result submission ownership mismatch: jobId={} claimedBy={} callerWorkerId={}", jobId, job.getWorkerId(), workerId);
+            metricsCounters.incrementOwnershipMismatch("result");
             // F02-05: do not echo the review's status to a non-owner -- indistinguishable from NOT_FOUND.
             return SubmitResultOutcome.ownershipMismatch();
         }
@@ -389,6 +404,93 @@ public class QueueManager {
 
         ReviewStatus finalStatus = resultProcessor.process(review.getId(), job.getId(), workerId, job.getBackendId(), command);
         return SubmitResultOutcome.accepted(review.getId(), finalStatus);
+    }
+
+    /** WOC-25/WOR-06c: {@code detail} is sanitized to a single line, capped at 200 chars. */
+    private static final int MAX_DETAIL_LENGTH = 200;
+
+    /**
+     * Handles {@code POST /jobs/{id}/fail} (architecture §5.2, WOC-26). Deliberately <b>not</b> {@code
+     * @Transactional} (unlike {@link #heartbeat}/{@link #submitResult}): {@link RetryManager#requeueOrFail}
+     * opens its own {@code REQUIRES_NEW} transaction and, only after that commits, calls
+     * {@code ChunkCoordinator} for the parent-row lock. An outer transaction here would hold a Hikari
+     * connection across both phases and reintroduce exactly the lock-ordering hazard CSR-17 removed
+     * (see {@code RetryManager.requeueOrFail}'s own "plain orchestrating method" precedent).
+     *
+     * <p>The unlocked pre-check below exists only to return {@code 404}/{@code 403} cheaply and to avoid
+     * opening a write transaction for the common no-op case (WOR-15b: the job is already not {@code
+     * RUNNING}); it is never the authorization decision. {@link RetryManager} re-checks ownership under
+     * the job-row lock (WOC-27) and that locked result always wins (WOR-19) — if the two disagree
+     * (a genuine race), the response reflects the locked outcome.
+     *
+     * @param reasonCode whitelist-parsed against {@link JobFailureReason} (WOC-23); an unrecognized value
+     *                    maps to {@code UNKNOWN} with a WARN, never a {@code 400} — audit-only, never
+     *                    influences the retry-vs-fail decision (WOC-24).
+     * @param detail      untrusted, Worker-supplied free text; sanitized to a single line and truncated to
+     *                    {@value #MAX_DETAIL_LENGTH} chars <b>here, at ingress</b>, before it ever reaches
+     *                    {@link RetryManager}, a logger, {@code review_events}, or {@code last_error}
+     *                    (WOC-25/WOR-06c) — the raw value never propagates past this method.
+     */
+    public FailureReportOutcome reportFailure(Long jobId, String workerId, String reasonCode, String detail) {
+        Optional<ReviewJob> preCheck = reviewJobRepository.findById(jobId);
+        if (preCheck.isEmpty()) {
+            log.debug("Failure report for unknown jobId={}", jobId);
+            return FailureReportOutcome.NOT_FOUND;
+        }
+        ReviewJob job = preCheck.get();
+        if (!isOwner(job, workerId)) {
+            log.warn("Failure report ownership mismatch: jobId={} claimedBy={} callerWorkerId={}",
+                    jobId, job.getWorkerId(), workerId);
+            metricsCounters.incrementOwnershipMismatch("fail");
+            metricsCounters.incrementWorkerFailureReportsIgnored();
+            return FailureReportOutcome.OWNERSHIP_MISMATCH;
+        }
+        if (job.getStatus() != JobStatus.RUNNING) {
+            // WOR-15b: no-op path returns 200 without opening RetryManager's REQUIRES_NEW transaction.
+            log.info("Idempotent no-op failure report: jobId={} currentJobStatus={}", jobId, job.getStatus());
+            metricsCounters.incrementWorkerFailureReportsIgnored();
+            return FailureReportOutcome.ACCEPTED;
+        }
+
+        JobFailureReason reason = JobFailureReason.fromWireValue(reasonCode);
+        if (reason == JobFailureReason.UNKNOWN) {
+            // WOC-23: never log the raw value, only its length -- it is untrusted, caller-supplied text.
+            log.warn("Unknown worker-reported failure reason (length={}) for jobId={}",
+                    reasonCode == null ? 0 : reasonCode.length(), jobId);
+        }
+        String sanitizedDetail = textSanitizer.sanitizeSingleLine(detail, MAX_DETAIL_LENGTH);
+        String composedReason = "worker-reported: reason=" + reason
+                + (sanitizedDetail != null ? "; detail=" + sanitizedDetail : "");
+
+        RequeueOutcome outcome;
+        try {
+            outcome = retryManager.requeueOrFail(jobId, composedReason, workerId);
+        } catch (PessimisticLockingFailureException | QueryTimeoutException lockTimeout) {
+            // WOC-32: never surface a lock-timeout as a 500 to the Worker -- the stale-heartbeat sweep
+            // remains the correctness backstop for this best-effort, latency-only optimization.
+            log.debug("Failure report lock-timed-out for jobId={}: the sweep will handle it", jobId);
+            return FailureReportOutcome.ACCEPTED;
+        }
+
+        return switch (outcome.outcome()) {
+            case NOT_FOUND -> FailureReportOutcome.NOT_FOUND;
+            case OWNERSHIP_MISMATCH -> {
+                // WOR-19: the locked re-check disagreed with the unlocked pre-check above (a genuine
+                // race) -- the locked outcome wins.
+                log.warn("Failure report ownership mismatch under lock: jobId={} callerWorkerId={}", jobId, workerId);
+                metricsCounters.incrementOwnershipMismatch("fail");
+                metricsCounters.incrementWorkerFailureReportsIgnored();
+                yield FailureReportOutcome.OWNERSHIP_MISMATCH;
+            }
+            case NOOP_NOT_RUNNING -> {
+                metricsCounters.incrementWorkerFailureReportsIgnored();
+                yield FailureReportOutcome.ACCEPTED;
+            }
+            case APPLIED_REQUEUED, APPLIED_FAILED -> {
+                log.info("Worker-reported job failure: jobId={} workerId={} reason={}", jobId, workerId, reason);
+                yield FailureReportOutcome.ACCEPTED;
+            }
+        };
     }
 
     private boolean isOwner(ReviewJob job, String workerId) {
