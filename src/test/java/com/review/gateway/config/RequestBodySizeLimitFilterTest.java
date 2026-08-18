@@ -28,6 +28,7 @@ class RequestBodySizeLimitFilterTest {
         properties = new GatewayProperties();
         properties.getDiff().setMaxRequestBodyBytes(1000);
         properties.getPublish().setMaxRequestBodyBytes(2000);
+        properties.getJob().setMaxFailBodyBytes(500);
         filter = new RequestBodySizeLimitFilter(properties);
     }
 
@@ -165,6 +166,64 @@ class RequestBodySizeLimitFilterTest {
         filter.doFilterInternal(request, response, chain);
 
         verify(chain, never()).doFilter(Mockito.any(), Mockito.any());
+    }
+
+    // =================================================================================================
+    // Worker Observability & Claim Latency: WOC-33 (new /jobs/{id}/fail cap), WOR-09 (decoded-path fix)
+    // =================================================================================================
+
+    @Test
+    void jobFailPostOverLimitIsRejectedWith413() throws Exception {
+        MockHttpServletResponse response = runFilter("POST", "/jobs/1/fail", 501);
+
+        assertThat(response.getStatus()).isEqualTo(413);
+        assertThat(response.getContentAsString()).contains("PAYLOAD_TOO_LARGE");
+    }
+
+    @Test
+    void jobFailPostUnderLimitPasses() throws Exception {
+        MockHttpServletRequest request = new MockHttpServletRequest("POST", "/jobs/1/fail");
+        request.setContent(new byte[400]);
+        MockHttpServletResponse response = new MockHttpServletResponse();
+        FilterChain chain = Mockito.mock(FilterChain.class);
+
+        filter.doFilterInternal(request, response, chain);
+
+        verify(chain).doFilter(request, response);
+    }
+
+    @Test
+    void percentEncodedFailPathCannotBypassTheCap() throws Exception {
+        // WOR-09/WOT-06b: "%66ail" decodes to "fail" -- must be capped exactly like the plain path.
+        MockHttpServletResponse response = runFilter("POST", "/jobs/1/%66ail", 999_999);
+
+        assertThat(response.getStatus()).isEqualTo(413);
+    }
+
+    @Test
+    void percentEncodedResultPathCannotBypassTheCap() throws Exception {
+        MockHttpServletResponse response = runFilter("POST", "/jobs/1/%72esult", 999_999);
+
+        assertThat(response.getStatus()).isEqualTo(413);
+    }
+
+    @Test
+    void percentEncodedReviewsPathCannotBypassTheCap() throws Exception {
+        MockHttpServletResponse response = runFilter("POST", "/re%76iews", 999_999);
+
+        assertThat(response.getStatus()).isEqualTo(413);
+    }
+
+    @Test
+    void percentEncodedFailPathUnderLimitStillPassesThrough() throws Exception {
+        MockHttpServletRequest request = new MockHttpServletRequest("POST", "/jobs/1/%66ail");
+        request.setContent(new byte[400]);
+        MockHttpServletResponse response = new MockHttpServletResponse();
+        FilterChain chain = Mockito.mock(FilterChain.class);
+
+        filter.doFilterInternal(request, response, chain);
+
+        verify(chain).doFilter(request, response);
     }
 
     @Test

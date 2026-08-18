@@ -92,4 +92,24 @@ class TextSanitizerTest {
         String result = sanitizer.sanitizeSectionText(text);
         assertThat(result).isEqualTo("text");
     }
+
+    // WOC-25/WOR-06: sanitizeSingleLine is a delegating alias for sanitizePath (no second implementation).
+    @Test
+    void sanitizeSingleLineDelegatesToSanitizePathByteForByte() {
+        String raw = "line1\r\n2026-01-01 INFO forged" + BIDI_OVERRIDE + "<script>";
+        assertThat(sanitizer.sanitizeSingleLine(raw, 200)).isEqualTo(sanitizer.sanitizePath(raw, 200));
+    }
+
+    @Test
+    void sanitizeSingleLineStripsCrlfAndCapsLength() {
+        String raw = "a\r\nb" + "x".repeat(300);
+        String result = sanitizer.sanitizeSingleLine(raw, 200);
+        assertThat(result).doesNotContain("\r").doesNotContain("\n");
+        assertThat(result.length()).isLessThanOrEqualTo(200);
+    }
+
+    @Test
+    void sanitizeSingleLineReturnsNullForNullInput() {
+        assertThat(sanitizer.sanitizeSingleLine(null, 200)).isNull();
+    }
 }

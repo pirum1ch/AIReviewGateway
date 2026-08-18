@@ -87,18 +87,21 @@ class QueueManagerIntegrationTest extends AbstractPostgresIntegrationTest {
     }
 
     private QueueManager newQueueManager(ResultProcessor resultProcessor) {
-        EventService eventService = new EventService(reviewEventRepository);
+        EventService eventService = new EventService(reviewEventRepository, new TextSanitizer());
         StateMachine stateMachine = new StateMachine(eventService);
         JobStateMachine jobStateMachine = new JobStateMachine(eventService);
-        BackendDispatcher backendDispatcher = new BackendDispatcher(backendRepository, reviewJobRepository);
         GatewayProperties properties = new GatewayProperties();
+        BackendDispatcher backendDispatcher = new BackendDispatcher(backendRepository, reviewJobRepository, properties);
         ChunkCoordinator chunkCoordinator = new ChunkCoordinator(reviewRepository, reviewJobRepository,
                 reviewChunkRepository, reviewCommentRepository, stateMachine, jobStateMachine, properties, entityManager, transactionManager);
         ChunkContextRenderer chunkContextRenderer = new ChunkContextRenderer(properties, new TextSanitizer());
         PromptMessageFormatter promptMessageFormatter = new PromptMessageFormatter(properties, new PromptAssembler(properties, new DiffSizeValidator(properties)));
+        RetryManager retryManager = new RetryManager(reviewJobRepository, jobStateMachine, chunkCoordinator,
+                properties, new TextSanitizer(), entityManager, transactionManager);
         return new QueueManager(reviewRepository, reviewJobRepository, reviewChunkRepository,
                 reviewPromptSectionRepository, backendDispatcher, jobStateMachine, chunkCoordinator, eventService,
-                resultProcessor, chunkContextRenderer, promptMessageFormatter, entityManager, transactionManager);
+                resultProcessor, chunkContextRenderer, promptMessageFormatter, retryManager, new TextSanitizer(),
+                new MetricsCounters(), entityManager, transactionManager);
     }
 
     private Review persistQueuedReview(long projectId, long mrId, String headSha, int priority) {

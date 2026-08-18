@@ -80,7 +80,7 @@ class ResultProcessorConcurrentSubmitTest extends AbstractPostgresIntegrationTes
     }
 
     private ResultProcessor newResultProcessor() {
-        EventService eventService = new EventService(reviewEventRepository);
+        EventService eventService = new EventService(reviewEventRepository, new TextSanitizer());
         StateMachine stateMachine = new StateMachine(eventService);
         JobStateMachine jobStateMachine = new JobStateMachine(eventService);
         CommentParser commentParser = new CommentParser(new GatewayProperties());

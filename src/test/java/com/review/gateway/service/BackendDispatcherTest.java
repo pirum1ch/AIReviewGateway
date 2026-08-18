@@ -1,5 +1,6 @@
 package com.review.gateway.service;
 
+import com.review.gateway.config.GatewayProperties;
 import com.review.gateway.model.Backend;
 import com.review.gateway.model.enums.BackendStatus;
 import com.review.gateway.repository.BackendRepository;
@@ -8,6 +9,8 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
 
+import java.time.Duration;
+import java.time.Instant;
 import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -23,7 +26,9 @@ class BackendDispatcherTest {
     void setUp() {
         backendRepository = Mockito.mock(BackendRepository.class);
         reviewJobRepository = Mockito.mock(ReviewJobRepository.class);
-        dispatcher = new BackendDispatcher(backendRepository, reviewJobRepository);
+        GatewayProperties properties = new GatewayProperties();
+        properties.getBackend().setFailureGrace(Duration.ofSeconds(180));
+        dispatcher = new BackendDispatcher(backendRepository, reviewJobRepository, properties);
     }
 
     private Backend activeBackend(String name, int capacity) {
@@ -64,6 +69,28 @@ class BackendDispatcherTest {
         when(reviewJobRepository.countRunningJobsForBackend(backend.getId())).thenReturn(1L);
 
         assertThat(dispatcher.resolveClaimableBackend("mac-mini-3")).isEmpty();
+    }
+
+    @Test
+    void pastGraceFailureStreakDeclinesEvenIfStatusIsStillActive() {
+        // WOR-10: BackendDispatcher must consult probe_failed_since itself, independent of the persisted
+        // status a BackendHealthChecker pass last wrote -- this is what makes WOC-13's at-capacity
+        // deferral dispatch-neutral OVER TIME, not just at the instant a probe pass evaluated it.
+        Backend backend = activeBackend("mac-mini-4", 2);
+        backend.setProbeFailedSince(Instant.now().minus(Duration.ofSeconds(200)));
+        when(backendRepository.findByName("mac-mini-4")).thenReturn(Optional.of(backend));
+
+        assertThat(dispatcher.resolveClaimableBackend("mac-mini-4")).isEmpty();
+    }
+
+    @Test
+    void withinGraceFailureStreakStaysClaimable() {
+        Backend backend = activeBackend("mac-mini-5", 2);
+        backend.setProbeFailedSince(Instant.now().minus(Duration.ofSeconds(10)));
+        when(backendRepository.findByName("mac-mini-5")).thenReturn(Optional.of(backend));
+        when(reviewJobRepository.countRunningJobsForBackend(backend.getId())).thenReturn(0L);
+
+        assertThat(dispatcher.resolveClaimableBackend("mac-mini-5")).contains(backend);
     }
 
     @Test

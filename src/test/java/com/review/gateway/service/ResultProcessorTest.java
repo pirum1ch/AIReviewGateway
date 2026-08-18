@@ -93,7 +93,7 @@ class ResultProcessorTest extends AbstractPostgresIntegrationTest {
     }
 
     private ResultProcessor newResultProcessor(CommentParser commentParser, GatewayProperties properties) {
-        EventService eventService = new EventService(reviewEventRepository);
+        EventService eventService = new EventService(reviewEventRepository, new TextSanitizer());
         StateMachine stateMachine = new StateMachine(eventService);
         JobStateMachine jobStateMachine = new JobStateMachine(eventService);
         ChunkCoordinator chunkCoordinator = new ChunkCoordinator(reviewRepository, reviewJobRepository,

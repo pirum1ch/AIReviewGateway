@@ -78,7 +78,7 @@ class SweepObsoleteStaleReadTest extends AbstractPostgresIntegrationTest {
     private ReviewService newReviewService() {
         GatewayProperties properties = new GatewayProperties();
         properties.getPrompt().setEnabled(false);
-        EventService eventService = new EventService(reviewEventRepository);
+        EventService eventService = new EventService(reviewEventRepository, new TextSanitizer());
         StateMachine stateMachine = new StateMachine(eventService);
         JobStateMachine jobStateMachine = new JobStateMachine(eventService);
         DeduplicationService deduplicationService = new DeduplicationService(reviewRepository);

@@ -64,7 +64,7 @@ class GitLabPublisherTest extends AbstractPostgresIntegrationTest {
     }
 
     private GitLabPublisher newPublisher(GitLabClient gitLabClient) {
-        EventService eventService = new EventService(reviewEventRepository);
+        EventService eventService = new EventService(reviewEventRepository, new TextSanitizer());
         StateMachine stateMachine = new StateMachine(eventService);
         return new GitLabPublisher(reviewRepository, reviewCommentRepository, stateMachine, gitLabClient, transactionManager);
     }

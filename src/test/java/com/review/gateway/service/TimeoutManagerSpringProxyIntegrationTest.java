@@ -46,7 +46,7 @@ import static org.assertj.core.api.Assertions.assertThatCode;
  */
 @Transactional(propagation = Propagation.NOT_SUPPORTED)
 @Import({TimeoutManager.class, RetryManager.class, StateMachine.class, JobStateMachine.class,
-        ChunkCoordinator.class, EventService.class, GatewayProperties.class})
+        ChunkCoordinator.class, EventService.class, GatewayProperties.class, TextSanitizer.class})
 class TimeoutManagerSpringProxyIntegrationTest extends AbstractPostgresIntegrationTest {
 
     @Autowired

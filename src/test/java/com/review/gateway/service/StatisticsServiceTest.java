@@ -41,7 +41,7 @@ class StatisticsServiceTest {
                                           ReviewEventRepository reviewEventRepository,
                                           BackendRepository backendRepository) {
         return new StatisticsService(reviewRepository, reviewJobRepository, reviewCommentRepository,
-                reviewEventRepository, backendRepository);
+                reviewEventRepository, backendRepository, new MetricsCounters());
     }
 
     @Test

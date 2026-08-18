@@ -196,4 +196,85 @@ class ReviewJobRepositoryTest extends AbstractPostgresIntegrationTest {
 
         assertThat(reviewJobRepository.countRunningJobsForBackend(backend.getId())).isEqualTo(1);
     }
+
+    // =================================================================================================
+    // Worker Observability & Claim Latency: WOC-41 (not_before claim predicate), WOC-13 (fresh-heartbeat
+    // existence check), WOC-18 (queued-job count)
+    // =================================================================================================
+
+    @Test
+    void findNextQueuedJobIdForUpdateSkipsAJobWhoseNotBeforeIsInTheFuture() {
+        Backend backend = persistBackend("backend-not-before-future");
+        Review review = persistReview(5L, 40L, "sha-not-before-future");
+        ReviewJob job = jobWithStatus(review, backend, null, JobStatus.QUEUED);
+        job.setNotBefore(Instant.now().plus(1, ChronoUnit.HOURS));
+        entityManager.persistAndFlush(job);
+
+        Optional<Long> claimable = reviewJobRepository.findNextQueuedJobIdForUpdate();
+
+        assertThat(claimable).isEmpty();
+    }
+
+    @Test
+    void findNextQueuedJobIdForUpdateClaimsAJobWhoseNotBeforeHasElapsed() {
+        Backend backend = persistBackend("backend-not-before-past");
+        Review review = persistReview(5L, 41L, "sha-not-before-past");
+        ReviewJob job = jobWithStatus(review, backend, null, JobStatus.QUEUED);
+        job.setNotBefore(Instant.now().minus(1, ChronoUnit.MINUTES));
+        ReviewJob saved = entityManager.persistFlushFind(job);
+
+        Optional<Long> claimable = reviewJobRepository.findNextQueuedJobIdForUpdate();
+
+        assertThat(claimable).contains(saved.getId());
+    }
+
+    @Test
+    void findNextQueuedJobIdForUpdateTreatsNullNotBeforeAsImmediatelyClaimable() {
+        // Rollback tolerance / today's-behavior-preserved case: a job with no not_before at all (or a
+        // Gateway build predating this column) must remain claimable exactly as before.
+        Backend backend = persistBackend("backend-not-before-null");
+        Review review = persistReview(5L, 42L, "sha-not-before-null");
+        ReviewJob job = jobWithStatus(review, backend, null, JobStatus.QUEUED);
+        ReviewJob saved = entityManager.persistFlushFind(job);
+
+        Optional<Long> claimable = reviewJobRepository.findNextQueuedJobIdForUpdate();
+
+        assertThat(claimable).contains(saved.getId());
+    }
+
+    @Test
+    void existsFreshRunningJobForBackendIsTrueOnlyWithinTheHeartbeatWindow() {
+        Backend backend = persistBackend("backend-fresh-heartbeat");
+        Review review = persistReview(6L, 50L, "sha-fresh-heartbeat");
+        ReviewJob job = jobWithStatus(review, backend, "worker-1", JobStatus.RUNNING);
+        job.setHeartbeatAt(Instant.now());
+        entityManager.persistAndFlush(job);
+
+        Instant cutoff = Instant.now().minus(3, ChronoUnit.MINUTES);
+        assertThat(reviewJobRepository.existsFreshRunningJobForBackend(backend.getId(), cutoff)).isTrue();
+
+        Instant futureCutoff = Instant.now().plus(1, ChronoUnit.MINUTES);
+        assertThat(reviewJobRepository.existsFreshRunningJobForBackend(backend.getId(), futureCutoff)).isFalse();
+    }
+
+    @Test
+    void existsFreshRunningJobForBackendIsFalseWhenNoJobsAreRunning() {
+        Backend backend = persistBackend("backend-no-running-jobs");
+        Instant cutoff = Instant.now().minus(3, ChronoUnit.MINUTES);
+
+        assertThat(reviewJobRepository.existsFreshRunningJobForBackend(backend.getId(), cutoff)).isFalse();
+    }
+
+    @Test
+    void countQueuedJobsCountsOnlyQueuedStatus() {
+        Backend backend = persistBackend("backend-count-queued");
+        Review queued1 = persistReview(7L, 60L, "sha-queued-1");
+        entityManager.persistAndFlush(jobWithStatus(queued1, backend, null, JobStatus.QUEUED));
+        Review queued2 = persistReview(7L, 61L, "sha-queued-2");
+        entityManager.persistAndFlush(jobWithStatus(queued2, backend, null, JobStatus.QUEUED));
+        Review running = persistReview(7L, 62L, "sha-running-not-counted");
+        entityManager.persistAndFlush(jobWithStatus(running, backend, "worker-1", JobStatus.RUNNING));
+
+        assertThat(reviewJobRepository.countQueuedJobs()).isEqualTo(2L);
+    }
 }
