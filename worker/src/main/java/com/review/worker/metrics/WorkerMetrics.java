@@ -36,6 +36,7 @@ public class WorkerMetrics {
     private final Counter jobsFailed;
     private final Timer llamaDuration;
     private final Counter gatewayErrors;
+    private final Counter failuresReported;
 
     public WorkerMetrics(MeterRegistry registry) {
         this.jobsTotal = Counter.builder("worker.jobs")
@@ -52,6 +53,12 @@ public class WorkerMetrics {
                 .register(registry);
         this.gatewayErrors = Counter.builder("worker.gateway.errors")
                 .description("GatewayUnavailableException occurrences")
+                .register(registry);
+        // WOC-39: distinguishes "failed and told the Gateway" from "failed silently" (the report is
+        // best-effort, WOC-35 -- this counter, not worker.jobs.failed, is what tells an operator whether
+        // the fast-recovery path is actually landing).
+        this.failuresReported = Counter.builder("worker.failures.reported")
+                .description("POST /jobs/{id}/fail reports the Gateway accepted (or that were at least attempted)")
                 .register(registry);
         Instant startedAt = Instant.now();
         Gauge.builder("worker.uptime", startedAt, this::secondsSince)
@@ -82,5 +89,9 @@ public class WorkerMetrics {
 
     public void incrementGatewayErrors() {
         gatewayErrors.increment();
+    }
+
+    public void incrementFailuresReported() {
+        failuresReported.increment();
     }
 }

@@ -3,6 +3,7 @@ package com.review.worker.llama;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.review.worker.config.WorkerProperties;
 import com.review.worker.core.LlamaResult;
+import com.review.worker.error.JobFailureReason;
 import com.review.worker.error.LlamaException;
 import com.review.worker.llama.dto.ChatCompletionRequest;
 import com.review.worker.llama.dto.ChatCompletionResponse;
@@ -166,7 +167,8 @@ public class LlamaClient {
     private LlamaException oversizeException(BoundedInputStream.ResponseTooLargeException cause) {
         long maxResponseBytes = properties.getWorker().getLimits().getMaxResponseBytes();
         return new LlamaException(
-                "llama-server response exceeded " + maxResponseBytes + " bytes -- abandoning job", cause);
+                "llama-server response exceeded " + maxResponseBytes + " bytes -- abandoning job", cause,
+                JobFailureReason.LLM_RESPONSE_TOO_LARGE);
     }
 
     private URI chatCompletionsUri() {
@@ -177,12 +179,12 @@ public class LlamaClient {
 
     private LlamaResult toResult(ChatCompletionResponse response, String requestedModel, long durationMs) {
         if (response == null || response.choices() == null || response.choices().isEmpty()) {
-            throw new LlamaException("llama-server response had no choices");
+            throw new LlamaException("llama-server response had no choices", JobFailureReason.LLM_EMPTY_RESPONSE);
         }
         Choice firstChoice = response.choices().get(0);
         if (firstChoice.message() == null || firstChoice.message().content() == null
                 || firstChoice.message().content().isEmpty()) {
-            throw new LlamaException("llama-server response choice had no message content");
+            throw new LlamaException("llama-server response choice had no message content", JobFailureReason.LLM_EMPTY_RESPONSE);
         }
         Usage usage = response.usage();
         Integer promptTokens = usage != null ? usage.promptTokens() : null;
