@@ -7,6 +7,12 @@ import ch.qos.logback.core.read.ListAppender;
 import com.review.worker.config.WorkerProperties;
 import com.review.worker.gateway.GatewayClient;
 import com.review.worker.gateway.HeartbeatOutcome;
+import com.review.worker.gateway.dto.ClaimResponse;
+import com.review.worker.gateway.dto.JobPayload;
+import com.review.worker.llama.LlamaClient;
+import com.review.worker.metrics.WorkerMetrics;
+import com.review.worker.prompt.PromptTemplateService;
+import com.review.worker.prompt.ResolvedPrompt;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -17,9 +23,14 @@ import org.springframework.web.client.RestClient;
 
 import java.time.Duration;
 import java.util.List;
+import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyDouble;
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
@@ -253,5 +264,104 @@ class WorkerObservabilityLoggingContentTest {
         assertThat(idleSummaryLines).as("all idle-summary lines log at INFO").allSatisfy(
                 e -> assertThat(e.getLevel()).isEqualTo(Level.INFO));
         assertThat(idleSummaryLines.get(0).getFormattedMessage()).contains("backend=backend-1");
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // F-WOC-04 (SAST fix round): WOR-17's marker regression test for the one new INFO log site that
+    // actually carries the risk -- WorkerLoop.runInference's "Starting inference" line (WOC-03). The SAST
+    // report confirmed the code itself already logs only counts (diffChars/systemMessages as ints, never
+    // the raw diff/List<String>), but no test asserted that specifically for this call site; a future
+    // regression here (e.g. someone "helpfully" logging systemMessages=%s with the actual list) would
+    // previously have gone uncaught. Marker-string technique mirrors the existing WOR-05 regression test
+    // on the Worker side (WorkerLoopContractAndResilienceTest#malformedLlamaResponseReportsFailure...).
+    // ---------------------------------------------------------------------------------------------
+
+    @Test
+    void startingInferenceLogNeverRendersRawDiffOrSystemMessageContent() throws Exception {
+        String marker = "SECTIONMARKER";
+        GatewayClient gatewayClient = mock(GatewayClient.class);
+        JobPayload payload = new JobPayload(
+                "diff content containing " + marker,
+                "v1",
+                "chunk context",
+                List.of("system section one containing " + marker, "system section two"));
+        ClaimResponse claimed = new ClaimResponse(1L, 7L, payload);
+        when(gatewayClient.claim(anyString(), anyString()))
+                .thenReturn(Optional.of(claimed))
+                .thenReturn(Optional.empty());
+
+        LlamaClient llamaClient = mock(LlamaClient.class);
+        CompletableFuture<java.net.http.HttpResponse<java.io.InputStream>> failedFuture = new CompletableFuture<>();
+        failedFuture.completeExceptionally(new RuntimeException("simulated llama-server failure"));
+        when(llamaClient.startChatCompletion(any(), anyString(), anyDouble(), anyInt()))
+                .thenReturn(new LlamaClient.AsyncCompletion(failedFuture, System.currentTimeMillis()));
+
+        PromptTemplateService promptTemplateService = mock(PromptTemplateService.class);
+        when(promptTemplateService.resolve(anyString(), any(), any(), any()))
+                .thenReturn(new ResolvedPrompt(List.of(), "test-model", 0.2, 100));
+
+        HeartbeatScheduler heartbeatScheduler = mock(HeartbeatScheduler.class);
+        WorkerMetrics metrics = mock(WorkerMetrics.class);
+
+        WorkerProperties properties = new WorkerProperties("127.0.0.1", "8081", "", "");
+        properties.getGateway().setUrl("https://gateway.internal");
+        properties.getGateway().setApiKey("a".repeat(40));
+        properties.getWorker().setId("worker-1");
+        properties.getBackend().setId("backend-1");
+        properties.getLlama().setUrl("http://127.0.0.1:8000");
+        properties.getLlama().setModel("test-model");
+        properties.getNetwork().setPollIntervalMs(20L);
+
+        Logger workerLoopLogger = (Logger) LoggerFactory.getLogger(WorkerLoop.class);
+        workerLoopLogger.setLevel(Level.ALL);
+        ListAppender<ILoggingEvent> logAppender = new ListAppender<>();
+        logAppender.start();
+        workerLoopLogger.addAppender(logAppender);
+
+        WorkerLoop loop = new WorkerLoop(gatewayClient, llamaClient, promptTemplateService,
+                heartbeatScheduler, metrics, properties);
+        try {
+            loop.start();
+            long deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
+            boolean sawStartingInference = false;
+            while (System.nanoTime() < deadline && !sawStartingInference) {
+                sawStartingInference = logAppender.list.stream()
+                        .anyMatch(e -> e.getFormattedMessage().contains("Starting inference"));
+                if (!sawStartingInference) {
+                    Thread.sleep(20);
+                }
+            }
+            assertThat(sawStartingInference).as("the Starting inference line must actually fire").isTrue();
+        } finally {
+            loop.requestShutdown();
+            loop.awaitTermination(Duration.ofSeconds(5));
+            workerLoopLogger.detachAppender(logAppender);
+            workerLoopLogger.setLevel(null);
+        }
+
+        List<ILoggingEvent> startingInferenceLines = logAppender.list.stream()
+                .filter(e -> e.getFormattedMessage().contains("Starting inference"))
+                .toList();
+        assertThat(startingInferenceLines).hasSize(1);
+        ILoggingEvent line = startingInferenceLines.get(0);
+        assertThat(line.getLevel()).isEqualTo(Level.INFO);
+        assertThat(line.getFormattedMessage())
+                .contains("jobId=1").contains("reviewId=7")
+                .contains("diffChars=" + payload.diff().length())
+                .contains("systemMessages=2") // count, not content
+                .contains("model=test-model").contains("maxTokens=100")
+                .as("WOR-17: only sizes/counts, never raw content").doesNotContain(marker);
+
+        // WOR-17's actual requirement is broader than just this one line: no Worker log line at any
+        // level <= INFO may contain the marker anywhere in the whole run (claim, heartbeat-scheduler
+        // start/stop are mocked here and produce no real log lines, so this really is scoped to
+        // WorkerLoop's own logging for this job).
+        List<ILoggingEvent> leakingLines = logAppender.list.stream()
+                .filter(e -> e.getLevel().toInt() <= Level.INFO.toInt())
+                .filter(e -> e.getFormattedMessage().contains(marker))
+                .toList();
+        assertThat(leakingLines)
+                .as("WOR-17: SECTIONMARKER must never appear in any Worker log line at level <= INFO")
+                .isEmpty();
     }
 }
