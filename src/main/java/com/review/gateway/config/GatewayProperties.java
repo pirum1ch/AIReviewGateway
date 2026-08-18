@@ -38,6 +38,15 @@ public class GatewayProperties {
     private static final Logger log = LoggerFactory.getLogger(GatewayProperties.class);
 
     private static final int MIN_SECRET_LENGTH = 32;
+    /** WOR-14: an upper cap on {@code gateway.retry.requeue-delay} so a typo cannot strand a Review. */
+    private static final Duration MAX_REQUEUE_DELAY = Duration.ofMinutes(10);
+    /**
+     * WOR-16: the Worker's own request timeout ({@code network.gateway-timeout-sec}, default 10s) is the
+     * quantity a non-zero {@code requeue-delay} must be bounded against, not its (much shorter) poll
+     * interval — a stale duplicate {@code /fail} report cannot arrive more than one Worker request
+     * timeout late.
+     */
+    private static final Duration MIN_NONZERO_REQUEUE_DELAY = Duration.ofSeconds(15);
 
     private final Diff diff = new Diff();
     private final Heartbeat heartbeat = new Heartbeat();
@@ -123,8 +132,90 @@ public class GatewayProperties {
             throw new IllegalStateException("gateway.diff.max-chunk-context-chars must be >= 1; got: "
                     + diff.getMaxChunkContextChars());
         }
+        if (job.getMaxFailBodyBytes() < 1) {
+            throw new IllegalStateException("gateway.job.max-fail-body-bytes must be >= 1; got: "
+                    + job.getMaxFailBodyBytes());
+        }
 
+        validateRetryAndBackendHealthOnStartup();
         validatePromptOnStartup();
+    }
+
+    /**
+     * Worker Observability & Claim Latency (WOR-01/WOR-14/WOR-16, blocking): the attempt budget must not
+     * be exhaustible inside one backend-demotion grace window, {@code not_before} must never strand a
+     * Review indefinitely, and the stale-duplicate-report window (SR-06 residual) must stay bounded by
+     * the Worker's own request timeout, not its poll interval (the architecture doc's original — now
+     * corrected — reasoning). Same {@code @PostConstruct} fail-fast pattern as the rest of this class.
+     */
+    private void validateRetryAndBackendHealthOnStartup() {
+        Duration requeueDelay = retry.getRequeueDelay();
+        Duration failureGrace = backend.getFailureGrace();
+        if (requeueDelay == null || requeueDelay.isNegative()) {
+            throw new IllegalStateException("gateway.retry.requeue-delay must be >= 0 — refusing to start");
+        }
+        if (failureGrace == null || failureGrace.isNegative()) {
+            throw new IllegalStateException("gateway.backend.failure-grace must be >= 0 — refusing to start");
+        }
+        // WOR-14: an upper cap so a typo (e.g. a missing unit suffix) cannot strand a Review in QUEUED
+        // forever behind an enormous not_before.
+        if (requeueDelay.compareTo(MAX_REQUEUE_DELAY) > 0) {
+            throw new IllegalStateException(
+                    "gateway.retry.requeue-delay must be <= " + MAX_REQUEUE_DELAY + " — refusing to start");
+        }
+
+        boolean requeueDelayZero = requeueDelay.isZero();
+        boolean failureGraceZero = failureGrace.isZero();
+        if (requeueDelayZero && failureGraceZero) {
+            // WOR-01/WOR-16: the paired, explicit "revert to pre-branch behavior" escape hatch -- neither
+            // may be zeroed alone (checked below). This re-accepts both the WOT-01 fast-fail-storm risk
+            // and the WOT-11 stale-duplicate-report residual; both are logged loudly at boot.
+            log.warn("gateway.retry.requeue-delay=0 and gateway.backend.failure-grace=0: reverting to "
+                    + "pre-branch behavior (immediate requeue, single-probe demotion) -- explicitly "
+                    + "re-accepting the SR-06 stale-duplicate-report residual (WOR-16) and the fast-fail "
+                    + "attempt-budget-exhaustion risk this branch otherwise closes (WOR-01)");
+            return;
+        }
+        if (requeueDelayZero != failureGraceZero) {
+            throw new IllegalStateException(
+                    "gateway.retry.requeue-delay and gateway.backend.failure-grace must either both be 0 "
+                            + "(explicit revert to pre-branch behavior) or both be non-zero — refusing to start");
+        }
+
+        // WOR-16: bounded by the Worker's request timeout (network.gateway-timeout-sec, default 10s), not
+        // its poll interval -- a stale duplicate /fail report cannot be more than one Worker request
+        // timeout late, so the delay must outlast that, not the much shorter poll cadence.
+        if (requeueDelay.compareTo(MIN_NONZERO_REQUEUE_DELAY) < 0) {
+            throw new IllegalStateException(
+                    "gateway.retry.requeue-delay must be >= " + MIN_NONZERO_REQUEUE_DELAY
+                            + " (bounded by the Worker's network.gateway-timeout-sec, WOR-16) or exactly 0 "
+                            + "(paired with gateway.backend.failure-grace=0) — refusing to start");
+        }
+
+        // WOR-01: the attempt budget must not be exhaustible inside one backend-demotion grace window --
+        // requeue-delay * (max-attempts - 1) is the minimum wall-clock time to burn every attempt via
+        // worker-reported failures, and that must be at least the grace window a dead backend is allowed
+        // to keep receiving claims for.
+        int maxAttempts = retry.getMaxAttempts();
+        if (maxAttempts < 1) {
+            throw new IllegalStateException("gateway.retry.max-attempts must be >= 1; got: " + maxAttempts);
+        }
+        Duration attemptBudgetWindow = requeueDelay.multipliedBy(Math.max(0, maxAttempts - 1));
+        if (attemptBudgetWindow.compareTo(failureGrace) < 0) {
+            throw new IllegalStateException(
+                    "gateway.retry.requeue-delay * (gateway.retry.max-attempts - 1) must be >= "
+                            + "gateway.backend.failure-grace (WOR-01) — got requeue-delay=" + requeueDelay
+                            + ", max-attempts=" + maxAttempts + " (budget window=" + attemptBudgetWindow
+                            + "), failure-grace=" + failureGrace + " — refusing to start");
+        }
+
+        // A grace window shorter than one probe interval is meaningless (scheduler jitter could demote
+        // on the very next tick regardless of the grace value).
+        if (failureGrace.compareTo(scheduler.getBackendHealthInterval()) < 0) {
+            throw new IllegalStateException(
+                    "gateway.backend.failure-grace must be >= gateway.scheduler.backend-health-interval "
+                            + "— refusing to start");
+        }
     }
 
     /**
@@ -445,6 +536,17 @@ public class GatewayProperties {
     /** Retry limits (§9 {@code gateway.retry.*}). */
     public static class Retry {
         private int maxAttempts = 3;
+        /**
+         * Worker Observability & Claim Latency (WOC-40/WOR-01): delay before a requeued job becomes
+         * claimable again, written to {@code review_jobs.not_before}. <b>Default 90s, not the
+         * architecture doc's original 30s</b> — the threat model (WOR-01) requires
+         * {@code requeue-delay * (max-attempts - 1) >= gateway.backend.failure-grace} (default 180s) so
+         * the attempt budget can never be exhausted inside one backend-demotion grace window; with
+         * {@code max-attempts=3} that arithmetic requires at least 90s. {@code 0} disables the mechanism
+         * entirely (the documented escape hatch, paired with {@code failure-grace: 0} — see
+         * {@link GatewayProperties#validateRetryAndBackendHealthOnStartup()}).
+         */
+        private Duration requeueDelay = Duration.ofSeconds(90);
 
         public int getMaxAttempts() {
             return maxAttempts;
@@ -453,11 +555,25 @@ public class GatewayProperties {
         public void setMaxAttempts(int maxAttempts) {
             this.maxAttempts = maxAttempts;
         }
+
+        public Duration getRequeueDelay() {
+            return requeueDelay;
+        }
+
+        public void setRequeueDelay(Duration requeueDelay) {
+            this.requeueDelay = requeueDelay;
+        }
     }
 
     /** Hard job-duration backstop (§9 {@code gateway.job.*}). */
     public static class Job {
         private Duration maxDuration = Duration.ofMinutes(45);
+        /**
+         * WOC-33/WOR-08: SR-11 hard edge cap (bytes) for the whole {@code POST /jobs/{id}/fail} request
+         * body, enforced by {@code RequestBodySizeLimitFilter}. Sized generously above the worst-case
+         * body (~2 KB of UTF-8 + JSON escaping for a 32-char {@code reason} and a 500-char {@code detail}).
+         */
+        private long maxFailBodyBytes = 4096;
 
         public Duration getMaxDuration() {
             return maxDuration;
@@ -465,6 +581,14 @@ public class GatewayProperties {
 
         public void setMaxDuration(Duration maxDuration) {
             this.maxDuration = maxDuration;
+        }
+
+        public long getMaxFailBodyBytes() {
+            return maxFailBodyBytes;
+        }
+
+        public void setMaxFailBodyBytes(long maxFailBodyBytes) {
+            this.maxFailBodyBytes = maxFailBodyBytes;
         }
     }
 
@@ -619,7 +743,12 @@ public class GatewayProperties {
     /** llama-server health-probe client config (§9/§11, SR-10). */
     public static class Backend {
         private Duration connectTimeout = Duration.ofSeconds(3);
-        private Duration readTimeout = Duration.ofSeconds(5);
+        /**
+         * WOC-16: raised {@code 5s -> 10s}. Safe only because {@code BackendHealthChecker} (WOC-14) now
+         * performs probe HTTP I/O outside any transaction, so a slow probe no longer pins a Hikari
+         * connection.
+         */
+        private Duration readTimeout = Duration.ofSeconds(10);
         /**
          * Regex the probed backend's host must match, checked in addition to the always-enforced
          * loopback/link-local/metadata-range block (SR-10). Permissive by default ({@code ".*"} = any
@@ -627,6 +756,26 @@ public class GatewayProperties {
          * tighten this in production config to their actual backend network.
          */
         private String allowedHostPattern = ".*";
+        /**
+         * WOC-11: continuous failed-probe streak required before {@code ACTIVE -> SUSPECT} (fail-slow).
+         * {@code SUSPECT -> ACTIVE} stays single-success (recover-fast, unchanged). Must be
+         * {@code >= gateway.scheduler.backend-health-interval} (validated at startup) and, per WOR-01,
+         * {@code <= gateway.retry.requeue-delay * (gateway.retry.max-attempts - 1)}.
+         */
+        private Duration failureGrace = Duration.ofSeconds(180);
+        /**
+         * WOC-13: a failed probe does not demote a backend that is at capacity with at least one RUNNING
+         * job whose heartbeat is still fresh — dispatch-neutral by construction (an at-capacity backend is
+         * already unclaimable), further tightened over time by {@code BackendDispatcher} consulting
+         * {@code probe_failed_since} directly (WOR-10).
+         */
+        private boolean deferDemotionWhileBusy = true;
+        /**
+         * WOR-13 (SHOULD): upper bound on how long the at-capacity deferral above may postpone a
+         * demotion; past this, demotion proceeds regardless of capacity/heartbeat freshness. Defaults to
+         * {@code gateway.job.max-duration} so a wedged-but-busy backend cannot defer forever.
+         */
+        private Duration deferDemotionMax = Duration.ofMinutes(45);
 
         public Duration getConnectTimeout() {
             return connectTimeout;
@@ -650,6 +799,30 @@ public class GatewayProperties {
 
         public void setAllowedHostPattern(String allowedHostPattern) {
             this.allowedHostPattern = allowedHostPattern;
+        }
+
+        public Duration getFailureGrace() {
+            return failureGrace;
+        }
+
+        public void setFailureGrace(Duration failureGrace) {
+            this.failureGrace = failureGrace;
+        }
+
+        public boolean isDeferDemotionWhileBusy() {
+            return deferDemotionWhileBusy;
+        }
+
+        public void setDeferDemotionWhileBusy(boolean deferDemotionWhileBusy) {
+            this.deferDemotionWhileBusy = deferDemotionWhileBusy;
+        }
+
+        public Duration getDeferDemotionMax() {
+            return deferDemotionMax;
+        }
+
+        public void setDeferDemotionMax(Duration deferDemotionMax) {
+            this.deferDemotionMax = deferDemotionMax;
         }
     }
 
