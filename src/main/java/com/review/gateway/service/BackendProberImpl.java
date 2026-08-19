@@ -9,11 +9,15 @@ import org.springframework.stereotype.Component;
 import org.springframework.web.client.RestClient;
 import org.springframework.web.client.RestClientException;
 
+import java.util.function.Supplier;
+
 /**
  * Real HTTP-based {@link BackendProber} (architecture §11): {@code GET {backend.url}/health} with a
- * short timeout via the dedicated {@code backendProbeRestClient} (redirects disabled, SR-10). The
- * backend's URL is validated fresh on every probe by {@link BackendUrlValidator} — never trusted just
- * because it made it into the registry.
+ * short timeout via a fresh {@code backendProbeRestClientFactory}-built client per probe (redirects
+ * disabled, SR-10) — see that bean's Javadoc ({@code RestClientConfig}) for why a shared/pooled client is
+ * unsafe here: a stale keep-alive connection surviving a remote {@code llama-server} restart can get
+ * silently poisoned and never self-heal. The backend's URL is validated fresh on every probe by
+ * {@link BackendUrlValidator} — never trusted just because it made it into the registry.
  *
  * <p>Replaces {@link NoOpBackendProber} as the Spring-managed {@link BackendProber} bean now that a real
  * implementation exists.
@@ -24,11 +28,11 @@ public class BackendProberImpl implements BackendProber {
     private static final Logger log = LoggerFactory.getLogger(BackendProberImpl.class);
     private static final String HEALTH_PATH = "/health";
 
-    private final RestClient backendProbeRestClient;
+    private final Supplier<RestClient> backendProbeRestClientFactory;
     private final GatewayProperties properties;
 
-    public BackendProberImpl(RestClient backendProbeRestClient, GatewayProperties properties) {
-        this.backendProbeRestClient = backendProbeRestClient;
+    public BackendProberImpl(Supplier<RestClient> backendProbeRestClientFactory, GatewayProperties properties) {
+        this.backendProbeRestClientFactory = backendProbeRestClientFactory;
         this.properties = properties;
     }
 
@@ -37,7 +41,8 @@ public class BackendProberImpl implements BackendProber {
         BackendUrlValidator.validate(backend.getUrl(), properties.getBackend().getAllowedHostPattern());
 
         try {
-            backendProbeRestClient.get()
+            RestClient freshClient = backendProbeRestClientFactory.get();
+            freshClient.get()
                     .uri(backend.getUrl() + HEALTH_PATH)
                     .retrieve()
                     .toBodilessEntity();

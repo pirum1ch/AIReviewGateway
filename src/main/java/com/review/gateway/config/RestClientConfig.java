@@ -7,6 +7,7 @@ import org.springframework.http.client.JdkClientHttpRequestFactory;
 import org.springframework.web.client.RestClient;
 
 import java.net.http.HttpClient;
+import java.util.function.Supplier;
 
 /**
  * Two {@code RestClient} beans (not the deprecated {@code RestTemplate}), per architecture §11/§7:
@@ -75,19 +76,43 @@ public class RestClientConfig {
                 .build();
     }
 
+    /**
+     * A <em>factory</em>, not a shared {@code RestClient}: {@link com.review.gateway.service.BackendProberImpl}
+     * calls {@code get()} fresh for every single probe, so each probe gets its own {@link HttpClient} with
+     * an empty connection pool.
+     *
+     * <p>A backend's {@code llama-server} process is expected to restart from time to time (deploy, crash,
+     * model swap — architecture §whatever, one 1:1-paired Mac mini per backend). A shared, long-lived
+     * {@code HttpClient} keeps HTTP/1.1 keep-alive connections pooled per host; when the remote process
+     * restarts, a pooled connection to the old process can outlive it and get silently poisoned — reused on
+     * the next probe, it fails (or worse, appears to hang) even though a brand-new connection to the same
+     * host:port would succeed instantly. Once poisoned, the pool entry does not self-heal: every subsequent
+     * probe reuses the same dead connection, so the backend is stuck flapping/{@code SUSPECT} until the
+     * Gateway process itself restarts and the pool is discarded with it — reproduced live: {@code llama-01}
+     * stayed {@code SUSPECT} for 40+ minutes while directly reachable by curl (host and container alike),
+     * and recovered on the very first probe immediately after a Gateway restart.
+     *
+     * <p>Probes are infrequent (~once per {@code gateway.scheduler.backend-health-interval}, default well
+     * under 1/min per backend) and low-volume, so paying a fresh TCP handshake every time is free in
+     * practice — trading connection reuse for immunity to this whole class of staleness is a clear win here,
+     * unlike {@code gitLabRestClient}/{@code gitLabPromptRestClient} which stay pooled since GitLab's own
+     * process lifecycle isn't the Gateway's problem to defend against.
+     */
     @Bean
-    public RestClient backendProbeRestClient() {
-        HttpClient httpClient = HttpClient.newBuilder()
-                .connectTimeout(properties.getBackend().getConnectTimeout())
-                // SR-10: never follow a redirect on the probe client -- a malicious/compromised backend
-                // must not be able to redirect this call to an internal target.
-                .followRedirects(HttpClient.Redirect.NEVER)
-                .build();
-        JdkClientHttpRequestFactory requestFactory = new JdkClientHttpRequestFactory(httpClient);
-        requestFactory.setReadTimeout(properties.getBackend().getReadTimeout());
+    public Supplier<RestClient> backendProbeRestClientFactory() {
+        return () -> {
+            HttpClient httpClient = HttpClient.newBuilder()
+                    .connectTimeout(properties.getBackend().getConnectTimeout())
+                    // SR-10: never follow a redirect on the probe client -- a malicious/compromised backend
+                    // must not be able to redirect this call to an internal target.
+                    .followRedirects(HttpClient.Redirect.NEVER)
+                    .build();
+            JdkClientHttpRequestFactory requestFactory = new JdkClientHttpRequestFactory(httpClient);
+            requestFactory.setReadTimeout(properties.getBackend().getReadTimeout());
 
-        return RestClient.builder()
-                .requestFactory(requestFactory)
-                .build();
+            return RestClient.builder()
+                    .requestFactory(requestFactory)
+                    .build();
+        };
     }
 }
