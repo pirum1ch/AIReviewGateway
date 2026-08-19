@@ -554,3 +554,180 @@ narrow re-verification of F-DC-12 only — F-DC-01/02/03/04/05/06/07 need not be
 to merge now, F-DC-12 and F-DC-08 must be recorded as accepted known defects with owners, not dropped:
 F-DC-12 is silent data corruption of a published Review, and F-DC-08 means the next relapse of this
 branch's hardest bug will ship undetected.
+
+---
+
+# Verification round 2 (final) — remediation commits `5bac339` (F-DC-08) / `2160d59` (F-DC-12), 2026-07-29
+
+Narrow re-verification of the two items left open by verification round 1, plus the F-DC-13 disposition
+call the developer deferred to me. Scope: `feature/diff-chunking` @ `813ae61`, not merged.
+**No production code changed by me** — the two revert experiments below were made in the working tree,
+run, then restored with `git checkout`; `git status --short` verified empty afterwards (twice).
+
+**Suites (run by me on the clean tree):** Gateway `mvn -o test` →
+`Tests run: 395, Failures: 0, Errors: 0, Skipped: 0`, BUILD SUCCESS. **395/395 confirmed.** Worker
+unchanged (`git diff e9d6721..HEAD -- worker/` is empty) and re-confirmed green at `105/105` earlier in
+this session.
+
+## F-DC-08 — **VERIFIED-FIXED**
+
+The diagnosis in the fix commit matches what I measured independently in round 1 exactly (40P01 →
+Hibernate `LockAcquisitionException` → Spring `CannotAcquireLockException`, a sibling of
+`DeadlockLoserDataAccessException`; 55P03 → plain base `PessimisticLockingFailureException`). The
+implementation is sound and, importantly, the SQLSTATE check is genuinely the load-bearing
+discriminator rather than decoration: `handleDeadlock` now catches
+`{CannotAcquireLockException, DeadlockLoserDataAccessException}` and downgrades anything without a
+class-40 root SQLSTATE to `LOCK_TIMEOUT` via `isGenuineDeadlock`, which walks the cause chain for a real
+`SQLException.getSQLState()`. `CannotAcquireLockException` was correctly removed from
+`handleLockTimeout`'s list so hierarchy resolution is unambiguous.
+
+**I re-ran the revert-and-confirm cycle myself** (this was the whole point — round 1's failure mode was
+a plausible-looking guard that could not fire). Temporarily reverted
+`ReviewRepository.findByIdForNoKeyUpdate` to plain `FOR UPDATE`, i.e. re-introduced F-DC-03, and ran
+`ClaimCancelObsoleteConcurrencyTest`:
+
+```
+[ERROR] Tests run: 2, Failures: 1  <<< FAILURE!
+multiChunkConcurrentResultSubmitAndCancelNeverDeadlockOrLeakAnUnhandled500:251
+  [cascadeCancelSiblings racing a sibling's result submission must never produce a genuine Postgres
+   deadlock (F-DC-03) -- a bounded 409 LOCK_TIMEOUT is acceptable, DEADLOCK_DETECTED is not]
+  Expecting empty but was: ["The operation was rolled back after a database deadlock; please retry", ...]
+```
+
+18 genuine `deadlock detected` events from PostgreSQL in that run; the handler classified **16** of them
+and every single one as `DEADLOCK_DETECTED` (`CannotAcquireLockException` → `LockAcquisitionException`
+→ `PSQLException` chain visible in the log). Restored the lock mode → both tests green again. So the
+oracle is now **demonstrably load-bearing**: the assertion that was vacuous in round 1 now fails loudly
+on exactly the regression it exists to catch. (Minor correction to the developer's report: in my run
+**one** of the two hammer tests failed, not both — see the residual below for why. One reliably-failing
+test is sufficient for the guard, but the claim was slightly overstated.)
+
+**No over-matching in the other direction**, which was the risk the SQLSTATE check exists to prevent:
+in the reverted run the "`CannotAcquireLockException` without a class-40 SQLSTATE" downgrade branch fired
+**0** times (no genuine deadlock was mislabeled a timeout), and in the clean 395-test run there were
+**0** Postgres deadlocks, **0** `DEADLOCK_DETECTED` labels, and exactly **1** ordinary
+`LOCK_TIMEOUT` — `LockTimeoutMappingTest`, which still correctly gets `LOCK_TIMEOUT` (1/1 green) even
+though `CannotAcquireLockException` now routes through `handleDeadlock`. An ordinary bounded
+`lock_timeout` is therefore still reported as a timeout, not a deadlock.
+
+**Residual (Info, non-blocking, newly measured — F-DC-14):** 2 of the 18 deadlocks never reached the
+handler, and the claim-path hammer test passed despite them. Cause: `QueueManager.claim:106` catches
+`{QueryTimeoutException, PessimisticLockingFailureException}` — and `CannotAcquireLockException` is a
+*subtype* of `PessimisticLockingFailureException` — so a deadlock on the `POST /jobs/claim` path is
+swallowed to `Optional.empty()` → `204 No Content` (logged at DEBUG) and never becomes a
+`DEADLOCK_DETECTED` response. That swallow is intentional, documented, and correct behaviour for the
+claim path (the Worker simply retries), so this is **not** a defect in the fix — but it does mean the
+oracle covers the result-submit/cancel paths (the actual F-DC-03 scenario, 16/18) and not the claim
+path. Optional hardening: add a `pg_stat_database.deadlocks` delta assertion around the hammer — it is
+translation-independent and catches swallowed deadlocks too (it is what I used for every F-DC-03 verdict
+in round 1). Not required for merge.
+
+## F-DC-12 — **VERIFIED-FIXED**
+
+`ReviewService.sweepObsolete:246-253` now calls `entityManager.refresh(review)` immediately after the
+lock and **before** the `OBSOLETABLE_STATUSES` re-check — the correct position (a refresh after the
+check would be useless), and the row is already locked at that point so the refresh cannot introduce a
+new race. The javadoc no longer asserts a false invariant: it now explains the Hibernate
+managed-instance semantics accurately and correctly records that `ChunkCoordinator`/`cancel` are
+unaffected because each opens a `REQUIRES_NEW` transaction with a clean persistence context — which
+matches what I measured independently in round 1 (probe 11).
+
+`SweepObsoleteStaleReadTest` is a genuine, well-built reproduction of my exact scenario: real Zonky
+PostgreSQL, `pg_locks`-polling synchronisation with no sleeps, and it asserts the *outcome* that matters
+(`PUBLISHED` survives) rather than an intermediate detail. Its javadoc even records the empirical
+discovery that a blocked `FOR NO KEY UPDATE` shows up as an ungranted `ShareLock` on the holder's
+`transactionid` rather than an ungranted `tuple` lock — correct, and the same thing I hit.
+
+**I ran the remove-the-fix-and-confirm cycle myself.** With the fix in place: 1/1 green. With
+`entityManager.refresh(review)` temporarily deleted:
+
+```
+[ERROR] SweepObsoleteStaleReadTest.reviewPublishedConcurrentlyWithSweepObsoleteIsNeverOverwrittenToObsolete:151
+  [F-DC-12: a Review published concurrently with sweepObsolete's stale-instance re-check must stay
+   PUBLISHED, never be silently overwritten to OBSOLETE ...]
+  expected: PUBLISHED
+   but was: OBSOLETE
+```
+
+— the exact F-DC-12 symptom I originally reproduced. Restored → green. So this is a real regression
+guard, not a name-only test.
+
+**Residual (Info, non-blocking — F-DC-15):** the poll predicate is
+`SELECT count(*) FROM pg_locks WHERE NOT granted`, i.e. cluster-global rather than scoped to this test's
+own waiter. The test's javadoc justifies this ("the only concurrent activity is the two threads it
+starts itself"), which holds when run in isolation; in a full-suite run with `@Scheduled` beans active
+an unlucky interleaving could satisfy the poll early, release the publisher before the sweep thread is
+actually blocked, and let the test pass *vacuously* (the sweep would then read the already-`PUBLISHED`
+row as a non-candidate and skip it). Not a correctness problem for this verdict — I verified the
+discriminator property directly, in isolation, both ways — but worth tightening later by scoping the
+poll (e.g. to a wait on the publisher's own `transactionid`/relation) or by asserting post-hoc that the
+sweep genuinely saw the row as a candidate. Suite timing is consistent with a real run either way
+(21.9 s in isolation ≈ 20 s of that being context/Postgres startup; 0.28 s of test body in the warm
+full-suite run).
+
+## F-DC-13 — disposition: **does not block merge** (Info, documentation/hygiene follow-up)
+
+Reachability re-confirmed by grep across **both** `src/main/java` and `worker/src/main/java`:
+`findNextQueuedReviewIdForUpdate` (native `FOR UPDATE SKIP LOCKED` on `reviews`) and
+`markObsoleteForOtherHeadShas` have **zero callers in production code** — only
+`ReviewRepositoryTest`. So there is no live deadlock edge, no reachable defect, and nothing exploitable:
+today this is dead code, and dead code is not a vulnerability.
+
+My call as the domain expert here: **do not gate the merge on it.** Blocking a release on unreachable
+code would be blocking for its own sake, and deletion is not quite the trivial change it looks like
+(both queries have live test coverage that would have to be removed with them, i.e. a real code change
+needing its own review, on a branch that is otherwise verified and ready). The genuine risk is purely
+prospective — someone re-arming the F-DC-03 class of bug by calling `findNextQueuedReviewIdForUpdate`
+later — and that risk is addressed adequately and at zero regression cost by a **comment-only**
+defensive javadoc warning ("do not use — plain `FOR UPDATE` on `reviews` deadlocks against the FK RI
+trigger's `FOR KEY SHARE`; use `findByIdForNoKeyUpdate` — see F-DC-03"). Recommendation: add that
+warning now if the developer is still on the branch (comment-only, no re-verification needed, I do not
+need to see it again), otherwise take it as the first item of the next maintenance touch, together with
+deleting both dead queries and their tests. Tracked here so it is not lost.
+
+## Carried forward (unchanged, all non-blocking)
+
+F-DC-09 (hand-rolled `escapeJson` — still safe), F-DC-10 (`Set.of` vs `EnumSet` — still unreachable),
+F-DC-11 (per-call `ObjectMapper`), plus the new Info residuals F-DC-14 (claim-path deadlocks invisible
+to the hammer's oracle) and F-DC-15 (`SweepObsoleteStaleReadTest`'s global poll predicate). Feature-03
+carry-overs F03-01…F03-06 unchanged, with the **deployment prerequisites** from
+`feature-03-sast-report.md` still standing (env secrets ≥32 chars, `BACKEND_ALLOWED_HOST_PATTERN` not
+`.*`, `sslmode=require`, TLS on every hop, append-only grant on `review_events`, at-rest encryption +
+retention purge) — and the F03-06 rate-limiting note gains weight now that F-DC-04's 320 KB cap makes
+the 5×-jobs-per-request lever genuinely reachable. None of these is new to this branch.
+
+## FINAL VERDICT: **APPROVED FOR MERGE** — `feature/diff-chunking` → `master`
+
+Every finding from this feature's security review is closed and independently verified by execution:
+
+| # | Severity | Status |
+|---|---|---|
+| F-DC-01 | High | VERIFIED-FIXED (round 1) |
+| F-DC-02 | Medium | VERIFIED-FIXED (round 1) |
+| F-DC-03 | Medium | VERIFIED-FIXED (round 1, real PostgreSQL) |
+| F-DC-04 / 05 / 06 / 07 | Low / Low / Low / Info | VERIFIED-FIXED (round 1) |
+| **F-DC-08** | Info | **VERIFIED-FIXED (round 2, revert-confirmed)** |
+| **F-DC-12** | Low | **VERIFIED-FIXED (round 2, revert-confirmed)** |
+| F-DC-13 | Info | Open, unreachable — explicitly does not block (see above) |
+| F-DC-09 / 10 / 11 / 14 / 15 | Info | Open, non-blocking hygiene |
+
+**No Critical, High, Medium or Low finding remains open.** What was blocking is genuinely gone at the
+root cause, not papered over: the one-request heap exhaustion of the SPOF Gateway is bounded at a
+single global choke point (same input: OOM in 1.1 s before, clean 422 in 173 ms after), the CSR-10
+prompt-injection escape is closed by a strictly stronger control than I asked for, and the FK-RI
+deadlock is gone on real PostgreSQL with the parent lock weakened along exactly the intended edge and
+mutual exclusion provably intact.
+
+Two things make me comfortable signing this off rather than asking for another round. First, **both
+round-2 fixes were verified the hard way — by me, not by reading the diff**: I re-introduced each
+underlying bug and watched the new tests fail with the precise original symptom, then restored and
+watched them pass. That is the one check that distinguishes a real regression guard from the
+plausible-looking dead code I found in round 1, and both passed it. Second, the branch now carries
+working regression detection for its own hardest bug, which it did not before — an F-DC-03 relapse can
+no longer ship silently on the result-submit/cancel paths.
+
+Both suites green on the clean tree (Gateway **395/395**, Worker **105/105**), dependencies still
+byte-identical to master, gitleaks/semgrep posture unchanged from the round-1 clean result, and the
+tree is clean with no appsec modifications to production code. **Cleared to merge**, subject to the
+standing deployment prerequisites above (which are pre-existing, whole-system items, not gates on this
+branch). The AppSec pipeline for `feature/diff-chunking` is complete.
