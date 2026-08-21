@@ -137,6 +137,38 @@ class DiffPositionResolverTest {
         assertThat(resolver.resolve(diff, wanted(new PathLine("A.java", 1)))).containsKey(new PathLine("A.java", 1));
     }
 
+    // ---- F-DP-01: "--- "/"+++ "-shaped hunk-body content is not misread as a new file header ----
+
+    @Test
+    void removedLineStartingWithDashDashSpaceIsTreatedAsHunkBodyNotANewFileHeader() {
+        // A removed line whose content happens to start with "-- " (e.g. a SQL/Lua "-- comment")
+        // serializes as "--- <text>". Pre-fix, that was misread as a new file header, ending position
+        // resolution for the rest of the hunk -- the hunk's own added line must still resolve.
+        String diff = "--- a/query.sql\n+++ b/query.sql\n@@ -1,1 +1,1 @@\n--- old sql comment\n+new line\n";
+
+        Map<PathLine, ResolvedLine> result = resolver.resolve(diff, wanted(new PathLine("query.sql", 1)));
+
+        ResolvedLine resolved = result.get(new PathLine("query.sql", 1));
+        assertThat(resolved).isNotNull();
+        assertThat(resolved.newPath()).isEqualTo("query.sql");
+        assertThat(resolved.newLine()).isEqualTo(1);
+    }
+
+    @Test
+    void addedLineStartingWithPlusPlusSpaceIsTreatedAsHunkBodyAndALaterLineInTheSameHunkStillResolves() {
+        // An added line whose content happens to start with "++ " serializes as "+++ <text>". Pre-fix,
+        // that was misread as a new file header (garbage path, inHunk reset to false), which would have
+        // made the hunk's later "+real added" line unresolvable.
+        String diff = "--- a/A.java\n+++ b/A.java\n@@ -1,1 +1,3 @@\n context\n++ trap line\n+real added\n";
+
+        Map<PathLine, ResolvedLine> result = resolver.resolve(diff, wanted(new PathLine("A.java", 3)));
+
+        ResolvedLine resolved = result.get(new PathLine("A.java", 3));
+        assertThat(resolved).isNotNull();
+        assertThat(resolved.newPath()).isEqualTo("A.java");
+        assertThat(resolved.newLine()).isEqualTo(3);
+    }
+
     // ---- basic resolution: added / context / removed / multi-hunk / multi-file ----
 
     @Test

@@ -83,7 +83,11 @@ public class DiffPositionResolver {
         }
     }
 
-    private record HunkHeader(int oldStart, int newStart) {
+    /** {@code oldCount}/{@code newCount} are the hunk's declared line budgets ({@code @@ -a,b +c,d @@}'s
+     * optional {@code ,b}/{@code ,d}, defaulting to 1 per the unified-diff convention when omitted) —
+     * F-DP-01: this is what lets {@link #processLine} tell a genuine end-of-hunk from a {@code --- }/
+     * {@code +++ }-shaped line that is actually hunk-body content (e.g. a removed SQL/Lua comment). */
+    private record HunkHeader(int oldStart, int newStart, long oldCount, long newCount) {
     }
 
     /**
@@ -117,13 +121,21 @@ public class DiffPositionResolver {
             state.reset();
             return;
         }
-        if (line.startsWith("--- ")) {
+        // F-DP-01: header-line recognition is confined to outside an active hunk body (mirrors
+        // DiffChunker's CSR-11 confinement, adapted to this class's incremental scan -- DiffChunker
+        // knows a section's full line list up front and can look for the first "@@"; this class sees
+        // one line at a time, so "active hunk body" is tracked via the hunk's own declared line budget
+        // instead). Without this guard, a removed/added line whose content starts with "-- "/"++ "
+        // (e.g. a removed SQL/Lua "-- comment", serialized as "--- comment") is misread as a new file
+        // header. When the guard holds off (still inside an unexhausted hunk), the line falls through to
+        // the ordinary '+'/'-'/' ' dispatch below like any other hunk-body line.
+        if (line.startsWith("--- ") && !activeHunkBody(state)) {
             state.oldPathRaw = extractPath(line.substring(4));
             state.oldPathNormalized = state.oldPathRaw == null ? null : normalizeDiffPath(state.oldPathRaw);
             state.inHunk = false;
             return;
         }
-        if (line.startsWith("+++ ")) {
+        if (line.startsWith("+++ ") && !activeHunkBody(state)) {
             state.newPathRaw = extractPath(line.substring(4));
             if (state.newPathRaw == null) {
                 state.newPathNormalized = null;
@@ -140,6 +152,8 @@ public class DiffPositionResolver {
             if (header != null) {
                 state.oldLine = (long) header.oldStart();
                 state.newLine = (long) header.newStart();
+                state.hunkOldRemaining = header.oldCount();
+                state.hunkNewRemaining = header.newCount();
             }
             return;
         }
@@ -155,12 +169,18 @@ public class DiffPositionResolver {
             case '+' -> {
                 emitIfWanted(state, wanted, result, null, state.newLine);
                 state.newLine = advance(state.newLine);
+                state.hunkNewRemaining--;
             }
-            case '-' -> state.oldLine = advance(state.oldLine);
+            case '-' -> {
+                state.oldLine = advance(state.oldLine);
+                state.hunkOldRemaining--;
+            }
             case ' ' -> {
                 emitIfWanted(state, wanted, result, state.oldLine, state.newLine);
                 state.oldLine = advance(state.oldLine);
                 state.newLine = advance(state.newLine);
+                state.hunkOldRemaining--;
+                state.hunkNewRemaining--;
             }
             case '\\' -> {
                 // "\ No newline at end of file" -- no counter movement, still inside the hunk.
@@ -171,6 +191,14 @@ public class DiffPositionResolver {
                 state.inHunk = false;
             }
         }
+    }
+
+    /** F-DP-01: true while {@code state} is inside a hunk whose declared old/new line budget is not yet
+     * fully consumed -- i.e. a {@code --- }/{@code +++ }-shaped line encountered right now is hunk-body
+     * content, not a new file header. A budget of zero on both sides (or state.inHunk == false) means
+     * the hunk has ended (or never started), so the next such line is free to be read as a header. */
+    private boolean activeHunkBody(State state) {
+        return state.inHunk && (state.hunkOldRemaining > 0 || state.hunkNewRemaining > 0);
     }
 
     private void emitIfWanted(State state, Set<PathLine> wanted, Map<PathLine, ResolvedLine> result,
@@ -212,20 +240,45 @@ public class DiffPositionResolver {
         if (minusIdx < 0 || plusIdx < 0 || plusIdx < minusIdx) {
             return null;
         }
-        int oldStart = parseLeadingNumber(line, minusIdx + 1);
-        int newStart = parseLeadingNumber(line, plusIdx + 1);
-        if (oldStart < 0 || newStart < 0) {
+        NumberScan oldStart = scanLeadingNumber(line, minusIdx + 1);
+        NumberScan newStart = scanLeadingNumber(line, plusIdx + 1);
+        if (oldStart.value() < 0 || newStart.value() < 0) {
             return null;
         }
-        return new HunkHeader(oldStart, newStart);
+        long oldCount = parseOptionalCount(line, oldStart.end());
+        long newCount = parseOptionalCount(line, newStart.end());
+        if (oldCount < 0 || newCount < 0) {
+            // A comma is present but not followed by a well-formed bounded digit run -- malformed either
+            // way, reject the whole header rather than guessing a budget (DPR-02).
+            return null;
+        }
+        return new HunkHeader(oldStart.value(), newStart.value(), oldCount, newCount);
     }
 
     /**
-     * Parses the run of ASCII digits starting at {@code from}. Returns {@code -1} (malformed, never
-     * thrown) if there are no digits or more than {@link #MAX_HUNK_NUMBER_DIGITS} of them — the DPR-02
-     * guard against a crafted {@code @@ -99999999999999999999,1 +1,1 @@} header.
+     * Parses the hunk header's optional {@code ,count} suffix (F-DP-01) right after a start number ends
+     * at {@code afterStart}. Per the unified-diff convention, an omitted count means exactly 1 line.
+     * Returns {@code -1} (malformed, never thrown) if a comma is present but not followed by a valid
+     * bounded digit run -- same posture as the start-number scan itself.
      */
-    private int parseLeadingNumber(String line, int from) {
+    private long parseOptionalCount(String line, int afterStart) {
+        if (afterStart >= line.length() || line.charAt(afterStart) != ',') {
+            return 1;
+        }
+        return scanLeadingNumber(line, afterStart + 1).value();
+    }
+
+    private record NumberScan(int value, int end) {
+    }
+
+    /**
+     * Scans the run of ASCII digits starting at {@code from}, returning both the parsed value and the
+     * index right after the last digit (so a caller can check for a following {@code ,count}). {@code
+     * value} is {@code -1} (malformed, never thrown) if there are no digits or more than
+     * {@link #MAX_HUNK_NUMBER_DIGITS} of them — the DPR-02 guard against a crafted
+     * {@code @@ -99999999999999999999,1 +1,1 @@} header.
+     */
+    private NumberScan scanLeadingNumber(String line, int from) {
         int len = line.length();
         int end = from;
         while (end < len && Character.isDigit(line.charAt(end))) {
@@ -236,13 +289,13 @@ public class DiffPositionResolver {
             // Either no digits at all, or more of them than a real diff could ever need -- malformed
             // either way; the cap is what keeps this a bounded digit scan rather than an unguarded
             // Integer.parseInt on caller-controlled digits (DPR-02).
-            return -1;
+            return new NumberScan(-1, end);
         }
         int value = 0;
         for (int i = from; i < end; i++) {
             value = value * 10 + (line.charAt(i) - '0');
         }
-        return value;
+        return new NumberScan(value, end);
     }
 
     /**
@@ -305,6 +358,9 @@ public class DiffPositionResolver {
         boolean inHunk;
         Long oldLine;
         Long newLine;
+        /** F-DP-01: the current hunk's remaining declared old/new line budget -- see {@link #activeHunkBody}. */
+        long hunkOldRemaining;
+        long hunkNewRemaining;
 
         void reset() {
             oldPathRaw = null;
@@ -314,6 +370,8 @@ public class DiffPositionResolver {
             inHunk = false;
             oldLine = null;
             newLine = null;
+            hunkOldRemaining = 0;
+            hunkNewRemaining = 0;
         }
     }
 }
