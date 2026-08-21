@@ -3,6 +3,8 @@ package com.review.gateway.service;
 import com.review.gateway.exception.GitLabPublishException;
 import com.review.gateway.exception.PromptSourceInvalidException;
 import com.review.gateway.exception.PromptSourceUnavailableException;
+import com.review.gateway.service.dto.DiffPosition;
+import com.review.gateway.service.dto.DiffRefs;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.http.MediaType;
@@ -15,16 +17,22 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.springframework.http.HttpMethod.GET;
 import static org.springframework.http.HttpMethod.POST;
+import static org.springframework.test.web.client.match.MockRestRequestMatchers.content;
 import static org.springframework.test.web.client.match.MockRestRequestMatchers.header;
 import static org.springframework.test.web.client.match.MockRestRequestMatchers.method;
 import static org.springframework.test.web.client.match.MockRestRequestMatchers.requestTo;
+import static org.springframework.test.web.client.response.MockRestResponseCreators.withBadRequest;
 import static org.springframework.test.web.client.response.MockRestResponseCreators.withServerError;
 import static org.springframework.test.web.client.response.MockRestResponseCreators.withStatus;
 import static org.springframework.test.web.client.response.MockRestResponseCreators.withSuccess;
+import static org.springframework.test.web.client.response.MockRestResponseCreators.withTooManyRequests;
 
 class GitLabClientImplTest {
 
     private static final String BASE_URL = "https://gitlab.example.test/api/v4";
+    private static final String SHA_A = "a".repeat(40);
+    private static final String SHA_B = "b".repeat(40);
+    private static final String SHA_C = "c".repeat(40);
 
     private MockRestServiceServer mockServer;
     private MockRestServiceServer promptMockServer;
@@ -42,7 +50,7 @@ class GitLabClientImplTest {
                 .defaultHeader("PRIVATE-TOKEN", "test-gitlab-prompt-token-01234567890");
         promptMockServer = MockRestServiceServer.bindTo(promptBuilder).build();
 
-        client = new GitLabClientImpl(builder.build(), promptBuilder.build(), new TextSanitizer());
+        client = new GitLabClientImpl(builder.build(), promptBuilder.build(), new TextSanitizer(), new MetricsCounters());
     }
 
     // ---- postDiscussion (existing behavior, unchanged) ----
@@ -56,7 +64,7 @@ class GitLabClientImplTest {
                         {"id": "discussion-abc-123", "individual_note": true}
                         """, MediaType.APPLICATION_JSON));
 
-        String discussionId = client.postDiscussion(10L, 5L, "a sanitized comment body");
+        String discussionId = client.postDiscussion(10L, 5L, "a sanitized comment body", null);
 
         assertThat(discussionId).isEqualTo("discussion-abc-123");
         mockServer.verify();
@@ -70,7 +78,7 @@ class GitLabClientImplTest {
                         {"id": "d-1"}
                         """, MediaType.APPLICATION_JSON));
 
-        client.postDiscussion(999999L, 123456L, "body");
+        client.postDiscussion(999999L, 123456L, "body", null);
 
         mockServer.verify();
     }
@@ -80,7 +88,7 @@ class GitLabClientImplTest {
         mockServer.expect(requestTo(BASE_URL + "/projects/1/merge_requests/1/discussions"))
                 .andRespond(withServerError());
 
-        assertThatThrownBy(() -> client.postDiscussion(1L, 1L, "body"))
+        assertThatThrownBy(() -> client.postDiscussion(1L, 1L, "body", null))
                 .isInstanceOf(GitLabPublishException.class);
         mockServer.verify();
     }
@@ -90,8 +98,201 @@ class GitLabClientImplTest {
         mockServer.expect(requestTo(BASE_URL + "/projects/1/merge_requests/1/discussions"))
                 .andRespond(withSuccess("{}", MediaType.APPLICATION_JSON));
 
-        assertThatThrownBy(() -> client.postDiscussion(1L, 1L, "body"))
+        assertThatThrownBy(() -> client.postDiscussion(1L, 1L, "body", null))
                 .isInstanceOf(GitLabPublishException.class);
+    }
+
+    // ---- postDiscussion wire shape (Diff Position Anchoring, DPR-03/DPR-08) ----
+
+    @Test
+    void fallbackBodyWithNoPositionSerializesToExactlyBodyNoPositionKey() {
+        // DPR-03(a): asserted on serialized bytes, not object state -- byte-identical to today's output.
+        mockServer.expect(requestTo(BASE_URL + "/projects/1/merge_requests/1/discussions"))
+                .andExpect(content().json("{\"body\":\"plain note\"}", true))
+                .andRespond(withSuccess("{\"id\": \"d-1\"}", MediaType.APPLICATION_JSON));
+
+        client.postDiscussion(1L, 1L, "plain note", null);
+
+        mockServer.verify();
+    }
+
+    @Test
+    void positionedBodyContainsExactlyTheLegalFieldsForAnAddedLine() {
+        // DPR-03(b)/(c): added line -> new_line only, old_line omitted entirely (not null).
+        DiffPosition position = new DiffPosition(SHA_A, SHA_B, SHA_C, "src/A.java", "src/A.java", null, 42);
+        mockServer.expect(requestTo(BASE_URL + "/projects/1/merge_requests/1/discussions"))
+                .andExpect(content().json("""
+                        {"body":"finding","position":{"position_type":"text","base_sha":"%s","start_sha":"%s",
+                        "head_sha":"%s","old_path":"src/A.java","new_path":"src/A.java","new_line":42}}
+                        """.formatted(SHA_A, SHA_B, SHA_C), true))
+                .andRespond(withSuccess("{\"id\": \"d-1\"}", MediaType.APPLICATION_JSON));
+
+        client.postDiscussion(1L, 1L, "finding", position);
+
+        mockServer.verify();
+    }
+
+    @Test
+    void positionedBodyContainsBothLineNumbersForAContextLine() {
+        DiffPosition position = new DiffPosition(SHA_A, SHA_B, SHA_C, "src/A.java", "src/A.java", 10, 11);
+        mockServer.expect(requestTo(BASE_URL + "/projects/1/merge_requests/1/discussions"))
+                .andExpect(content().json("""
+                        {"body":"finding","position":{"position_type":"text","base_sha":"%s","start_sha":"%s",
+                        "head_sha":"%s","old_path":"src/A.java","new_path":"src/A.java","old_line":10,"new_line":11}}
+                        """.formatted(SHA_A, SHA_B, SHA_C), true))
+                .andRespond(withSuccess("{\"id\": \"d-1\"}", MediaType.APPLICATION_JSON));
+
+        client.postDiscussion(1L, 1L, "finding", position);
+
+        mockServer.verify();
+    }
+
+    /**
+     * DPR-03: the "no position key at all" contract must hold independent of any global Jackson
+     * defaults a deployment might configure — {@code @JsonInclude(NON_NULL)} on the record itself
+     * (asserted directly above, on serialized bytes through the real production code path) is what
+     * guarantees this, not any property-inclusion default of the {@code RestClient}'s converter. This
+     * project has no {@code spring.jackson.default-property-inclusion} override anywhere in
+     * {@code application.yml} (verified), so the two round-trip assertions above are the meaningful,
+     * non-fragile form of this check; a bespoke {@code ObjectMapper} reconstructed outside the real
+     * request pipeline would only prove the annotation exists, which the round-trip tests already do.
+     */
+
+    @Test
+    void badRequestWithPositionRetriesOnceWithoutPositionAndSucceeds() {
+        // DPR-08: 400 -> retry ONCE with position omitted -> 200 succeeds; the retry body must carry no position.
+        DiffPosition position = new DiffPosition(SHA_A, SHA_B, SHA_C, "A.java", "A.java", null, 1);
+        mockServer.expect(requestTo(BASE_URL + "/projects/1/merge_requests/1/discussions"))
+                .andExpect(content().json("{\"body\":\"finding\",\"position\":{\"position_type\":\"text\","
+                        + "\"base_sha\":\"" + SHA_A + "\",\"start_sha\":\"" + SHA_B + "\",\"head_sha\":\"" + SHA_C
+                        + "\",\"old_path\":\"A.java\",\"new_path\":\"A.java\",\"new_line\":1}}", true))
+                .andRespond(withBadRequest());
+        mockServer.expect(requestTo(BASE_URL + "/projects/1/merge_requests/1/discussions"))
+                .andExpect(content().json("{\"body\":\"finding\"}", true))
+                .andRespond(withSuccess("{\"id\": \"d-1\"}", MediaType.APPLICATION_JSON));
+
+        String discussionId = client.postDiscussion(1L, 1L, "finding", position);
+
+        assertThat(discussionId).isEqualTo("d-1");
+        mockServer.verify();
+    }
+
+    @Test
+    void badRequestThenBadRequestAgainSurfacesAsTransientExactlyOnceNoLoop() {
+        DiffPosition position = new DiffPosition(SHA_A, SHA_B, SHA_C, "A.java", "A.java", null, 1);
+        mockServer.expect(requestTo(BASE_URL + "/projects/1/merge_requests/1/discussions"))
+                .andRespond(withBadRequest());
+        mockServer.expect(requestTo(BASE_URL + "/projects/1/merge_requests/1/discussions"))
+                .andRespond(withBadRequest());
+
+        assertThatThrownBy(() -> client.postDiscussion(1L, 1L, "finding", position))
+                .isInstanceOf(GitLabPublishException.class);
+        mockServer.verify(); // exactly two requests were expected/consumed -- no further retry loop
+    }
+
+    @Test
+    void badRequestWithNoPositionAttachedNeverRetries() {
+        // DPR-08: the retry is gated on "a position was attached to the first attempt" -- a fallback
+        // POST that already has no position must not retry (there is nothing left to omit).
+        mockServer.expect(requestTo(BASE_URL + "/projects/1/merge_requests/1/discussions"))
+                .andRespond(withBadRequest());
+
+        assertThatThrownBy(() -> client.postDiscussion(1L, 1L, "finding", null))
+                .isInstanceOf(GitLabPublishException.class);
+        mockServer.verify(); // exactly one request
+    }
+
+    @Test
+    void tooManyRequestsDoesNotTriggerThePositionRetry() {
+        // DPR-08: 429 must NOT be treated like 400 -- it keeps today's transient-failure path verbatim.
+        DiffPosition position = new DiffPosition(SHA_A, SHA_B, SHA_C, "A.java", "A.java", null, 1);
+        mockServer.expect(requestTo(BASE_URL + "/projects/1/merge_requests/1/discussions"))
+                .andRespond(withTooManyRequests());
+
+        assertThatThrownBy(() -> client.postDiscussion(1L, 1L, "finding", position))
+                .isInstanceOf(GitLabPublishException.class);
+        mockServer.verify(); // exactly one request -- no retry attempted for 429
+    }
+
+    // ---- fetchDiffRefs (Diff Position Anchoring, DPR-07) ----
+
+    @Test
+    void fetchDiffRefsHappyPathReturnsAllThreeShas() {
+        mockServer.expect(requestTo(BASE_URL + "/projects/1/merge_requests/5"))
+                .andExpect(method(GET))
+                .andExpect(header("PRIVATE-TOKEN", "test-gitlab-token-0123456789012345"))
+                .andRespond(withSuccess("""
+                        {"id": 999, "title": "ignored free text", "diff_refs": {"base_sha": "%s",
+                        "start_sha": "%s", "head_sha": "%s"}}
+                        """.formatted(SHA_A, SHA_B, SHA_C), MediaType.APPLICATION_JSON));
+
+        Optional<DiffRefs> refs = client.fetchDiffRefs(1L, 5L);
+
+        assertThat(refs).contains(new DiffRefs(SHA_A, SHA_B, SHA_C));
+        mockServer.verify();
+    }
+
+    @Test
+    void fetchDiffRefsEmptyBodyIsEmpty() {
+        mockServer.expect(requestTo(BASE_URL + "/projects/1/merge_requests/5"))
+                .andRespond(withSuccess("{}", MediaType.APPLICATION_JSON));
+
+        assertThat(client.fetchDiffRefs(1L, 5L)).isEmpty();
+    }
+
+    @Test
+    void fetchDiffRefsNullDiffRefsIsEmpty() {
+        mockServer.expect(requestTo(BASE_URL + "/projects/1/merge_requests/5"))
+                .andRespond(withSuccess("{\"diff_refs\": null}", MediaType.APPLICATION_JSON));
+
+        assertThat(client.fetchDiffRefs(1L, 5L)).isEmpty();
+    }
+
+    @Test
+    void fetchDiffRefsOneNullMemberIsEmptyNeverPartial() {
+        mockServer.expect(requestTo(BASE_URL + "/projects/1/merge_requests/5"))
+                .andRespond(withSuccess("""
+                        {"diff_refs": {"base_sha": null, "start_sha": "%s", "head_sha": "%s"}}
+                        """.formatted(SHA_B, SHA_C), MediaType.APPLICATION_JSON));
+
+        assertThat(client.fetchDiffRefs(1L, 5L)).isEmpty();
+    }
+
+    @Test
+    void fetchDiffRefsA39CharacterShaIsEmpty() {
+        String shortSha = SHA_A.substring(0, 39);
+        mockServer.expect(requestTo(BASE_URL + "/projects/1/merge_requests/5"))
+                .andRespond(withSuccess("""
+                        {"diff_refs": {"base_sha": "%s", "start_sha": "%s", "head_sha": "%s"}}
+                        """.formatted(shortSha, SHA_B, SHA_C), MediaType.APPLICATION_JSON));
+
+        assertThat(client.fetchDiffRefs(1L, 5L)).isEmpty();
+    }
+
+    @Test
+    void fetchDiffRefsNonJsonBodyIsEmpty() {
+        mockServer.expect(requestTo(BASE_URL + "/projects/1/merge_requests/5"))
+                .andRespond(withSuccess("not json at all", MediaType.APPLICATION_JSON));
+
+        assertThat(client.fetchDiffRefs(1L, 5L)).isEmpty();
+    }
+
+    @Test
+    void fetchDiffRefsServerErrorIsEmpty() {
+        mockServer.expect(requestTo(BASE_URL + "/projects/1/merge_requests/5"))
+                .andRespond(withServerError());
+
+        assertThat(client.fetchDiffRefs(1L, 5L)).isEmpty();
+    }
+
+    @Test
+    void fetchDiffRefsConnectionResetIsEmpty() {
+        mockServer.expect(requestTo(BASE_URL + "/projects/1/merge_requests/5"))
+                .andRespond(request -> {
+                    throw new java.io.IOException("Connection reset");
+                });
+
+        assertThat(client.fetchDiffRefs(1L, 5L)).isEmpty();
     }
 
     // ---- resolveCommitSha (PMR-13/PMR-15/PMR-26) ----

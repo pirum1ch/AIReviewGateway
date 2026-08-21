@@ -1,14 +1,18 @@
 package com.review.gateway.service;
 
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.review.gateway.exception.GitLabPublishException;
 import com.review.gateway.exception.PromptSourceInvalidException;
 import com.review.gateway.exception.PromptSourceUnavailableException;
+import com.review.gateway.service.dto.DiffPosition;
+import com.review.gateway.service.dto.DiffRefs;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatusCode;
 import org.springframework.stereotype.Component;
+import org.springframework.web.client.HttpClientErrorException;
 import org.springframework.web.client.RestClient;
 import org.springframework.web.client.RestClientException;
 import org.springframework.web.util.UriUtils;
@@ -41,46 +45,165 @@ public class GitLabClientImpl implements GitLabClient {
 
     private static final Logger log = LoggerFactory.getLogger(GitLabClientImpl.class);
     private static final String DISCUSSIONS_PATH = "/projects/{projectId}/merge_requests/{mergeRequestIid}/discussions";
+    private static final String MERGE_REQUEST_PATH = "/projects/{projectId}/merge_requests/{mergeRequestIid}";
     private static final String COMMITS_PATH = "/projects/{projectRef}/repository/commits/{ref}";
     private static final String RAW_FILE_PATH = "/projects/{projectRef}/repository/files/{filePath}/raw?ref={commitSha}";
     private static final String PROJECT_PATH = "/projects/{projectRef}";
-    /** PMR-13: {@code commitSha} must be pinned to this shape before it ever reaches a URI. */
+    /** PMR-13: {@code commitSha} must be pinned to this shape before it ever reaches a URI. Reused,
+     * unchanged, for DPR-07's SHA validation on {@link #fetchDiffRefs} — one implementation of the
+     * "40 lowercase hex chars" lesson, not a second one (§0 of the diff-position-anchoring threat model). */
     private static final java.util.regex.Pattern COMMIT_SHA_PATTERN = java.util.regex.Pattern.compile("^[0-9a-f]{40}$");
     /** F-PM-06: {@code reviews.source_ref}/{@code review_prompt_sections.source_ref} column width. */
     private static final int MAX_DEFAULT_BRANCH_LENGTH = 200;
+    private static final String POSITION_TYPE_TEXT = "text";
 
     private final RestClient gitLabRestClient;
     private final RestClient gitLabPromptRestClient;
     private final TextSanitizer textSanitizer;
+    private final MetricsCounters metricsCounters;
 
-    public GitLabClientImpl(RestClient gitLabRestClient, RestClient gitLabPromptRestClient, TextSanitizer textSanitizer) {
+    public GitLabClientImpl(RestClient gitLabRestClient, RestClient gitLabPromptRestClient, TextSanitizer textSanitizer,
+                             MetricsCounters metricsCounters) {
         this.gitLabRestClient = gitLabRestClient;
         this.gitLabPromptRestClient = gitLabPromptRestClient;
         this.textSanitizer = textSanitizer;
+        this.metricsCounters = metricsCounters;
     }
 
+    /**
+     * DPR-08: the position-less retry is a bounded loop (a flag, not a re-entrant call) — at most one
+     * retry, triggered only by HTTP 400, only when a position was actually attached on the attempt that
+     * received it. 401/403/404/429/5xx and network failures fall straight to the existing
+     * {@link GitLabPublishException} transient path, exactly as before this feature.
+     */
     @Override
-    public String postDiscussion(Long projectId, Long mergeRequestId, String body) {
-        try {
-            DiscussionResponse response = gitLabRestClient.post()
-                    .uri(DISCUSSIONS_PATH, projectId, mergeRequestId)
-                    .body(new DiscussionRequest(body))
-                    .retrieve()
-                    .body(DiscussionResponse.class);
-
-            if (response == null || response.id() == null || response.id().isBlank()) {
-                throw new GitLabPublishException("GitLab discussion creation returned no discussion id");
+    public String postDiscussion(Long projectId, Long mergeRequestId, String body, DiffPosition position) {
+        DiffPosition attemptPosition = position;
+        boolean alreadyRetried = false;
+        while (true) {
+            try {
+                return doPostDiscussion(projectId, mergeRequestId, body, attemptPosition);
+            } catch (HttpClientErrorException.BadRequest badRequest) {
+                if (attemptPosition != null && !alreadyRetried) {
+                    log.warn("GitLab discussion publish returned 400 with a position attached for project={} mr={}; "
+                            + "retrying once without position", projectId, mergeRequestId);
+                    metricsCounters.incrementPositionRejectedByGitLab();
+                    attemptPosition = null;
+                    alreadyRetried = true;
+                    continue;
+                }
+                log.warn("GitLab discussion publish failed for project={} mr={}: {}",
+                        projectId, mergeRequestId, badRequest.getClass().getSimpleName());
+                throw new GitLabPublishException("Failed to publish discussion to GitLab", badRequest);
+            } catch (RestClientException failure) {
+                // SR-14: never log the comment body (LLM-derived, but still treated as payload, not just
+                // infra chatter) or raw exception detail beyond class/status -- the caller (GitLabPublisher)
+                // already logs failure.getMessage() at WARN via the thrown exception's own message here,
+                // which is deliberately generic (no comment content echoed).
+                log.warn("GitLab discussion publish failed for project={} mr={}: {}",
+                        projectId, mergeRequestId, failure.getClass().getSimpleName());
+                throw new GitLabPublishException("Failed to publish discussion to GitLab", failure);
             }
-            return response.id();
-        } catch (RestClientException failure) {
-            // SR-14: never log the comment body (LLM-derived, but still treated as payload, not just
-            // infra chatter) or raw exception detail beyond class/status -- the caller (GitLabPublisher)
-            // already logs failure.getMessage() at WARN via the thrown exception's own message here,
-            // which is deliberately generic (no comment content echoed).
-            log.warn("GitLab discussion publish failed for project={} mr={}: {}",
-                    projectId, mergeRequestId, failure.getClass().getSimpleName());
-            throw new GitLabPublishException("Failed to publish discussion to GitLab", failure);
         }
+    }
+
+    private String doPostDiscussion(Long projectId, Long mergeRequestId, String body, DiffPosition position) {
+        DiscussionResponse response = gitLabRestClient.post()
+                .uri(DISCUSSIONS_PATH, projectId, mergeRequestId)
+                .body(new DiscussionRequest(body, toPositionRequest(position)))
+                .retrieve()
+                .body(DiscussionResponse.class);
+
+        if (response == null || response.id() == null || response.id().isBlank()) {
+            throw new GitLabPublishException("GitLab discussion creation returned no discussion id");
+        }
+        return response.id();
+    }
+
+    /**
+     * DPR-03: the choke point every positioned POST goes through. Returns {@code null} (no
+     * {@code position} key at all in the serialized body, {@code @JsonInclude(NON_NULL)}) unless every
+     * invariant holds — never {@code /dev/null} in either path, never a half-filled line-number
+     * combination (new-file interpretation only: {@code newLine} is always required), never a blank SHA.
+     * Defense in depth: {@link DiffPositionResolver} and {@code GitLabPublisher} are already specified to
+     * never produce an invalid {@link DiffPosition}, but this is the single place a wire body is built,
+     * so it is also the single place that must refuse to emit one.
+     */
+    private PositionRequest toPositionRequest(DiffPosition position) {
+        if (position == null) {
+            return null;
+        }
+        if (isBlankOrDevNull(position.oldPath()) || isBlankOrDevNull(position.newPath())) {
+            return null;
+        }
+        if (position.newLine() == null) {
+            return null;
+        }
+        if (isBlank(position.baseSha()) || isBlank(position.startSha()) || isBlank(position.headSha())) {
+            return null;
+        }
+        return new PositionRequest(POSITION_TYPE_TEXT, position.baseSha(), position.startSha(), position.headSha(),
+                position.oldPath(), position.newPath(), position.oldLine(), position.newLine());
+    }
+
+    private boolean isBlank(String value) {
+        return value == null || value.isBlank();
+    }
+
+    private boolean isBlankOrDevNull(String value) {
+        return isBlank(value) || "/dev/null".equals(value);
+    }
+
+    /**
+     * Diff Position Anchoring: resolves {@code diff_refs} for {@code mrIid} via the write-scoped
+     * {@code gitLabRestClient} (reused, not a new credential — endorsed by the threat model §4.5: this
+     * is the first *read* call on that client, but minting a third GitLab credential for one field is a
+     * worse trade-off than the widened scope, which DEPLOYMENT.md documents). DPR-07: binds only
+     * {@code diff_refs.{base_sha,start_sha,head_sha}} via {@code @JsonIgnoreProperties(ignoreUnknown =
+     * true)} — every other MR field (title/description/labels/...) is skipped by Jackson without ever
+     * being materialized into a String (§4.1 of the threat model). Never throws.
+     */
+    @Override
+    public Optional<DiffRefs> fetchDiffRefs(Long projectId, Long mergeRequestId) {
+        try {
+            MergeRequestResponse response = gitLabRestClient.get()
+                    .uri(MERGE_REQUEST_PATH, projectId, mergeRequestId)
+                    .retrieve()
+                    .body(MergeRequestResponse.class);
+            return extractDiffRefs(response);
+        } catch (RestClientException failure) {
+            log.warn("GitLab merge request lookup failed for project={} mr={}: {}",
+                    projectId, mergeRequestId, failure.getClass().getSimpleName());
+            return Optional.empty();
+        } catch (RuntimeException unexpected) {
+            // DPR-07: no throws path -- any other runtime failure (e.g. an unexpected URI-building or
+            // deserialization error) degrades to "diff refs unavailable", exactly like a network failure.
+            log.warn("GitLab merge request lookup failed unexpectedly for project={} mr={}: {}",
+                    projectId, mergeRequestId, unexpected.getClass().getSimpleName());
+            return Optional.empty();
+        }
+    }
+
+    private Optional<DiffRefs> extractDiffRefs(MergeRequestResponse response) {
+        if (response == null || response.diffRefs() == null) {
+            return Optional.empty();
+        }
+        DiffRefsResponse raw = response.diffRefs();
+        String baseSha = normalizeCommitSha(raw.baseSha());
+        String startSha = normalizeCommitSha(raw.startSha());
+        String headSha = normalizeCommitSha(raw.headSha());
+        if (baseSha == null || startSha == null || headSha == null) {
+            // DPR-07: all three or none -- never a partially-populated DiffRefs.
+            return Optional.empty();
+        }
+        return Optional.of(new DiffRefs(baseSha, startSha, headSha));
+    }
+
+    private String normalizeCommitSha(String raw) {
+        if (raw == null || raw.isBlank()) {
+            return null;
+        }
+        return COMMIT_SHA_PATTERN.matcher(raw).matches() ? raw : null;
     }
 
     @Override
@@ -227,7 +350,31 @@ public class GitLabClientImpl implements GitLabClient {
         }
     }
 
-    private record DiscussionRequest(String body) {
+    /**
+     * DPR-03: {@code @JsonInclude(NON_NULL)} is load-bearing here -- when {@code position} is
+     * {@code null} (the fallback/legacy path), the serialized body must be exactly
+     * {@code {"body":"..."}}, with no {@code "position"} key at all (asserted on serialized bytes in
+     * {@code GitLabClientImplTest}, not just on object state).
+     */
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    private record DiscussionRequest(String body, PositionRequest position) {
+    }
+
+    /**
+     * DPR-03: {@code @JsonInclude(NON_NULL)} so {@code old_line}/{@code new_line} are <em>omitted</em>,
+     * never serialized as {@code null}, per GitLab's own line-type convention (added line: {@code
+     * new_line} only; context line: both).
+     */
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    private record PositionRequest(
+            @JsonProperty("position_type") String positionType,
+            @JsonProperty("base_sha") String baseSha,
+            @JsonProperty("start_sha") String startSha,
+            @JsonProperty("head_sha") String headSha,
+            @JsonProperty("old_path") String oldPath,
+            @JsonProperty("new_path") String newPath,
+            @JsonProperty("old_line") Integer oldLine,
+            @JsonProperty("new_line") Integer newLine) {
     }
 
     @JsonIgnoreProperties(ignoreUnknown = true)
@@ -240,5 +387,18 @@ public class GitLabClientImpl implements GitLabClient {
 
     @JsonIgnoreProperties(ignoreUnknown = true)
     private record ProjectResponse(@JsonProperty("default_branch") String defaultBranch) {
+    }
+
+    /** DPR-07: the ONLY field bound from {@code GET /projects/{id}/merge_requests/{iid}} -- every other
+     * MR field (title/description/labels/...) is ignored, and never materialized (§4.1). */
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    private record MergeRequestResponse(@JsonProperty("diff_refs") DiffRefsResponse diffRefs) {
+    }
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    private record DiffRefsResponse(
+            @JsonProperty("base_sha") String baseSha,
+            @JsonProperty("start_sha") String startSha,
+            @JsonProperty("head_sha") String headSha) {
     }
 }

@@ -23,6 +23,15 @@ public class MetricsCounters {
 
     private final Map<String, AtomicLong> ownershipMismatches = new ConcurrentHashMap<>();
     private final AtomicLong workerFailureReportsIgnored = new AtomicLong();
+    /** DPR-12 (Diff Position Anchoring, SHOULD): every failure mode of position anchoring is silent by
+     * design (it always degrades to a plain note), so without these an operator has no way to notice
+     * "anchoring stopped working three weeks ago". Same process-local, non-persisted pattern as the two
+     * counters above, for the same reason (an authenticated unbounded write primitive is a worse
+     * trade-off than losing the counters on restart). */
+    private final AtomicLong positionsAnchored = new AtomicLong();
+    private final AtomicLong positionsUnresolved = new AtomicLong();
+    private final AtomicLong diffRefsUnavailable = new AtomicLong();
+    private final AtomicLong positionRejectedByGitLab = new AtomicLong();
 
     /** @param endpoint a short, fixed label — e.g. {@code "heartbeat"}, {@code "result"}, {@code "fail"}. */
     public void incrementOwnershipMismatch(String endpoint) {
@@ -34,6 +43,26 @@ public class MetricsCounters {
         workerFailureReportsIgnored.incrementAndGet();
     }
 
+    /** DPR-12: an unpublished comment with a resolvable file+line was successfully anchored to a diff position. */
+    public void incrementPositionsAnchored() {
+        positionsAnchored.incrementAndGet();
+    }
+
+    /** DPR-12: an unpublished comment had a file+line but no resolvable diff position was found for it. */
+    public void incrementPositionsUnresolved() {
+        positionsUnresolved.incrementAndGet();
+    }
+
+    /** DPR-12: {@code fetchDiffRefs} returned {@code Optional.empty()} (any reason — network, scope, stale MR state). */
+    public void incrementDiffRefsUnavailable() {
+        diffRefsUnavailable.incrementAndGet();
+    }
+
+    /** DPR-12: GitLab rejected a positioned POST with 400 and the automatic position-less retry ran (DPR-08). */
+    public void incrementPositionRejectedByGitLab() {
+        positionRejectedByGitLab.incrementAndGet();
+    }
+
     public Map<String, Long> ownershipMismatchSnapshot() {
         Map<String, Long> snapshot = new LinkedHashMap<>();
         ownershipMismatches.forEach((endpoint, count) -> snapshot.put(endpoint, count.get()));
@@ -42,5 +71,21 @@ public class MetricsCounters {
 
     public long workerFailureReportsIgnoredCount() {
         return workerFailureReportsIgnored.get();
+    }
+
+    public long positionsAnchoredCount() {
+        return positionsAnchored.get();
+    }
+
+    public long positionsUnresolvedCount() {
+        return positionsUnresolved.get();
+    }
+
+    public long diffRefsUnavailableCount() {
+        return diffRefsUnavailable.get();
+    }
+
+    public long positionRejectedByGitLabCount() {
+        return positionRejectedByGitLab.get();
     }
 }

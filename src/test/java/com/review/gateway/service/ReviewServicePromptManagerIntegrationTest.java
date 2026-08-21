@@ -123,7 +123,7 @@ class ReviewServicePromptManagerIntegrationTest extends AbstractPostgresIntegrat
     private GitLabClientImpl newGitLabClient() {
         RestClient client = RestClient.builder().baseUrl(stub.baseUrl())
                 .defaultHeader("PRIVATE-TOKEN", "test-token-does-not-matter-for-a-stub-0000").build();
-        return new GitLabClientImpl(client, client, new TextSanitizer());
+        return new GitLabClientImpl(client, client, new TextSanitizer(), new MetricsCounters());
     }
 
     private ReviewService newReviewService(GatewayProperties properties, GitLabClient gitLabClient) {
