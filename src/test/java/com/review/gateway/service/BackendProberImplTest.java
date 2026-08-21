@@ -8,6 +8,9 @@ import org.junit.jupiter.api.Test;
 import org.springframework.test.web.client.MockRestServiceServer;
 import org.springframework.web.client.RestClient;
 
+import java.util.concurrent.atomic.AtomicInteger;
+
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.springframework.test.web.client.match.MockRestRequestMatchers.requestTo;
@@ -25,7 +28,8 @@ class BackendProberImplTest {
         RestClient.Builder builder = RestClient.builder();
         mockServer = MockRestServiceServer.bindTo(builder).build();
         properties = new GatewayProperties();
-        prober = new BackendProberImpl(builder.build(), properties);
+        RestClient mockBoundClient = builder.build();
+        prober = new BackendProberImpl(() -> mockBoundClient, properties);
     }
 
     private Backend backendWithUrl(String url) {
@@ -65,5 +69,30 @@ class BackendProberImplTest {
         Backend backend = backendWithUrl("http://192.168.1.60:8080");
 
         assertThatThrownBy(() -> prober.probe(backend)).isInstanceOf(BackendUnavailableException.class);
+    }
+
+    @Test
+    void everyProbeRequestsAFreshClientFromTheFactory() {
+        // A shared/pooled RestClient here would let a keep-alive connection to one backend's llama-server
+        // outlive that process across a restart and get silently reused once dead -- observed live: a
+        // backend stuck SUSPECT for 40+ minutes while directly reachable by curl, recovering only once the
+        // Gateway itself restarted and discarded its connection pool. Guards that BackendProberImpl never
+        // caches the client across calls -- each probe() must ask the factory again.
+        RestClient.Builder builder = RestClient.builder();
+        MockRestServiceServer countingMockServer = MockRestServiceServer.bindTo(builder).build();
+        RestClient client = builder.build();
+        AtomicInteger factoryCalls = new AtomicInteger();
+        BackendProberImpl countingProber = new BackendProberImpl(() -> {
+            factoryCalls.incrementAndGet();
+            return client;
+        }, properties);
+        Backend backend = backendWithUrl("http://192.168.1.62:8080");
+        countingMockServer.expect(requestTo("http://192.168.1.62:8080/health")).andRespond(withSuccess());
+        countingMockServer.expect(requestTo("http://192.168.1.62:8080/health")).andRespond(withSuccess());
+
+        countingProber.probe(backend);
+        countingProber.probe(backend);
+
+        assertThat(factoryCalls.get()).isEqualTo(2);
     }
 }

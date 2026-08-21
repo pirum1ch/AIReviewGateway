@@ -80,6 +80,16 @@ services:
       GITLAB_BASE_URL: ${GITLAB_BASE_URL:-https://gitlab.example.com/api/v4}
       GITLAB_TOKEN: ${GITLAB_TOKEN:?set GITLAB_TOKEN, a GitLab project/group access token}
       BACKEND_ALLOWED_HOST_PATTERN: ${BACKEND_ALLOWED_HOST_PATTERN:-.*}
+      # Prompt Manager (V3, optional) -- Compose only forwards variables listed here; exporting them
+      # in the host shell alone has no effect on the container. Left at their off-by-default values
+      # unless the corresponding host env var is actually exported (see README.md §4.4).
+      PROMPT_MANAGER_ENABLED: ${PROMPT_MANAGER_ENABLED:-false}
+      GITLAB_PROMPT_TOKEN: ${GITLAB_PROMPT_TOKEN:-}
+      PROMPT_CORPORATE_PROJECT: ${PROMPT_CORPORATE_PROJECT:-}
+      PROMPT_CORPORATE_REF: ${PROMPT_CORPORATE_REF:-main}
+      PROMPT_CORPORATE_BASE_PROMPT_PATH: ${PROMPT_CORPORATE_BASE_PROMPT_PATH:-prompts/base-system-prompt.md}
+      PROMPT_CORPORATE_REVIEW_RULES_PATH: ${PROMPT_CORPORATE_REVIEW_RULES_PATH:-prompts/review-rules.md}
+      PROMPT_ON_ERROR: ${PROMPT_ON_ERROR:-FAIL}
     ports:
       - "8080:8080"
     # GITLAB_BASE_URL uses the gitlab.local hostname (its self-signed cert's SAN is issued for

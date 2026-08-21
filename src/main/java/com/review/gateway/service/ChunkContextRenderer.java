@@ -53,9 +53,11 @@ public class ChunkContextRenderer {
     private static final String OTHER_FILES_END = "<<<END_OTHER_FILES_NOT_SHOWN>>>";
 
     private final GatewayProperties properties;
+    private final TextSanitizer textSanitizer;
 
-    public ChunkContextRenderer(GatewayProperties properties) {
+    public ChunkContextRenderer(GatewayProperties properties, TextSanitizer textSanitizer) {
         this.properties = properties;
+        this.textSanitizer = textSanitizer;
     }
 
     /**
@@ -64,29 +66,13 @@ public class ChunkContextRenderer {
      * javadoc for why). Returns {@code null} if nothing publishable remains after stripping (e.g. a path
      * made entirely of control/format characters, or entirely of {@code '<'}/{@code '>'}) — callers
      * must treat {@code null} as "drop this path", never render/persist an empty string in its place.
+     *
+     * <p>Delegates to the shared {@link TextSanitizer#sanitizePath} (Prompt Manager feature): same
+     * character classes stripped, same behavior, one implementation instead of two copies of the
+     * F-DC-02 lesson.
      */
     public String sanitizePath(String rawPath) {
-        if (rawPath == null) {
-            return null;
-        }
-        StringBuilder sb = new StringBuilder(rawPath.length());
-        rawPath.codePoints().forEach(cp -> {
-            int type = Character.getType(cp);
-            boolean disallowed = type == Character.CONTROL
-                    || type == Character.FORMAT
-                    || type == Character.LINE_SEPARATOR
-                    || type == Character.PARAGRAPH_SEPARATOR
-                    || cp == '<'
-                    || cp == '>';
-            if (!disallowed) {
-                sb.appendCodePoint(cp);
-            }
-        });
-        String stripped = sb.toString().trim();
-        if (stripped.isEmpty()) {
-            return null;
-        }
-        return capLength(stripped, MAX_PATH_LENGTH);
+        return textSanitizer.sanitizePath(rawPath, MAX_PATH_LENGTH);
     }
 
     /**

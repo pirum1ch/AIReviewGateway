@@ -67,16 +67,34 @@ public class PromptTemplateService {
     }
 
     /**
+     * Prompt Manager (V3, architecture §8): {@code systemMessages} — when non-{@code null} — become
+     * {@code ChatMessage("system", ...)} entries <b>verbatim</b>, in list order, never passed through
+     * {@link #substitute}: they are Gateway-assembled, already-final text (PMR-23), not a template to be
+     * filled in, and the {@code {{DIFF}}}/{@code {{CHUNK_CONTEXT}}} single-pass substitution stays scoped
+     * to the {@code user} template exactly as before. {@code template.system()} is ignored entirely in
+     * that case (never duplicated alongside {@code systemMessages}).
+     *
+     * <p>{@code systemMessages == null} is the explicit, tested legacy/compat branch — today's behavior
+     * (the template's own {@code system:} block, if any) — used for a {@code prompt_bundle_mode=NONE}
+     * Review, a Gateway with Prompt Manager disabled, or an old Gateway that doesn't send the field at
+     * all (the field is optional in {@code ClaimResponse}/{@code JobPayload} — WSR/PMR forward
+     * compatibility). This is <b>not</b> a fallback triggered by any error condition here. An empty list
+     * ({@code List.of()}) is treated the same as {@code null} for rendering purposes (zero system
+     * messages either way) but is a materially different signal upstream (Gateway resolved a Review with
+     * zero sections) — this method itself does not need to distinguish the two beyond "iterate what's
+     * there".
+     *
      * @throws AbandonJobException if {@code promptVersion} fails the allowlist check, no matching
      *                              template exists on the classpath, the template is malformed, the
-     *                              combined diff/chunkContext size exceeds
-     *                              {@code worker.limits.max-diff-bytes}, or {@code chunkContext} was
+     *                              combined diff/chunkContext/systemMessages size exceeds
+     *                              {@code worker.limits.max-diff-bytes}, {@code systemMessages} exceeds
+     *                              {@code worker.limits.max-system-messages}, or {@code chunkContext} was
      *                              supplied but the template has no {@code {{CHUNK_CONTEXT}}}
      *                              placeholder (CSR-12).
      */
-    public ResolvedPrompt resolve(String promptVersion, String diff, String chunkContext) {
+    public ResolvedPrompt resolve(String promptVersion, String diff, String chunkContext, List<String> systemMessages) {
         validatePromptVersion(promptVersion);
-        validateDiffSize(diff, chunkContext);
+        validateDiffSize(diff, chunkContext, systemMessages);
         PromptTemplate template = loadTemplate(promptVersion);
         if (chunkContext != null && !hasChunkContextPlaceholder(template)) {
             throw new AbandonJobException(
@@ -85,7 +103,7 @@ public class PromptTemplateService {
         // CSR-08 defense in depth: strip literal '{{'/'}}' from the Gateway-rendered chunkContext
         // before it is ever substituted in, on top of the single-pass substitution below.
         String sanitizedChunkContext = chunkContext == null ? null : chunkContext.replace("{{", "").replace("}}", "");
-        List<ChatMessage> messages = buildMessages(template, diff, sanitizedChunkContext);
+        List<ChatMessage> messages = buildMessages(template, diff, sanitizedChunkContext, systemMessages);
         String model = template.model() != null ? template.model() : properties.getLlama().getModel();
         double temperature = template.temperature() != null
                 ? template.temperature() : properties.getLlama().getTemperature();
@@ -94,9 +112,14 @@ public class PromptTemplateService {
         return new ResolvedPrompt(messages, model, temperature, maxTokens);
     }
 
+    /** Backward-compatible overload: no {@code systemMessages} (legacy/kill-switch-off behavior). */
+    public ResolvedPrompt resolve(String promptVersion, String diff, String chunkContext) {
+        return resolve(promptVersion, diff, chunkContext, null);
+    }
+
     /** Backward-compatible overload for callers with no chunk context (single-chunk Reviews). */
     public ResolvedPrompt resolve(String promptVersion, String diff) {
-        return resolve(promptVersion, diff, null);
+        return resolve(promptVersion, diff, null, null);
     }
 
     private boolean hasChunkContextPlaceholder(PromptTemplate template) {
@@ -116,14 +139,31 @@ public class PromptTemplateService {
         }
     }
 
-    /** Extends {@code worker.limits.max-diff-bytes} to cover {@code diff bytes + chunkContext bytes} combined. */
-    private void validateDiffSize(String diff, String chunkContext) {
+    /**
+     * Extends {@code worker.limits.max-diff-bytes} to cover {@code diff bytes + chunkContext bytes +
+     * systemMessages bytes} combined (Prompt Manager, V3). {@code systemMessages}' element count is
+     * independently capped at {@code worker.limits.max-system-messages} (WSR-03 sibling: enforced here
+     * regardless of what the Gateway itself enforces via {@code gateway.prompt.limits.max-sections}).
+     */
+    private void validateDiffSize(String diff, String chunkContext, List<String> systemMessages) {
         int diffBytes = diff == null ? 0 : diff.getBytes(StandardCharsets.UTF_8).length;
         int contextBytes = chunkContext == null ? 0 : chunkContext.getBytes(StandardCharsets.UTF_8).length;
-        long combinedBytes = (long) diffBytes + contextBytes;
+        long systemMessagesBytes = 0;
+        if (systemMessages != null) {
+            int maxSystemMessages = properties.getWorker().getLimits().getMaxSystemMessages();
+            if (systemMessages.size() > maxSystemMessages) {
+                throw new AbandonJobException(
+                        "systemMessages count exceeds worker.limits.max-system-messages (" + maxSystemMessages + ")");
+            }
+            for (String message : systemMessages) {
+                systemMessagesBytes += message == null ? 0 : message.getBytes(StandardCharsets.UTF_8).length;
+            }
+        }
+        long combinedBytes = (long) diffBytes + contextBytes + systemMessagesBytes;
         long maxDiffBytes = properties.getWorker().getLimits().getMaxDiffBytes();
         if (combinedBytes > maxDiffBytes) {
-            throw new AbandonJobException("diff + chunkContext exceeds worker.limits.max-diff-bytes (" + maxDiffBytes + ")");
+            throw new AbandonJobException(
+                    "diff + chunkContext + systemMessages exceeds worker.limits.max-diff-bytes (" + maxDiffBytes + ")");
         }
     }
 
@@ -159,9 +199,22 @@ public class PromptTemplateService {
         }
     }
 
-    private List<ChatMessage> buildMessages(PromptTemplate template, String diff, String chunkContext) {
+    /**
+     * PMR-23: when {@code systemMessages != null}, each element becomes its own {@code ChatMessage}
+     * verbatim (no {@link #substitute}, no {@code {{}}} stripping — that stripping stays scoped to
+     * {@code chunkContext}) and {@code template.system()} is ignored entirely, never duplicated
+     * alongside them. {@code systemMessages == null} is exactly today's behavior.
+     */
+    private List<ChatMessage> buildMessages(PromptTemplate template, String diff, String chunkContext,
+                                             List<String> systemMessages) {
         List<ChatMessage> messages = new ArrayList<>();
-        if (template.system() != null && !template.system().isBlank()) {
+        if (systemMessages != null) {
+            for (String systemMessage : systemMessages) {
+                if (systemMessage != null) {
+                    messages.add(new ChatMessage("system", systemMessage));
+                }
+            }
+        } else if (template.system() != null && !template.system().isBlank()) {
             messages.add(new ChatMessage("system", substitute(template.system(), diff, chunkContext)));
         }
         messages.add(new ChatMessage("user", substitute(template.user(), diff, chunkContext)));

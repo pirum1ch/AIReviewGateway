@@ -6,3 +6,8 @@ target/
 .vscode/
 .env
 certs/
+.claude/
+docs/
+GitLab_script/
+GitLab_script.rar
+log.txt

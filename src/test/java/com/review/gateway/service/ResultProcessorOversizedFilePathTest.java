@@ -74,7 +74,7 @@ class ResultProcessorOversizedFilePathTest extends AbstractPostgresIntegrationTe
     }
 
     private ResultProcessor newResultProcessor(CommentParser commentParser) {
-        EventService eventService = new EventService(reviewEventRepository);
+        EventService eventService = new EventService(reviewEventRepository, new TextSanitizer());
         StateMachine stateMachine = new StateMachine(eventService);
         JobStateMachine jobStateMachine = new JobStateMachine(eventService);
         GatewayProperties properties = new GatewayProperties();

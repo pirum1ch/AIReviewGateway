@@ -42,6 +42,23 @@ public class ReviewInput {
     @Column(name = "estimated_tokens", updatable = false)
     private Integer estimatedTokens;
 
+    /**
+     * Prompt Manager (V3): the estimated token size of the assembled system prompt used for this
+     * Review, or {@code null} for a {@link com.review.gateway.model.enums.PromptBundleMode#NONE}
+     * Review (kill-switch off — no repo-sourced sections were resolved).
+     */
+    @Column(name = "system_prompt_tokens", updatable = false)
+    private Integer systemPromptTokens;
+
+    /**
+     * PMR-09/PMR-24 related: {@code true} when project-section resolution failed and
+     * {@code gateway.prompt.error-handling.on-error=SKIP_OPTIONAL} let the Review proceed without its
+     * optional {@code PROJECT_*} sections (corporate sections are always mandatory and never produce a
+     * degraded Review — a corporate failure always fails {@code POST /reviews} outright).
+     */
+    @Column(name = "prompt_degraded", nullable = false, updatable = false)
+    private boolean promptDegraded;
+
     @Column(name = "created_at", nullable = false, updatable = false)
     private Instant createdAt;
 
@@ -51,12 +68,20 @@ public class ReviewInput {
 
     public ReviewInput(Long reviewId, String diff, String promptVersion, String headSha,
                        String baseSha, Integer estimatedTokens) {
+        this(reviewId, diff, promptVersion, headSha, baseSha, estimatedTokens, null, false);
+    }
+
+    /** Prompt Manager (V3) constructor: additionally records the system-prompt token size and degraded flag. */
+    public ReviewInput(Long reviewId, String diff, String promptVersion, String headSha, String baseSha,
+                        Integer estimatedTokens, Integer systemPromptTokens, boolean promptDegraded) {
         this.reviewId = Objects.requireNonNull(reviewId, "reviewId");
         this.diff = Objects.requireNonNull(diff, "diff");
         this.promptVersion = Objects.requireNonNull(promptVersion, "promptVersion");
         this.headSha = Objects.requireNonNull(headSha, "headSha");
         this.baseSha = Objects.requireNonNull(baseSha, "baseSha");
         this.estimatedTokens = estimatedTokens;
+        this.systemPromptTokens = systemPromptTokens;
+        this.promptDegraded = promptDegraded;
     }
 
     @PrePersist
@@ -90,6 +115,14 @@ public class ReviewInput {
 
     public Integer getEstimatedTokens() {
         return estimatedTokens;
+    }
+
+    public Integer getSystemPromptTokens() {
+        return systemPromptTokens;
+    }
+
+    public boolean isPromptDegraded() {
+        return promptDegraded;
     }
 
     public Instant getCreatedAt() {

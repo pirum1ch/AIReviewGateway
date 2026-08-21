@@ -1,26 +1,33 @@
 package com.review.gateway.service;
 
 import com.review.gateway.exception.GitLabPublishException;
+import com.review.gateway.exception.PromptSourceInvalidException;
+import com.review.gateway.exception.PromptSourceUnavailableException;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.http.MediaType;
 import org.springframework.test.web.client.MockRestServiceServer;
 import org.springframework.web.client.RestClient;
 
+import java.util.Optional;
+
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.springframework.http.HttpMethod.GET;
+import static org.springframework.http.HttpMethod.POST;
 import static org.springframework.test.web.client.match.MockRestRequestMatchers.header;
 import static org.springframework.test.web.client.match.MockRestRequestMatchers.method;
 import static org.springframework.test.web.client.match.MockRestRequestMatchers.requestTo;
 import static org.springframework.test.web.client.response.MockRestResponseCreators.withServerError;
+import static org.springframework.test.web.client.response.MockRestResponseCreators.withStatus;
 import static org.springframework.test.web.client.response.MockRestResponseCreators.withSuccess;
-import static org.springframework.http.HttpMethod.POST;
 
 class GitLabClientImplTest {
 
     private static final String BASE_URL = "https://gitlab.example.test/api/v4";
 
     private MockRestServiceServer mockServer;
+    private MockRestServiceServer promptMockServer;
     private GitLabClientImpl client;
 
     @BeforeEach
@@ -29,8 +36,16 @@ class GitLabClientImplTest {
                 .baseUrl(BASE_URL)
                 .defaultHeader("PRIVATE-TOKEN", "test-gitlab-token-0123456789012345");
         mockServer = MockRestServiceServer.bindTo(builder).build();
-        client = new GitLabClientImpl(builder.build());
+
+        RestClient.Builder promptBuilder = RestClient.builder()
+                .baseUrl(BASE_URL)
+                .defaultHeader("PRIVATE-TOKEN", "test-gitlab-prompt-token-01234567890");
+        promptMockServer = MockRestServiceServer.bindTo(promptBuilder).build();
+
+        client = new GitLabClientImpl(builder.build(), promptBuilder.build(), new TextSanitizer());
     }
+
+    // ---- postDiscussion (existing behavior, unchanged) ----
 
     @Test
     void postsDiscussionAndReturnsItsId() {
@@ -77,5 +92,243 @@ class GitLabClientImplTest {
 
         assertThatThrownBy(() -> client.postDiscussion(1L, 1L, "body"))
                 .isInstanceOf(GitLabPublishException.class);
+    }
+
+    // ---- resolveCommitSha (PMR-13/PMR-15/PMR-26) ----
+
+    @Test
+    void resolveCommitShaReturnsTheCommitId() {
+        promptMockServer.expect(requestTo(BASE_URL + "/projects/42/repository/commits/main"))
+                .andExpect(method(GET))
+                .andExpect(header("PRIVATE-TOKEN", "test-gitlab-prompt-token-01234567890"))
+                .andRespond(withSuccess("""
+                        {"id": "abc123def456"}
+                        """, MediaType.APPLICATION_JSON));
+
+        String sha = client.resolveCommitSha("42", "main");
+
+        assertThat(sha).isEqualTo("abc123def456");
+        promptMockServer.verify();
+    }
+
+    @Test
+    void resolveCommitShaUrlEncodesAGroupPathProjectReference() {
+        // PMR-13: a project ref containing '/' (group/project path form) must be encoded into %2F as a
+        // single opaque path segment, exactly as GitLab's API requires for the :id position.
+        promptMockServer.expect(requestTo(
+                        BASE_URL + "/projects/org%2Fteam-a%2Fai-review-prompts/repository/commits/main"))
+                .andRespond(withSuccess("""
+                        {"id": "sha1"}
+                        """, MediaType.APPLICATION_JSON));
+
+        client.resolveCommitSha("org/team-a/ai-review-prompts", "main");
+
+        promptMockServer.verify();
+    }
+
+    @Test
+    void resolveCommitSha404IsUndifferentiatedFromOtherFailures() {
+        // PMR-26: coarse and undifferentiated -- always PromptSourceUnavailableException, never a
+        // distinguishable "not found" vs "no access" signal for this call.
+        promptMockServer.expect(requestTo(BASE_URL + "/projects/42/repository/commits/main"))
+                .andRespond(withStatus(org.springframework.http.HttpStatus.NOT_FOUND));
+
+        assertThatThrownBy(() -> client.resolveCommitSha("42", "main"))
+                .isInstanceOf(PromptSourceUnavailableException.class);
+    }
+
+    @Test
+    void resolveCommitShaServerErrorIsUnavailable() {
+        promptMockServer.expect(requestTo(BASE_URL + "/projects/42/repository/commits/main"))
+                .andRespond(withServerError());
+
+        assertThatThrownBy(() -> client.resolveCommitSha("42", "main"))
+                .isInstanceOf(PromptSourceUnavailableException.class);
+    }
+
+    @Test
+    void resolveCommitShaUsesThePromptClientNeverTheWriteClient() {
+        promptMockServer.expect(requestTo(BASE_URL + "/projects/42/repository/commits/main"))
+                .andExpect(header("PRIVATE-TOKEN", "test-gitlab-prompt-token-01234567890"))
+                .andRespond(withSuccess("""
+                        {"id": "sha1"}
+                        """, MediaType.APPLICATION_JSON));
+
+        client.resolveCommitSha("42", "main");
+
+        promptMockServer.verify();
+        mockServer.verify(); // zero interactions on the write-scoped client
+    }
+
+    // ---- resolveDefaultBranch ----
+
+    @Test
+    void resolveDefaultBranchReturnsTheBranchName() {
+        promptMockServer.expect(requestTo(BASE_URL + "/projects/42"))
+                .andExpect(method(GET))
+                .andRespond(withSuccess("""
+                        {"id": 42, "default_branch": "main", "other_field": "ignored"}
+                        """, MediaType.APPLICATION_JSON));
+
+        String branch = client.resolveDefaultBranch("42");
+
+        assertThat(branch).isEqualTo("main");
+    }
+
+    @Test
+    void resolveDefaultBranch404IsUnavailable() {
+        promptMockServer.expect(requestTo(BASE_URL + "/projects/42"))
+                .andRespond(withStatus(org.springframework.http.HttpStatus.NOT_FOUND));
+
+        assertThatThrownBy(() -> client.resolveDefaultBranch("42"))
+                .isInstanceOf(PromptSourceUnavailableException.class);
+    }
+
+    /**
+     * F-PM-06 regression: {@code default_branch} is repo-controlled input (PMR-25), sanitized at its
+     * single entry point via the same {@link TextSanitizer} section text uses -- a bidi-override
+     * character (Trojan-Source class, U+202E here) must not survive into the returned branch name.
+     */
+    @Test
+    void resolveDefaultBranchStripsControlAndFormatCharacters() {
+        String rawBranch = "featu‮re/evil";
+        promptMockServer.expect(requestTo(BASE_URL + "/projects/42"))
+                .andExpect(method(GET))
+                .andRespond(withSuccess("{\"id\": 42, \"default_branch\": \"" + rawBranch + "\"}",
+                        MediaType.APPLICATION_JSON));
+
+        String branch = client.resolveDefaultBranch("42");
+
+        assertThat(branch).isEqualTo("feature/evil");
+        assertThat(branch).doesNotContain("‮");
+    }
+
+    /** F-PM-06: caps at 200 chars, below {@code reviews.source_ref VARCHAR(256)}, never overflows the column. */
+    @Test
+    void resolveDefaultBranchCapsExcessiveLength() {
+        String rawBranch = "f".repeat(400);
+        promptMockServer.expect(requestTo(BASE_URL + "/projects/42"))
+                .andExpect(method(GET))
+                .andRespond(withSuccess("{\"id\": 42, \"default_branch\": \"" + rawBranch + "\"}",
+                        MediaType.APPLICATION_JSON));
+
+        String branch = client.resolveDefaultBranch("42");
+
+        assertThat(branch).hasSize(200);
+        assertThat(branch).endsWith("...");
+    }
+
+    /** F-PM-06 scope guard: a branch name that sanitizes to nothing publishable is treated as unavailable, not blank/null. */
+    @Test
+    void resolveDefaultBranchThatSanitizesToNothingIsUnavailable() {
+        String rawBranch = "‮‮‮"; // entirely bidi-override control characters
+        promptMockServer.expect(requestTo(BASE_URL + "/projects/42"))
+                .andExpect(method(GET))
+                .andRespond(withSuccess("{\"id\": 42, \"default_branch\": \"" + rawBranch + "\"}",
+                        MediaType.APPLICATION_JSON));
+
+        assertThatThrownBy(() -> client.resolveDefaultBranch("42"))
+                .isInstanceOf(PromptSourceUnavailableException.class);
+    }
+
+    // ---- fetchRawFile (PMR-13/PMR-17) ----
+
+    @Test
+    void fetchRawFileReturnsDecodedContentOnSuccess() {
+        promptMockServer.expect(requestTo(
+                        BASE_URL + "/projects/42/repository/files/prompts%2Fbase.md/raw?ref=a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"))
+                .andExpect(method(GET))
+                .andRespond(withSuccess("hello prompt content", MediaType.TEXT_PLAIN));
+
+        Optional<String> content = client.fetchRawFile("42", "prompts/base.md", "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2", 1000);
+
+        assertThat(content).contains("hello prompt content");
+    }
+
+    @Test
+    void fetchRawFile404ReturnsEmpty() {
+        promptMockServer.expect(requestTo(
+                        BASE_URL + "/projects/42/repository/files/missing.md/raw?ref=a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"))
+                .andRespond(withStatus(org.springframework.http.HttpStatus.NOT_FOUND));
+
+        Optional<String> content = client.fetchRawFile("42", "missing.md", "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2", 1000);
+
+        assertThat(content).isEmpty();
+    }
+
+    @Test
+    void fetchRawFileServerErrorIsUnavailable() {
+        promptMockServer.expect(requestTo(
+                        BASE_URL + "/projects/42/repository/files/x.md/raw?ref=a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"))
+                .andRespond(withServerError());
+
+        assertThatThrownBy(() -> client.fetchRawFile("42", "x.md", "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2", 1000))
+                .isInstanceOf(PromptSourceUnavailableException.class);
+    }
+
+    @Test
+    void fetchRawFileOversizedByContentLengthIsRejectedWithoutReadingBody() {
+        promptMockServer.expect(requestTo(
+                        BASE_URL + "/projects/42/repository/files/big.md/raw?ref=a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"))
+                .andRespond(withSuccess("x".repeat(50), MediaType.TEXT_PLAIN)
+                        .header("Content-Length", "50"));
+
+        assertThatThrownBy(() -> client.fetchRawFile("42", "big.md", "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2", 10))
+                .isInstanceOf(PromptSourceInvalidException.class);
+    }
+
+    @Test
+    void fetchRawFileOversizedByStreamingIsRejectedEvenWithoutContentLengthHeader() {
+        // PMR-17: the bound must be enforced while reading, not just via Content-Length.
+        promptMockServer.expect(requestTo(
+                        BASE_URL + "/projects/42/repository/files/big.md/raw?ref=a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"))
+                .andRespond(withSuccess("x".repeat(50), MediaType.TEXT_PLAIN));
+
+        assertThatThrownBy(() -> client.fetchRawFile("42", "big.md", "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2", 10))
+                .isInstanceOf(PromptSourceInvalidException.class);
+    }
+
+    @Test
+    void fetchRawFileEmptyBodyIsInvalid() {
+        promptMockServer.expect(requestTo(
+                        BASE_URL + "/projects/42/repository/files/empty.md/raw?ref=a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"))
+                .andRespond(withSuccess("", MediaType.TEXT_PLAIN));
+
+        assertThatThrownBy(() -> client.fetchRawFile("42", "empty.md", "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2", 1000))
+                .isInstanceOf(PromptSourceInvalidException.class);
+    }
+
+    @Test
+    void fetchRawFileContainingNulByteIsInvalid() {
+        promptMockServer.expect(requestTo(
+                        BASE_URL + "/projects/42/repository/files/nul.md/raw?ref=a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"))
+                .andRespond(withSuccess("hello\u0000world", MediaType.TEXT_PLAIN));
+
+        assertThatThrownBy(() -> client.fetchRawFile("42", "nul.md", "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2", 1000))
+                .isInstanceOf(PromptSourceInvalidException.class);
+    }
+
+    @Test
+    void fetchRawFileNestedPathIsUrlEncodedAsOneOpaqueSegment() {
+        promptMockServer.expect(requestTo(
+                        BASE_URL + "/projects/42/repository/files/.ai-review%2Fcode-rules.md/raw?ref=a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"))
+                .andRespond(withSuccess("rules content", MediaType.TEXT_PLAIN));
+
+        Optional<String> content = client.fetchRawFile("42", ".ai-review/code-rules.md", "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2", 1000);
+
+        assertThat(content).contains("rules content");
+    }
+
+    @Test
+    void fetchRawFileRejectsACommitShaNotMatchingTheExpectedShapeBeforeIssuingAnyRequest() {
+        // PMR-13: defense in depth -- pinned to ^[0-9a-f]{40}$ before it ever reaches the URI, even
+        // though every real caller only ever passes through resolveCommitSha's own output.
+        assertThatThrownBy(() -> client.fetchRawFile("42", "base.md", "not-a-real-sha", 1000))
+                .isInstanceOf(PromptSourceUnavailableException.class);
+        assertThatThrownBy(() -> client.fetchRawFile("42", "base.md", "abc123", 1000))
+                .isInstanceOf(PromptSourceUnavailableException.class);
+        assertThatThrownBy(() -> client.fetchRawFile("42", "base.md", null, 1000))
+                .isInstanceOf(PromptSourceUnavailableException.class);
+        promptMockServer.verify(); // no request was ever issued for any of the three
     }
 }

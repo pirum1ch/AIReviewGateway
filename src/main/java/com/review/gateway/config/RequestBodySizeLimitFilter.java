@@ -8,24 +8,38 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
+import org.springframework.http.server.PathContainer;
 import org.springframework.web.filter.OncePerRequestFilter;
+import org.springframework.web.util.UriUtils;
 import org.springframework.web.util.pattern.PathPattern;
 import org.springframework.web.util.pattern.PathPatternParser;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 
 /**
  * SR-11: rejects an oversized request body with {@code 413} before Spring MVC/Jackson ever reads or
  * buffers it — fail-fast at the edge (requirement), sized from {@code max-diff-tokens × chars-per-token
- * + margin} for {@code POST /reviews} (§9 {@code gateway.diff.max-request-body-bytes}) and from
+ * + margin} for {@code POST /reviews} (§9 {@code gateway.diff.max-request-body-bytes}), from
  * {@code max-raw-response-length + margin} for {@code POST /jobs/{id}/result}
- * (§9 {@code gateway.publish.max-request-body-bytes}).
+ * (§9 {@code gateway.publish.max-request-body-bytes}), and, as of Worker Observability &amp; Claim
+ * Latency (WOC-33), a small fixed cap for {@code POST /jobs/{id}/fail}
+ * (§9 {@code gateway.job.max-fail-body-bytes}).
  *
  * <p>Checked against the declared {@code Content-Length} header, which covers the overwhelmingly
  * common case (every realistic CI/Worker HTTP client sends a known-length JSON body). A client that
  * both omits {@code Content-Length} and streams an unbounded chunked body would bypass this specific
  * check; that residual gap is accepted at this project's scale/threat model (internal CI + Worker
  * clients, not an open public API) rather than adding a byte-counting stream wrapper.
+ *
+ * <p><b>WOT-06b/WOR-09 fix:</b> this filter previously matched {@link PathPattern}s against the raw,
+ * <em>possibly percent-encoded</em> {@link HttpServletRequest#getRequestURI()} — per the Servlet spec
+ * that method returns the request path exactly as it appeared on the wire, un-decoded — while Spring
+ * MVC ultimately routes on the <em>decoded</em> path. A request to {@code POST /jobs/1/%66ail} (decodes
+ * to {@code /jobs/1/fail}) matched none of the patterns here yet still reached the controller, silently
+ * bypassing the size cap on all three protected endpoints. This filter now decodes/normalizes the path
+ * the same way Spring MVC does ({@link UriUtils#decode}, matching {@code PathContainer}'s own decoding)
+ * before matching, so a percent-encoded path segment can no longer bypass the cap.
  */
 public class RequestBodySizeLimitFilter extends OncePerRequestFilter {
 
@@ -33,6 +47,7 @@ public class RequestBodySizeLimitFilter extends OncePerRequestFilter {
 
     private static final PathPattern REVIEWS_PATTERN = new PathPatternParser().parse("/reviews");
     private static final PathPattern RESULT_PATTERN = new PathPatternParser().parse("/jobs/{id}/result");
+    private static final PathPattern FAIL_PATTERN = new PathPatternParser().parse("/jobs/{id}/fail");
 
     private final GatewayProperties properties;
 
@@ -62,13 +77,31 @@ public class RequestBodySizeLimitFilter extends OncePerRequestFilter {
         if (!"POST".equalsIgnoreCase(request.getMethod())) {
             return null;
         }
-        String path = request.getRequestURI();
-        if (REVIEWS_PATTERN.matches(org.springframework.http.server.PathContainer.parsePath(path))) {
+        PathContainer decodedPath = PathContainer.parsePath(decodedPath(request));
+        if (REVIEWS_PATTERN.matches(decodedPath)) {
             return properties.getDiff().getMaxRequestBodyBytes();
         }
-        if (RESULT_PATTERN.matches(org.springframework.http.server.PathContainer.parsePath(path))) {
+        if (RESULT_PATTERN.matches(decodedPath)) {
             return properties.getPublish().getMaxRequestBodyBytes();
         }
+        if (FAIL_PATTERN.matches(decodedPath)) {
+            return properties.getJob().getMaxFailBodyBytes();
+        }
         return null;
+    }
+
+    /**
+     * WOR-09: decodes percent-encoding and strips the context path, mirroring how Spring MVC's own
+     * {@code RequestPath}/{@code PathContainer} resolve the path it ultimately routes on — so a
+     * percent-encoded segment (e.g. {@code %66ail} for {@code fail}) matches here exactly as it will
+     * downstream, instead of matching neither this filter's patterns nor a plausible "safe" path.
+     */
+    private String decodedPath(HttpServletRequest request) {
+        String raw = request.getRequestURI();
+        String contextPath = request.getContextPath();
+        if (contextPath != null && !contextPath.isEmpty() && raw.startsWith(contextPath)) {
+            raw = raw.substring(contextPath.length());
+        }
+        return UriUtils.decode(raw, StandardCharsets.UTF_8);
     }
 }

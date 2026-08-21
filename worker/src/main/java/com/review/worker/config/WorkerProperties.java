@@ -138,6 +138,10 @@ public class WorkerProperties {
         validateHeartbeatInterval();
         requirePositive("worker.limits.maxDiffBytes", worker.getLimits().getMaxDiffBytes());
         requirePositive("worker.limits.maxResponseBytes", worker.getLimits().getMaxResponseBytes());
+        requirePositive("worker.limits.maxSystemMessages", worker.getLimits().getMaxSystemMessages());
+        if (worker.getLog().getIdleSummaryIntervalSec() < 0) {
+            throw new IllegalStateException("worker.log.idleSummaryIntervalSec must be >= 0 (0 disables it) — refusing to start");
+        }
         validatePromptLocation();
         validateServerBinding();
         warnIfHeapDumpOnOutOfMemoryEnabled();
@@ -334,6 +338,8 @@ public class WorkerProperties {
         private boolean allowInsecureGateway = false;
         @Valid
         private final Limits limits = new Limits();
+        @Valid
+        private final Log log = new Log();
 
         public String getId() {
             return id;
@@ -363,6 +369,29 @@ public class WorkerProperties {
             return limits;
         }
 
+        public Log getLog() {
+            return log;
+        }
+
+        /**
+         * Worker Observability &amp; Claim Latency (WOC-04): idle-liveness log summary config.
+         */
+        public static class Log {
+            /**
+             * At most one INFO idle-summary line per this many seconds while no job is available;
+             * {@code 0} disables it entirely. Default {@code 300} (5 minutes).
+             */
+            private int idleSummaryIntervalSec = 300;
+
+            public int getIdleSummaryIntervalSec() {
+                return idleSummaryIntervalSec;
+            }
+
+            public void setIdleSummaryIntervalSec(int idleSummaryIntervalSec) {
+                this.idleSummaryIntervalSec = idleSummaryIntervalSec;
+            }
+        }
+
         /** WSR-03/WSR-04: independent Worker-side caps on Gateway-/llama-supplied data (treated as untrusted). */
         public static class Limits {
             /**
@@ -380,6 +409,13 @@ public class WorkerProperties {
              * {@code gateway.publish.max-request-body-bytes}) even after JSON-escaping overhead (WSR-04).
              */
             private long maxResponseBytes = 200_000L;
+            /**
+             * Prompt Manager (V3, WSR-03 sibling): independent Worker-side cap on the number of
+             * {@code systemMessages} entries a claim payload may carry, regardless of what the Gateway
+             * itself enforces ({@code gateway.prompt.limits.max-sections}). Combined with
+             * {@link #maxDiffBytes} for the total-size check (diff + chunkContext + systemMessages).
+             */
+            private int maxSystemMessages = 8;
 
             public long getMaxDiffBytes() {
                 return maxDiffBytes;
@@ -395,6 +431,14 @@ public class WorkerProperties {
 
             public void setMaxResponseBytes(long maxResponseBytes) {
                 this.maxResponseBytes = maxResponseBytes;
+            }
+
+            public int getMaxSystemMessages() {
+                return maxSystemMessages;
+            }
+
+            public void setMaxSystemMessages(int maxSystemMessages) {
+                this.maxSystemMessages = maxSystemMessages;
             }
         }
     }

@@ -3,10 +3,12 @@ package com.review.worker.core;
 import com.review.worker.config.WorkerProperties;
 import com.review.worker.error.AbandonJobException;
 import com.review.worker.error.GatewayUnavailableException;
+import com.review.worker.error.JobFailureReason;
 import com.review.worker.error.LlamaException;
 import com.review.worker.gateway.GatewayClient;
 import com.review.worker.gateway.ResultOutcome;
 import com.review.worker.gateway.dto.ClaimResponse;
+import com.review.worker.gateway.dto.FailRequest;
 import com.review.worker.gateway.dto.ResultRequest;
 import com.review.worker.llama.LlamaClient;
 import com.review.worker.metrics.WorkerMetrics;
@@ -19,6 +21,8 @@ import org.springframework.stereotype.Component;
 import java.io.InputStream;
 import java.net.http.HttpResponse;
 import java.time.Duration;
+import java.util.EnumMap;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.ExecutionException;
@@ -42,6 +46,26 @@ public class WorkerLoop {
     private static final long MAX_BACKOFF_MS = 60_000L;
     private static final String THREAD_NAME = "worker-loop";
 
+    /**
+     * WOR-05: fixed, Worker-side-constant vocabulary for the {@code POST /jobs/{id}/fail} {@code detail}
+     * field, one entry per {@link JobFailureReason} — never an exception message, never LLM/prompt/diff
+     * content. A {@code Jackson} parse-failure message can quote the offending LLM-generated JSON
+     * verbatim, which must never reach the Gateway's audit trail (WOT-03).
+     */
+    private static final Map<JobFailureReason, String> DETAIL_BY_REASON = buildDetailByReason();
+
+    private static Map<JobFailureReason, String> buildDetailByReason() {
+        Map<JobFailureReason, String> map = new EnumMap<>(JobFailureReason.class);
+        map.put(JobFailureReason.LLM_EMPTY_RESPONSE, "llama-server response had no choices or empty message content");
+        map.put(JobFailureReason.LLM_ERROR, "llama-server call failed");
+        map.put(JobFailureReason.LLM_TIMEOUT, "llama-server did not respond within the configured timeout");
+        map.put(JobFailureReason.LLM_RESPONSE_TOO_LARGE, "llama-server response exceeded the configured size limit");
+        map.put(JobFailureReason.PROMPT_INVALID, "prompt resolution failed (invalid promptVersion, oversized "
+                + "diff, or missing template)");
+        map.put(JobFailureReason.WORKER_ERROR, "unclassified worker-side failure");
+        return map;
+    }
+
     private final GatewayClient gatewayClient;
     private final LlamaClient llamaClient;
     private final PromptTemplateService promptTemplateService;
@@ -53,6 +77,15 @@ public class WorkerLoop {
     private final AtomicBoolean running = new AtomicBoolean(false);
     private volatile Thread thread;
     private volatile AbortSignal currentAbortSignal;
+
+    /**
+     * WOC-04: single-threaded loop (this field is touched only from the {@code worker-loop} thread), so
+     * plain fields suffice -- no synchronization, no new scheduler. {@code idlePollCount} resets to 0 on
+     * every successful claim; {@code lastIdleSummaryAtMillis} gates the log line to at most once per
+     * {@code worker.log.idle-summary-interval-sec}.
+     */
+    private long idlePollCount;
+    private long lastIdleSummaryAtMillis;
 
     public WorkerLoop(GatewayClient gatewayClient,
                        LlamaClient llamaClient,
@@ -152,10 +185,12 @@ public class WorkerLoop {
                 }
 
                 if (claimed.isEmpty()) {
+                    recordIdlePoll();
                     sleepInterruptibly(properties.getNetwork().getPollIntervalMs());
                     continue;
                 }
 
+                idlePollCount = 0;
                 processJob(claimed.get());
             }
         } finally {
@@ -168,6 +203,31 @@ public class WorkerLoop {
         long base = Math.max(properties.getNetwork().getPollIntervalMs(), 1);
         long next = previousMs <= 0 ? base : previousMs * 2;
         return Math.min(next, MAX_BACKOFF_MS);
+    }
+
+    /**
+     * WOC-04: rate-limited idle-liveness summary. Fires at most once per {@code
+     * worker.log.idle-summary-interval-sec} (default 300s; {@code 0} disables it) so a genuinely idle
+     * Worker still proves liveness in its log without spamming one line per poll.
+     */
+    private void recordIdlePoll() {
+        idlePollCount++;
+        int intervalSec = properties.getWorker().getLog().getIdleSummaryIntervalSec();
+        if (intervalSec <= 0) {
+            return;
+        }
+        long intervalMs = intervalSec * 1000L;
+        long now = System.currentTimeMillis();
+        if (lastIdleSummaryAtMillis == 0) {
+            lastIdleSummaryAtMillis = now;
+            return;
+        }
+        if (now - lastIdleSummaryAtMillis >= intervalMs) {
+            log.info("Idle: no job available in the last {} poll(s) (backend={})",
+                    idlePollCount, properties.getBackend().getId());
+            idlePollCount = 0;
+            lastIdleSummaryAtMillis = now;
+        }
     }
 
     private void sleepInterruptibly(long millis) {
@@ -184,8 +244,8 @@ public class WorkerLoop {
         AbortSignal abortSignal = new AbortSignal();
         currentAbortSignal = abortSignal;
         try {
-            ResolvedPrompt prompt = promptTemplateService.resolve(
-                    job.payload().promptVersion(), job.payload().diff(), job.payload().chunkContext());
+            ResolvedPrompt prompt = promptTemplateService.resolve(job.payload().promptVersion(),
+                    job.payload().diff(), job.payload().chunkContext(), job.payload().systemMessages());
 
             heartbeatScheduler.start(job.jobId(), workerId, abortSignal);
             try {
@@ -194,14 +254,68 @@ public class WorkerLoop {
                 heartbeatScheduler.stop();
             }
         } catch (AbandonJobException | LlamaException e) {
-            log.warn("Job abandoned (jobId={}): {}", job.jobId(), e.getMessage());
+            JobFailureReason reason = classifyFailure(e);
+            // WOR-05: never e.getMessage() here -- a wrapped Jackson parse-failure message can quote
+            // LLM-generated JSON verbatim (WOT-03). Only the classified reason and the exception's class
+            // name (never its message) are logged.
+            log.warn("Job abandoned (jobId={}, reason={}, exceptionType={})",
+                    job.jobId(), reason, e.getClass().getSimpleName());
             metrics.incrementJobsFailed();
+            // WOC-34/WOC-37: heartbeatScheduler.stop() has already run (inner finally, above) and the
+            // job was not aborted/superseded (an abort/redelivery-abandon/shutdown path never throws
+            // here -- see those call sites) -- safe and correct to report now, synchronously, before the
+            // loop returns to claim().
+            reportFailureBestEffort(job.jobId(), workerId, reason);
         } finally {
             currentAbortSignal = null;
         }
     }
 
+    private JobFailureReason classifyFailure(RuntimeException e) {
+        if (e instanceof LlamaException llamaException) {
+            return llamaException.getReason();
+        }
+        if (e instanceof AbandonJobException abandonJobException) {
+            return abandonJobException.getReason();
+        }
+        return JobFailureReason.WORKER_ERROR;
+    }
+
+    /**
+     * WOC-35: single best-effort attempt, no redelivery loop, no backoff, no retry of its own. Any
+     * failure is logged at WARN, counted in {@code worker.gateway.errors}, and swallowed -- the
+     * Gateway's stale-heartbeat sweep remains the correctness backstop (WOC-36); nothing in the system
+     * may become dependent on this report being delivered.
+     *
+     * <p><b>F-WOC-03:</b> the catch is deliberately {@link Throwable}, not just {@link
+     * GatewayUnavailableException} -- {@code GatewayClient.reportFailure} maps only {@code
+     * RestClientResponseException}/{@code ResourceAccessException} into that type, so any other
+     * unmapped exception from this call (an unrelated {@code RestClientException} subtype, an {@code
+     * IllegalArgumentException} from URI templating, etc.) would otherwise propagate out of {@code
+     * processJob}'s only handler and out of {@code runLoop}'s {@code while}, killing the worker-loop
+     * thread -- exactly the silent-stall failure class WOC-35 exists to eliminate (a wedged/dead Worker
+     * that logs nothing further and claims no more jobs). Same precedent as {@code
+     * HeartbeatScheduler.tick}'s WSR-15 crash guard.
+     */
+    private void reportFailureBestEffort(long jobId, String workerId, JobFailureReason reason) {
+        try {
+            gatewayClient.reportFailure(jobId, new FailRequest(workerId, reason.name(), DETAIL_BY_REASON.get(reason)));
+            metrics.incrementFailuresReported();
+        } catch (Throwable t) {
+            metrics.incrementGatewayErrors();
+            log.warn("Failed to report job failure to the Gateway; the stale-heartbeat sweep will recover "
+                    + "it (jobId={})", jobId, t);
+        }
+    }
+
     private void runInference(ClaimResponse job, String workerId, ResolvedPrompt prompt, AbortSignal abortSignal) {
+        // WOC-03/WOR-17: sizes/counts only, never the raw systemMessages/messages content -- closes the
+        // gap between "Job claimed" and the first heartbeat tick (up to 60s of silence today).
+        int diffChars = job.payload().diff() == null ? 0 : job.payload().diff().length();
+        int systemMessageCount = job.payload().systemMessages() == null ? 0 : job.payload().systemMessages().size();
+        log.info("Starting inference (jobId={}, reviewId={}, diffChars={}, systemMessages={}, model={}, maxTokens={})",
+                job.jobId(), job.reviewId(), diffChars, systemMessageCount, prompt.model(), prompt.maxTokens());
+
         LlamaClient.AsyncCompletion call = llamaClient.startChatCompletion(
                 prompt.messages(), prompt.model(), prompt.temperature(), prompt.maxTokens());
         abortSignal.attach(call.future());
@@ -255,7 +369,7 @@ public class WorkerLoop {
             if (abortSignal.isAborted()) {
                 return null;
             }
-            throw new LlamaException("llama-server did not respond within requestTimeoutSec", e);
+            throw new LlamaException("llama-server did not respond within requestTimeoutSec", e, JobFailureReason.LLM_TIMEOUT);
         } catch (CancellationException e) {
             return null;
         } catch (ExecutionException e) {

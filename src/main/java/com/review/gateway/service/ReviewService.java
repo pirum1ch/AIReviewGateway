@@ -7,13 +7,16 @@ import com.review.gateway.model.Review;
 import com.review.gateway.model.ReviewChunk;
 import com.review.gateway.model.ReviewInput;
 import com.review.gateway.model.ReviewJob;
+import com.review.gateway.model.ReviewPromptSection;
 import com.review.gateway.model.enums.EventType;
 import com.review.gateway.model.enums.JobStatus;
+import com.review.gateway.model.enums.PromptBundleMode;
 import com.review.gateway.model.enums.ReviewStatus;
 import com.review.gateway.repository.ReviewChunkRepository;
 import com.review.gateway.repository.ReviewCommentRepository;
 import com.review.gateway.repository.ReviewInputRepository;
 import com.review.gateway.repository.ReviewJobRepository;
+import com.review.gateway.repository.ReviewPromptSectionRepository;
 import com.review.gateway.repository.ReviewRepository;
 import com.review.gateway.service.dto.CreateReviewCommand;
 import com.review.gateway.service.dto.CreateReviewResult;
@@ -70,10 +73,13 @@ public class ReviewService {
     private final ReviewChunkRepository reviewChunkRepository;
     private final ReviewJobRepository reviewJobRepository;
     private final ReviewCommentRepository reviewCommentRepository;
+    private final ReviewPromptSectionRepository reviewPromptSectionRepository;
     private final DeduplicationService deduplicationService;
     private final DiffSizeValidator diffSizeValidator;
     private final DiffChunker diffChunker;
     private final ChunkContextRenderer chunkContextRenderer;
+    private final PromptManager promptManager;
+    private final EventService eventService;
     private final StateMachine stateMachine;
     private final JobStateMachine jobStateMachine;
     private final EntityManager entityManager;
@@ -84,10 +90,13 @@ public class ReviewService {
                           ReviewChunkRepository reviewChunkRepository,
                           ReviewJobRepository reviewJobRepository,
                           ReviewCommentRepository reviewCommentRepository,
+                          ReviewPromptSectionRepository reviewPromptSectionRepository,
                           DeduplicationService deduplicationService,
                           DiffSizeValidator diffSizeValidator,
                           DiffChunker diffChunker,
                           ChunkContextRenderer chunkContextRenderer,
+                          PromptManager promptManager,
+                          EventService eventService,
                           StateMachine stateMachine,
                           JobStateMachine jobStateMachine,
                           EntityManager entityManager,
@@ -97,10 +106,13 @@ public class ReviewService {
         this.reviewChunkRepository = reviewChunkRepository;
         this.reviewJobRepository = reviewJobRepository;
         this.reviewCommentRepository = reviewCommentRepository;
+        this.reviewPromptSectionRepository = reviewPromptSectionRepository;
         this.deduplicationService = deduplicationService;
         this.diffSizeValidator = diffSizeValidator;
         this.diffChunker = diffChunker;
         this.chunkContextRenderer = chunkContextRenderer;
+        this.promptManager = promptManager;
+        this.eventService = eventService;
         this.stateMachine = stateMachine;
         this.jobStateMachine = jobStateMachine;
         this.entityManager = entityManager;
@@ -112,9 +124,11 @@ public class ReviewService {
     /**
      * Creates a new Review, or returns the existing one for the same dedup key (req. 1.5). Order of
      * operations: cheap absurd-size guard (CSR-01, no DB access) -&gt; sweep prior non-terminal Reviews
-     * of the MR to OBSOLETE if this head_sha is new -&gt; dedup lookup -&gt; split into chunks
-     * (DiffChunker) -&gt; validate prompt-version compatibility if chunked (CSR-12) -&gt; insert
-     * (racing safely against concurrent creates).
+     * of the MR to OBSOLETE if this head_sha is new -&gt; dedup lookup -&gt; resolve prompt sections
+     * (Prompt Manager, architecture §3 — no point calling GitLab for a request that will be
+     * deduplicated) -&gt; split into chunks (DiffChunker, budget reduced by the resolved system-prompt
+     * size) -&gt; validate prompt-version compatibility if chunked (CSR-12) -&gt; insert (racing safely
+     * against concurrent creates).
      */
     public CreateReviewResult createReview(CreateReviewCommand command) {
         diffSizeValidator.rejectIfAbsurdlyLarge(command.diff());
@@ -129,15 +143,22 @@ public class ReviewService {
             return toResult(existing.get(), true);
         }
 
-        DiffChunker.ChunkPlan plan = diffChunker.split(command.diff());
+        // Never inside a DB transaction (architecture §3): a GitLab HTTP call must never hold a Hikari
+        // connection or a row lock.
+        PromptManager.PromptResolution promptResolution = promptManager.resolve(command.projectId());
+        diffSizeValidator.assertPromptFits(promptResolution.estimatedTokens());
+
+        DiffChunker.ChunkPlan plan = diffChunker.split(command.diff(), promptResolution.estimatedTokens());
         if (plan.chunks().size() > 1) {
             validatePromptVersionForChunking(command.promptVersion());
         }
 
         try {
-            Review created = requiresNewTransactionTemplate.execute(status -> persistNewReview(command, plan));
-            log.info("Review created: reviewId={} projectId={} mrId={} headSha={} chunks={}",
-                    created.getId(), command.projectId(), command.mergeRequestId(), command.headSha(), plan.chunks().size());
+            Review created = requiresNewTransactionTemplate.execute(
+                    status -> persistNewReview(command, plan, promptResolution));
+            log.info("Review created: reviewId={} projectId={} mrId={} headSha={} chunks={} promptBundleMode={}",
+                    created.getId(), command.projectId(), command.mergeRequestId(), command.headSha(),
+                    plan.chunks().size(), promptResolution.mode());
             return new CreateReviewResult(created.getId(), created.getStatus(), false, plan.chunks().size());
         } catch (DataIntegrityViolationException race) {
             log.info("Review create race detected (unique-violation), re-reading existing: projectId={} mrId={} headSha={}",
@@ -275,16 +296,25 @@ public class ReviewService {
         }
     }
 
-    /** Runs inside {@link #requiresNewTransactionTemplate}; a unique-violation surfaces on the flush below. */
-    private Review persistNewReview(CreateReviewCommand command, DiffChunker.ChunkPlan plan) {
+    /**
+     * Runs inside {@link #requiresNewTransactionTemplate}; a unique-violation surfaces on the flush
+     * below. Prompt Manager (V3): writes {@code review_prompt_sections} in the same transaction as the
+     * Review/chunks/jobs — a Review can never exist with chunks but no sections (architecture §3).
+     */
+    private Review persistNewReview(CreateReviewCommand command, DiffChunker.ChunkPlan plan,
+                                     PromptManager.PromptResolution promptResolution) {
         Review review = new Review(command.projectId(), command.mergeRequestId(), command.headSha(),
-                command.baseSha(), command.promptVersion(), command.priority());
+                command.baseSha(), command.promptVersion(), command.priority(), promptResolution.mode());
         Review saved = reviewRepository.saveAndFlush(review);
 
         int estimatedTokens = diffSizeValidator.estimateTokens(command.diff());
         ReviewInput input = new ReviewInput(saved.getId(), command.diff(), command.promptVersion(),
-                command.headSha(), command.baseSha(), estimatedTokens);
+                command.headSha(), command.baseSha(), estimatedTokens,
+                promptResolution.mode() == PromptBundleMode.NONE ? null : promptResolution.estimatedTokens(),
+                promptResolution.degraded());
         reviewInputRepository.save(input);
+
+        persistPromptSections(saved.getId(), promptResolution);
 
         int chunkCount = plan.chunks().size();
         List<ReviewChunk> persistedChunks = new ArrayList<>();
@@ -306,7 +336,48 @@ public class ReviewService {
 
         stateMachine.transition(saved, ReviewStatus.QUEUED, EventType.CREATED,
                 "project=" + command.projectId() + " mr=" + command.mergeRequestId() + " chunks=" + chunkCount);
+
+        if (promptResolution.mode() == PromptBundleMode.NONE) {
+            // PMR-10: the audit trail must positively state which reviews ran without repo-sourced rules
+            // (kill-switch off), not stay silent about it.
+            eventService.record(saved.getId(), EventType.PROMPT_DISABLED, null, null,
+                    "gateway.prompt.enabled=false");
+        }
+        for (var missingKind : promptResolution.explicitPathsMissing()) {
+            // PMR-11: an explicitly-configured override path that 404'd -- WARN already logged by
+            // PromptManager; this is the durable review_events record of the same fact.
+            eventService.record(saved.getId(), EventType.PROMPT_SECTION_MISSING, null, null,
+                    "kind=" + missingKind);
+        }
+
         return saved;
+    }
+
+    /**
+     * Prompt Manager (V3): persists the resolved sections, immutable/append-only, in the same
+     * transaction as the Review itself — ordinal is the assembly order {@code PromptResolution.sections()}
+     * already carries.
+     *
+     * <p>ponytail: F-PM-11(a) (Info) -- no single assembled-output hash is recorded for the Review as a
+     * whole; each row's own {@code content_sha256} (covering its exact stored bytes) is the only hash
+     * persisted. Reconstructibility itself is not at risk (ordering derives from {@code kind}, the
+     * preamble/trailer are compile-time constants, and every row's hash covers its exact content) — what
+     * a single assembled-prompt hash would add is a forensic shortcut: an auditor could verify a
+     * reconstruction without re-deriving the assembly order/framing from the code version that produced
+     * it. Not implemented here because it is a genuinely new artifact (a {@code PROMPT_ASSEMBLED} event
+     * or an extra column), not a fix to something already computed. Add it once a real audit/incident
+     * response scenario actually needs "verify this reconstruction without cross-referencing the code" —
+     * until then the per-row hashes plus the deterministic ordering already satisfy PMR-07's
+     * reconstructibility requirement.
+     */
+    private void persistPromptSections(Long reviewId, PromptManager.PromptResolution promptResolution) {
+        int ordinal = 0;
+        for (PromptAssembler.AssembledSection section : promptResolution.sections()) {
+            ReviewPromptSection entity = new ReviewPromptSection(reviewId, ordinal++, section.kind(),
+                    section.status(), section.content(), section.sourceProject(), section.sourcePath(),
+                    section.sourceRef(), section.sourceCommit(), section.contentSha256(), section.estimatedTokens());
+            reviewPromptSectionRepository.save(entity);
+        }
     }
 
     /** Minimal, dependency-free JSON string-array encoder (avoids pulling Jackson into this hot path for a tiny list). */

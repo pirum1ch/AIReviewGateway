@@ -47,6 +47,30 @@ public class Backend {
     @Column(name = "last_seen")
     private Instant lastSeen;
 
+    /**
+     * Worker Observability & Claim Latency (V4, WOC-10): restart-safe start-of-streak timestamp for a
+     * continuous run of failed health probes; {@code NULL} means the backend is not currently failing.
+     * Set on the first failed probe of a streak, cleared on any successful probe -- PostgreSQL stays the
+     * single source of truth (no in-memory failure counter). {@code ACTIVE -> SUSPECT} requires this
+     * streak to be at least {@code gateway.backend.failure-grace} old (WOC-11); {@code BackendDispatcher}
+     * also declines a backend whose streak is past grace regardless of persisted status (WOR-10).
+     */
+    @Column(name = "probe_failed_since")
+    private Instant probeFailedSince;
+
+    /**
+     * Prompt Manager (V3, PMR-22): per-backend override of {@code gateway.prompt.message-format}
+     * ({@code MULTI}/{@code SINGLE}), or {@code null} to use the configured global default. Deliberately
+     * a plain {@code String}, not {@code @Enumerated} bound directly to
+     * {@link com.review.gateway.model.enums.PromptMessageFormat} — {@code PromptMessageFormatter} parses
+     * it via {@code PromptMessageFormat.fromNullable}, never {@code Enum.valueOf}, so a value the DB
+     * {@code CHECK} constraint didn't catch (a stale row from before the constraint existed, manual DB
+     * edit, etc.) degrades to the global default with a {@code WARN} instead of throwing and taking the
+     * claim path down.
+     */
+    @Column(name = "prompt_message_format", length = 16)
+    private String promptMessageFormat;
+
     @Column(name = "created_at", nullable = false, updatable = false)
     private Instant createdAt;
 
@@ -123,6 +147,22 @@ public class Backend {
 
     public void setLastSeen(Instant lastSeen) {
         this.lastSeen = lastSeen;
+    }
+
+    public Instant getProbeFailedSince() {
+        return probeFailedSince;
+    }
+
+    public void setProbeFailedSince(Instant probeFailedSince) {
+        this.probeFailedSince = probeFailedSince;
+    }
+
+    public String getPromptMessageFormat() {
+        return promptMessageFormat;
+    }
+
+    public void setPromptMessageFormat(String promptMessageFormat) {
+        this.promptMessageFormat = promptMessageFormat;
     }
 
     public Instant getCreatedAt() {

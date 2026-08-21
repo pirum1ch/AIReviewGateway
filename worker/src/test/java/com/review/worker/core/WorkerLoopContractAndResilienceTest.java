@@ -125,10 +125,12 @@ class WorkerLoopContractAndResilienceTest {
     private static final class GatewayDispatcher extends Dispatcher {
         private static final Pattern HEARTBEAT_PATH = Pattern.compile("^/jobs/\\d+/heartbeat$");
         private static final Pattern RESULT_PATH = Pattern.compile("^/jobs/\\d+/result$");
+        private static final Pattern FAIL_PATH = Pattern.compile("^/jobs/\\d+/fail$");
 
         private final Map<String, Queue<MockResponse>> queuesByExactPath = new ConcurrentHashMap<>();
         private final Queue<MockResponse> heartbeatQueue = new ConcurrentLinkedQueue<>();
         private final Queue<MockResponse> resultQueue = new ConcurrentLinkedQueue<>();
+        private final Queue<MockResponse> failQueue = new ConcurrentLinkedQueue<>();
         private final Queue<String> seenPaths = new ConcurrentLinkedQueue<>();
 
         void enqueueClaim(MockResponse response) {
@@ -141,6 +143,10 @@ class WorkerLoopContractAndResilienceTest {
 
         void enqueueResult(MockResponse response) {
             resultQueue.add(response);
+        }
+
+        void enqueueFail(MockResponse response) {
+            failQueue.add(response);
         }
 
         boolean everSaw(String exactPath) {
@@ -165,6 +171,10 @@ class WorkerLoopContractAndResilienceTest {
             if (RESULT_PATH.matcher(path).matches()) {
                 MockResponse queued = poll(resultQueue);
                 return queued != null ? queued : jsonResponse("{\"reviewId\":0,\"status\":\"COMPLETED\"}");
+            }
+            if (FAIL_PATH.matcher(path).matches()) {
+                MockResponse queued = poll(failQueue);
+                return queued != null ? queued : jsonResponse("{\"accepted\":true}");
             }
             return new MockResponse().setResponseCode(404);
         }
@@ -835,5 +845,142 @@ class WorkerLoopContractAndResilienceTest {
         assertThat(scraped).contains("worker_llama_duration_seconds_count");
         assertThat(scraped).contains("worker_gateway_errors_total");
         assertThat(scraped).contains("worker_uptime_seconds");
+    }
+
+    // =================================================================================================
+    // 8. Worker Observability & Claim Latency (WOC-34/WOC-35/WOC-37, WOR-05): explicit failure reporting
+    // =================================================================================================
+
+    @Test
+    void malformedLlamaResponseReportsFailureWithClassifiedReasonAndNoExceptionMessageLeak() throws Exception {
+        MockWebServer gatewayServer = newServer();
+        MockWebServer llamaServer = newServer();
+        Harness harness = newHarness(gatewayServer, llamaServer, p -> { });
+
+        harness.gatewayDispatcher.enqueueClaim(jsonResponse(200, """
+                {"jobId":60,"reviewId":60,"payload":{"diff":"d","promptVersion":"v1"}}
+                """));
+        // WOR-05: the marker below would, pre-fix, quote verbatim into a Jackson JsonParseException
+        // message ("...was expecting ... at [Source: ... SECRETMARKER ...]") -- it must never reach the
+        // Gateway.
+        llamaServer.enqueue(jsonResponse(200, "{\"choices\": SECRETMARKER not valid json"));
+
+        harness.workerLoop.start();
+
+        assertThat(takeRequestWithPath(gatewayServer, "/jobs/claim", Duration.ofSeconds(3))).isNotNull();
+        assertThat(llamaServer.takeRequest(3, TimeUnit.SECONDS)).isNotNull();
+
+        RecordedRequest failRequest = takeRequestWithPath(gatewayServer, "/jobs/60/fail", Duration.ofSeconds(3));
+        assertThat(failRequest).as("WOC-34: a LlamaException must trigger a best-effort /jobs/{id}/fail report").isNotNull();
+
+        String rawBody = failRequest.getBody().readUtf8();
+        assertThat(rawBody).as("WOR-05: detail must be a fixed Worker-side constant, never the exception message")
+                .doesNotContain("SECRETMARKER");
+        JsonNode failBody = MAPPER.readTree(rawBody);
+        assertThat(failBody.get("workerId").asText()).isEqualTo("worker-1");
+        assertThat(failBody.get("reason").asText()).isEqualTo("LLM_ERROR");
+
+        awaitTrue(Duration.ofSeconds(3), () -> counterValue(harness.registry, "worker.failures.reported") == 1.0);
+    }
+
+    @Test
+    void llamaEmptyChoicesReportsLlmEmptyResponseReason() throws Exception {
+        MockWebServer gatewayServer = newServer();
+        MockWebServer llamaServer = newServer();
+        Harness harness = newHarness(gatewayServer, llamaServer, p -> { });
+
+        harness.gatewayDispatcher.enqueueClaim(jsonResponse(200, """
+                {"jobId":61,"reviewId":61,"payload":{"diff":"d","promptVersion":"v1"}}
+                """));
+        llamaServer.enqueue(jsonResponse(200, "{\"choices\":[],\"usage\":null}"));
+
+        harness.workerLoop.start();
+
+        assertThat(takeRequestWithPath(gatewayServer, "/jobs/claim", Duration.ofSeconds(3))).isNotNull();
+        assertThat(llamaServer.takeRequest(3, TimeUnit.SECONDS)).isNotNull();
+
+        RecordedRequest failRequest = takeRequestWithPath(gatewayServer, "/jobs/61/fail", Duration.ofSeconds(3));
+        assertThat(failRequest).isNotNull();
+        JsonNode failBody = MAPPER.readTree(failRequest.getBody().readUtf8());
+        assertThat(failBody.get("reason").asText()).isEqualTo("LLM_EMPTY_RESPONSE");
+    }
+
+    @Test
+    void abortedJobNeverSendsAFailureReport() throws Exception {
+        MockWebServer gatewayServer = newServer();
+        MockWebServer llamaServer = newServer();
+        Harness harness = newHarness(gatewayServer, llamaServer, p -> { });
+
+        // WOC-37: heartbeat says stop mid-generation -> the job is aborted, not "failed"; no /fail call.
+        harness.gatewayDispatcher.enqueueClaim(jsonResponse(200, """
+                {"jobId":62,"reviewId":62,"payload":{"diff":"d","promptVersion":"v1"}}
+                """));
+        for (int i = 0; i < 5; i++) {
+            harness.gatewayDispatcher.enqueueHeartbeat(jsonResponse(200, "{\"shouldContinue\":false}"));
+        }
+        llamaServer.enqueue(new MockResponse()
+                .setHeadersDelay(20, TimeUnit.SECONDS).setResponseCode(200).setBody("{}"));
+
+        harness.workerLoop.start();
+
+        assertThat(takeRequestWithPath(gatewayServer, "/jobs/claim", Duration.ofSeconds(3))).isNotNull();
+        assertThat(llamaServer.takeRequest(3, TimeUnit.SECONDS)).isNotNull();
+        awaitTrue(Duration.ofSeconds(3), () -> harness.gatewayDispatcher.everSaw("/jobs/62/heartbeat"));
+
+        // Give the abort a moment to fully settle, then assert no /fail request ever arrived.
+        assertThat(takeRequestWithPath(gatewayServer, "/jobs/62/fail", Duration.ofMillis(800))).isNull();
+        assertThat(counterValue(harness.registry, "worker.failures.reported")).isEqualTo(0.0);
+    }
+
+    @Test
+    void resultRedeliveryAbandonedByShutdownNeverSendsAFailureReport() throws Exception {
+        // WOC-37: RedeliveryOutcome.ABANDONED must not report -- a result already exists and the thread
+        // is interrupted anyway.
+        MockWebServer gatewayServer = newServer();
+        MockWebServer llamaServer = newServer();
+        Harness harness = newHarness(gatewayServer, llamaServer, p -> p.getNetwork().setGatewayTimeoutSec(1));
+
+        harness.gatewayDispatcher.enqueueClaim(jsonResponse(200, """
+                {"jobId":63,"reviewId":63,"payload":{"diff":"d","promptVersion":"v1"}}
+                """));
+        llamaServer.enqueue(jsonResponse(200, "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"[]\"}}]}"));
+        for (int i = 0; i < 10; i++) {
+            harness.gatewayDispatcher.enqueueResult(new MockResponse().setSocketPolicy(SocketPolicy.NO_RESPONSE));
+        }
+
+        harness.workerLoop.start();
+
+        assertThat(takeRequestWithPath(gatewayServer, "/jobs/claim", Duration.ofSeconds(3))).isNotNull();
+        assertThat(llamaServer.takeRequest(3, TimeUnit.SECONDS)).isNotNull();
+        assertThat(takeRequestWithPath(gatewayServer, "/jobs/63/result", Duration.ofSeconds(3))).isNotNull();
+
+        harness.workerLoop.abandonCurrentJob();
+
+        assertThat(takeRequestWithPath(gatewayServer, "/jobs/63/fail", Duration.ofMillis(800))).isNull();
+    }
+
+    @Test
+    void gatewayRejectingTheFailureReportIsSwallowedAndCountedAsAGatewayError() throws Exception {
+        MockWebServer gatewayServer = newServer();
+        MockWebServer llamaServer = newServer();
+        Harness harness = newHarness(gatewayServer, llamaServer, p -> { });
+
+        harness.gatewayDispatcher.enqueueClaim(jsonResponse(200, """
+                {"jobId":64,"reviewId":64,"payload":{"diff":"d","promptVersion":"v1"}}
+                """));
+        llamaServer.enqueue(jsonResponse(200, "{\"choices\":[],\"usage\":null}"));
+        // Simulate an older Gateway build that has no such endpoint (WOC-35).
+        harness.gatewayDispatcher.enqueueFail(new MockResponse().setResponseCode(404));
+
+        harness.workerLoop.start();
+
+        assertThat(takeRequestWithPath(gatewayServer, "/jobs/claim", Duration.ofSeconds(3))).isNotNull();
+        assertThat(llamaServer.takeRequest(3, TimeUnit.SECONDS)).isNotNull();
+        assertThat(takeRequestWithPath(gatewayServer, "/jobs/64/fail", Duration.ofSeconds(3))).isNotNull();
+
+        // Single best-effort attempt: no redelivery loop, swallowed, counted, worker keeps running.
+        awaitTrue(Duration.ofSeconds(3), () -> counterValue(harness.registry, "worker.gateway.errors") >= 1.0);
+        assertThat(counterValue(harness.registry, "worker.jobs.failed")).isEqualTo(1.0);
+        assertThat(harness.workerLoop.isRunning()).isTrue();
     }
 }

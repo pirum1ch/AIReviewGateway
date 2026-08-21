@@ -6,6 +6,7 @@ import com.review.worker.error.LlamaException;
 import com.review.worker.llama.dto.ChatMessage;
 import okhttp3.mockwebserver.MockResponse;
 import okhttp3.mockwebserver.MockWebServer;
+import okhttp3.mockwebserver.RecordedRequest;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -77,6 +78,26 @@ class LlamaClientTest {
         assertThat(result.completionTokens()).isEqualTo(2);
         assertThat(result.model()).isEqualTo("test-model");
         assertThat(result.durationMs()).isGreaterThanOrEqualTo(0);
+    }
+
+    @Test
+    void requestDisablesModelThinking() throws InterruptedException {
+        // A "thinking" model spends part of max_tokens on a hidden reasoning block before the actual
+        // answer; on a large diff that can exhaust the whole budget and leave message.content empty
+        // (surfaces as LLM_EMPTY_RESPONSE even though the backend is healthy). Guards that the Worker
+        // always asks llama-server to skip it.
+        server.enqueue(new MockResponse()
+                .setResponseCode(200)
+                .addHeader("Content-Type", "application/json")
+                .setBody("""
+                        {"choices":[{"message":{"role":"assistant","content":"[]"},"finish_reason":"stop"}]}
+                        """));
+
+        llamaClient.chatCompletion(messages(), "test-model", 0.1, 100);
+
+        RecordedRequest recorded = server.takeRequest();
+        assertThat(recorded.getBody().readUtf8())
+                .contains("\"chat_template_kwargs\":{\"enable_thinking\":false}");
     }
 
     @Test

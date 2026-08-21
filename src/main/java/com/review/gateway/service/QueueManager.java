@@ -1,17 +1,23 @@
 package com.review.gateway.service;
 
+import com.review.gateway.exception.PromptSectionsMissingException;
 import com.review.gateway.model.Backend;
 import com.review.gateway.model.Review;
 import com.review.gateway.model.ReviewChunk;
 import com.review.gateway.model.ReviewJob;
+import com.review.gateway.model.ReviewPromptSection;
 import com.review.gateway.model.enums.EventType;
 import com.review.gateway.model.enums.JobStatus;
 import com.review.gateway.model.enums.ReviewStatus;
 import com.review.gateway.repository.ReviewChunkRepository;
 import com.review.gateway.repository.ReviewJobRepository;
+import com.review.gateway.repository.ReviewPromptSectionRepository;
 import com.review.gateway.repository.ReviewRepository;
+import com.review.gateway.model.enums.JobFailureReason;
 import com.review.gateway.service.dto.ClaimedJob;
+import com.review.gateway.service.dto.FailureReportOutcome;
 import com.review.gateway.service.dto.HeartbeatResult;
+import com.review.gateway.service.dto.RequeueOutcome;
 import com.review.gateway.service.dto.SubmitResultCommand;
 import com.review.gateway.service.dto.SubmitResultOutcome;
 import jakarta.persistence.EntityManager;
@@ -53,35 +59,50 @@ public class QueueManager {
     private final ReviewRepository reviewRepository;
     private final ReviewJobRepository reviewJobRepository;
     private final ReviewChunkRepository reviewChunkRepository;
+    private final ReviewPromptSectionRepository reviewPromptSectionRepository;
     private final BackendDispatcher backendDispatcher;
     private final JobStateMachine jobStateMachine;
     private final ChunkCoordinator chunkCoordinator;
     private final EventService eventService;
     private final ResultProcessor resultProcessor;
     private final ChunkContextRenderer chunkContextRenderer;
+    private final PromptMessageFormatter promptMessageFormatter;
+    private final RetryManager retryManager;
+    private final TextSanitizer textSanitizer;
+    private final MetricsCounters metricsCounters;
     private final EntityManager entityManager;
     private final TransactionTemplate requiresNewTransactionTemplate;
 
     public QueueManager(ReviewRepository reviewRepository,
                          ReviewJobRepository reviewJobRepository,
                          ReviewChunkRepository reviewChunkRepository,
+                         ReviewPromptSectionRepository reviewPromptSectionRepository,
                          BackendDispatcher backendDispatcher,
                          JobStateMachine jobStateMachine,
                          ChunkCoordinator chunkCoordinator,
                          EventService eventService,
                          ResultProcessor resultProcessor,
                          ChunkContextRenderer chunkContextRenderer,
+                         PromptMessageFormatter promptMessageFormatter,
+                         RetryManager retryManager,
+                         TextSanitizer textSanitizer,
+                         MetricsCounters metricsCounters,
                          EntityManager entityManager,
                          PlatformTransactionManager transactionManager) {
         this.reviewRepository = reviewRepository;
         this.reviewJobRepository = reviewJobRepository;
         this.reviewChunkRepository = reviewChunkRepository;
+        this.reviewPromptSectionRepository = reviewPromptSectionRepository;
         this.backendDispatcher = backendDispatcher;
         this.jobStateMachine = jobStateMachine;
         this.chunkCoordinator = chunkCoordinator;
         this.eventService = eventService;
         this.resultProcessor = resultProcessor;
         this.chunkContextRenderer = chunkContextRenderer;
+        this.promptMessageFormatter = promptMessageFormatter;
+        this.retryManager = retryManager;
+        this.textSanitizer = textSanitizer;
+        this.metricsCounters = metricsCounters;
         this.entityManager = entityManager;
         this.requiresNewTransactionTemplate = new TransactionTemplate(transactionManager);
         this.requiresNewTransactionTemplate.setPropagationBehavior(TransactionTemplate.PROPAGATION_REQUIRES_NEW);
@@ -100,21 +121,34 @@ public class QueueManager {
      *         lock-timeout on the job-row lock (all mapped to the same empty/204 outcome).
      */
     public Optional<ClaimedJob> claim(String backendName, String workerId) {
-        Optional<ClaimedJob> claimed;
+        ClaimAttempt attempt;
         try {
-            claimed = requiresNewTransactionTemplate.execute(status -> claimJobRow(backendName, workerId));
+            attempt = requiresNewTransactionTemplate.execute(status -> claimJobRow(backendName, workerId));
         } catch (QueryTimeoutException | PessimisticLockingFailureException lockTimeout) {
             log.debug("Claim lock-timed-out for backend '{}': treating as no job available", backendName);
             return Optional.empty();
         }
-        if (claimed == null || claimed.isEmpty()) {
+        if (attempt == null || attempt.reviewIdTouched() == null) {
             return Optional.empty();
         }
-        ClaimedJob job = claimed.get();
 
         // CSR-17: independent transaction, parent lock only, taken after claimJobRow's transaction
-        // (and the job-row lock it held) has already committed.
-        chunkCoordinator.recomputeAndApply(job.reviewId());
+        // (and the job-row lock it held) has already committed. Always run once a job row was actually
+        // touched, so the parent's derived status never goes stale. PMR-09 note: at this point the job
+        // row is RUNNING even on the fail-closed path below (claimJobRow never marks it FAILED itself —
+        // see that method's javadoc for why) — this call is what legally advances the parent
+        // QUEUED -> RUNNING before the follow-up fail step below asks for the (legal) RUNNING -> FAILED.
+        chunkCoordinator.recomputeAndApply(attempt.reviewIdTouched());
+
+        if (attempt.jobIdMissingPromptSections() != null) {
+            // PMR-09: fail the job now that the parent is (legally) RUNNING, then recompute once more so
+            // the parent (legally) follows RUNNING -> FAILED. Never dispatched to the Worker.
+            failJobForMissingPromptSections(attempt.jobIdMissingPromptSections());
+            chunkCoordinator.recomputeAndApply(attempt.reviewIdTouched());
+            return Optional.empty();
+        }
+
+        ClaimedJob job = attempt.claimed().orElseThrow();
 
         // Lock-free "doomed job" courtesy check (best-effort, not a correctness mechanism -- see class
         // javadoc): if the parent already went CANCELLED/OBSOLETE, don't hand this job to the Worker.
@@ -123,22 +157,45 @@ public class QueueManager {
             markDoomedJob(job.jobId(), reviewStatus);
             return Optional.empty();
         }
-        return claimed;
+        return attempt.claimed();
+    }
+
+    /**
+     * Outcome of {@link #claimJobRow}: {@code reviewIdTouched} is set whenever a job row's status
+     * actually changed, so {@link #claim} knows to recompute the parent's derived status;
+     * {@code jobIdMissingPromptSections} is set instead of {@code claimed} on the PMR-09 fail-closed
+     * path (the job is RUNNING at this point — see {@link #claimJobRow}'s javadoc for why it is not
+     * marked FAILED there directly). {@code null} {@code reviewIdTouched} means nothing was touched at
+     * all (no claimable backend, empty queue).
+     */
+    private record ClaimAttempt(Optional<ClaimedJob> claimed, Long reviewIdTouched, Long jobIdMissingPromptSections) {
+
+        static ClaimAttempt none() {
+            return new ClaimAttempt(Optional.empty(), null, null);
+        }
+
+        static ClaimAttempt claimed(ClaimedJob job) {
+            return new ClaimAttempt(Optional.of(job), job.reviewId(), null);
+        }
+
+        static ClaimAttempt missingPromptSections(Long jobId, Long reviewId) {
+            return new ClaimAttempt(Optional.empty(), reviewId, jobId);
+        }
     }
 
     /** Phase 1: locks only the job row (CSR-17). Runs inside {@link #requiresNewTransactionTemplate}. */
-    private Optional<ClaimedJob> claimJobRow(String backendName, String workerId) {
+    private ClaimAttempt claimJobRow(String backendName, String workerId) {
         applyLockTimeout();
         Optional<Backend> backendOpt = backendDispatcher.resolveClaimableBackend(backendName);
         if (backendOpt.isEmpty()) {
             log.debug("Claim declined for backend '{}': not claimable right now", backendName);
-            return Optional.empty();
+            return ClaimAttempt.none();
         }
         Backend backend = backendOpt.get();
 
         Optional<Long> jobIdOpt = reviewJobRepository.findNextQueuedJobIdForUpdate();
         if (jobIdOpt.isEmpty()) {
-            return Optional.empty();
+            return ClaimAttempt.none();
         }
         Long jobId = jobIdOpt.get();
 
@@ -154,6 +211,7 @@ public class QueueManager {
         job.setStartedAt(now);
         job.setFinishedAt(null);
         job.setLastError(null);
+        job.setNotBefore(null);
         jobStateMachine.transition(job, JobStatus.RUNNING, EventType.CLAIMED, workerId, backend.getId(),
                 "attempt=" + job.getAttempts());
         reviewJobRepository.save(job);
@@ -167,10 +225,55 @@ public class QueueManager {
 
         String chunkContext = buildChunkContext(job.getReviewId(), chunk);
 
+        Review review = reviewRepository.findById(job.getReviewId())
+                .orElseThrow(() -> new IllegalStateException("Review " + job.getReviewId() + " vanished mid-claim"));
+
+        List<String> systemMessages;
+        try {
+            List<ReviewPromptSection> sections =
+                    reviewPromptSectionRepository.findByReviewIdOrderByOrdinalAsc(job.getReviewId());
+            systemMessages = promptMessageFormatter.render(
+                    review.getPromptBundleMode(), sections, backend.getPromptMessageFormat());
+        } catch (PromptSectionsMissingException missingSections) {
+            // PMR-09: fail-closed, never dispatch a REPO-mode job with an empty/partial system prompt.
+            // Deliberately does NOT mark the job FAILED here: the job is RUNNING and the *parent*
+            // Review's own status is still whatever it was before this claim (typically QUEUED, for a
+            // Review's very first chunk) -- Review-level QUEUED -> FAILED is not a legal StateMachine
+            // transition (only RUNNING -> FAILED is), and this job-lock-only transaction must never take
+            // the parent lock itself (CSR-17). {@link #claim} performs the actual fail step as a separate
+            // follow-up transaction, only after its own recompute call has already legally advanced the
+            // parent to RUNNING.
+            log.warn("Claim-time PROMPT_SECTIONS_MISSING: jobId={} reviewId={}: {}",
+                    job.getId(), job.getReviewId(), missingSections.getMessage());
+            return ClaimAttempt.missingPromptSections(job.getId(), job.getReviewId());
+        }
+
         log.info("Job claimed: jobId={} reviewId={} chunkIndex={} backend={} workerId={}",
                 job.getId(), job.getReviewId(), job.getChunkIndex(), backendName, workerId);
-        return Optional.of(new ClaimedJob(job.getId(), job.getReviewId(), chunk.getDiff(),
-                promptVersionFor(chunk), chunkContext));
+        ClaimedJob claimedJob = new ClaimedJob(job.getId(), job.getReviewId(), chunk.getDiff(),
+                review.getPromptVersion(), chunkContext, systemMessages);
+        return ClaimAttempt.claimed(claimedJob);
+    }
+
+    /**
+     * PMR-09 follow-up fail step (called from {@link #claim} only after the parent Review has already
+     * been recomputed to {@code RUNNING}, making this job's own {@code RUNNING -> FAILED} transition
+     * legal at the Review level too on the next recompute). Its own small transaction, job-row lock
+     * only — mirrors {@link RetryManager#requeueOrFailJobOnly}'s pattern exactly.
+     */
+    private void failJobForMissingPromptSections(Long jobId) {
+        requiresNewTransactionTemplate.executeWithoutResult(status -> {
+            applyLockTimeout();
+            ReviewJob job = reviewJobRepository.findByIdForUpdate(jobId).orElse(null);
+            if (job == null || job.getStatus() != JobStatus.RUNNING) {
+                return;
+            }
+            jobStateMachine.transition(job, JobStatus.FAILED, EventType.PROMPT_SECTIONS_MISSING, job.getWorkerId(),
+                    job.getBackendId(), "prompt_bundle_mode=REPO but mandatory CORPORATE_* sections missing at claim time");
+            reviewJobRepository.save(job);
+            log.info("Job {} FAILED at claim time: mandatory CORPORATE_* prompt sections missing (reviewId={})",
+                    jobId, job.getReviewId());
+        });
     }
 
     /**
@@ -206,18 +309,6 @@ public class QueueManager {
                     json.length());
             return List.of();
         }
-    }
-
-    /**
-     * The Review's overall {@code prompt_version} is not modeled on {@code review_chunks} (only on
-     * {@code reviews}/{@code review_inputs}); {@code ReviewService} already validated (CSR-12) that
-     * this version is chunk-context-aware whenever {@code chunkCount > 1}. We re-read it here from the
-     * job's own review to avoid a redundant column.
-     */
-    private String promptVersionFor(ReviewChunk chunk) {
-        return reviewRepository.findById(chunk.getReviewId())
-                .map(Review::getPromptVersion)
-                .orElseThrow(() -> new IllegalStateException("Review " + chunk.getReviewId() + " vanished mid-claim"));
     }
 
     /**
@@ -263,6 +354,7 @@ public class QueueManager {
 
         if (!isOwner(job, workerId)) {
             log.warn("Heartbeat ownership mismatch: jobId={} claimedBy={} callerWorkerId={}", jobId, job.getWorkerId(), workerId);
+            metricsCounters.incrementOwnershipMismatch("heartbeat");
             return HeartbeatResult.ownershipMismatch();
         }
 
@@ -296,6 +388,7 @@ public class QueueManager {
 
         if (!isOwner(job, workerId)) {
             log.warn("Result submission ownership mismatch: jobId={} claimedBy={} callerWorkerId={}", jobId, job.getWorkerId(), workerId);
+            metricsCounters.incrementOwnershipMismatch("result");
             // F02-05: do not echo the review's status to a non-owner -- indistinguishable from NOT_FOUND.
             return SubmitResultOutcome.ownershipMismatch();
         }
@@ -311,6 +404,93 @@ public class QueueManager {
 
         ReviewStatus finalStatus = resultProcessor.process(review.getId(), job.getId(), workerId, job.getBackendId(), command);
         return SubmitResultOutcome.accepted(review.getId(), finalStatus);
+    }
+
+    /** WOC-25/WOR-06c: {@code detail} is sanitized to a single line, capped at 200 chars. */
+    private static final int MAX_DETAIL_LENGTH = 200;
+
+    /**
+     * Handles {@code POST /jobs/{id}/fail} (architecture §5.2, WOC-26). Deliberately <b>not</b> {@code
+     * @Transactional} (unlike {@link #heartbeat}/{@link #submitResult}): {@link RetryManager#requeueOrFail}
+     * opens its own {@code REQUIRES_NEW} transaction and, only after that commits, calls
+     * {@code ChunkCoordinator} for the parent-row lock. An outer transaction here would hold a Hikari
+     * connection across both phases and reintroduce exactly the lock-ordering hazard CSR-17 removed
+     * (see {@code RetryManager.requeueOrFail}'s own "plain orchestrating method" precedent).
+     *
+     * <p>The unlocked pre-check below exists only to return {@code 404}/{@code 403} cheaply and to avoid
+     * opening a write transaction for the common no-op case (WOR-15b: the job is already not {@code
+     * RUNNING}); it is never the authorization decision. {@link RetryManager} re-checks ownership under
+     * the job-row lock (WOC-27) and that locked result always wins (WOR-19) — if the two disagree
+     * (a genuine race), the response reflects the locked outcome.
+     *
+     * @param reasonCode whitelist-parsed against {@link JobFailureReason} (WOC-23); an unrecognized value
+     *                    maps to {@code UNKNOWN} with a WARN, never a {@code 400} — audit-only, never
+     *                    influences the retry-vs-fail decision (WOC-24).
+     * @param detail      untrusted, Worker-supplied free text; sanitized to a single line and truncated to
+     *                    {@value #MAX_DETAIL_LENGTH} chars <b>here, at ingress</b>, before it ever reaches
+     *                    {@link RetryManager}, a logger, {@code review_events}, or {@code last_error}
+     *                    (WOC-25/WOR-06c) — the raw value never propagates past this method.
+     */
+    public FailureReportOutcome reportFailure(Long jobId, String workerId, String reasonCode, String detail) {
+        Optional<ReviewJob> preCheck = reviewJobRepository.findById(jobId);
+        if (preCheck.isEmpty()) {
+            log.debug("Failure report for unknown jobId={}", jobId);
+            return FailureReportOutcome.NOT_FOUND;
+        }
+        ReviewJob job = preCheck.get();
+        if (!isOwner(job, workerId)) {
+            log.warn("Failure report ownership mismatch: jobId={} claimedBy={} callerWorkerId={}",
+                    jobId, job.getWorkerId(), workerId);
+            metricsCounters.incrementOwnershipMismatch("fail");
+            metricsCounters.incrementWorkerFailureReportsIgnored();
+            return FailureReportOutcome.OWNERSHIP_MISMATCH;
+        }
+        if (job.getStatus() != JobStatus.RUNNING) {
+            // WOR-15b: no-op path returns 200 without opening RetryManager's REQUIRES_NEW transaction.
+            log.info("Idempotent no-op failure report: jobId={} currentJobStatus={}", jobId, job.getStatus());
+            metricsCounters.incrementWorkerFailureReportsIgnored();
+            return FailureReportOutcome.ACCEPTED;
+        }
+
+        JobFailureReason reason = JobFailureReason.fromWireValue(reasonCode);
+        if (reason == JobFailureReason.UNKNOWN) {
+            // WOC-23: never log the raw value, only its length -- it is untrusted, caller-supplied text.
+            log.warn("Unknown worker-reported failure reason (length={}) for jobId={}",
+                    reasonCode == null ? 0 : reasonCode.length(), jobId);
+        }
+        String sanitizedDetail = textSanitizer.sanitizeSingleLine(detail, MAX_DETAIL_LENGTH);
+        String composedReason = "worker-reported: reason=" + reason
+                + (sanitizedDetail != null ? "; detail=" + sanitizedDetail : "");
+
+        RequeueOutcome outcome;
+        try {
+            outcome = retryManager.requeueOrFail(jobId, composedReason, workerId);
+        } catch (PessimisticLockingFailureException | QueryTimeoutException lockTimeout) {
+            // WOC-32: never surface a lock-timeout as a 500 to the Worker -- the stale-heartbeat sweep
+            // remains the correctness backstop for this best-effort, latency-only optimization.
+            log.debug("Failure report lock-timed-out for jobId={}: the sweep will handle it", jobId);
+            return FailureReportOutcome.ACCEPTED;
+        }
+
+        return switch (outcome.outcome()) {
+            case NOT_FOUND -> FailureReportOutcome.NOT_FOUND;
+            case OWNERSHIP_MISMATCH -> {
+                // WOR-19: the locked re-check disagreed with the unlocked pre-check above (a genuine
+                // race) -- the locked outcome wins.
+                log.warn("Failure report ownership mismatch under lock: jobId={} callerWorkerId={}", jobId, workerId);
+                metricsCounters.incrementOwnershipMismatch("fail");
+                metricsCounters.incrementWorkerFailureReportsIgnored();
+                yield FailureReportOutcome.OWNERSHIP_MISMATCH;
+            }
+            case NOOP_NOT_RUNNING -> {
+                metricsCounters.incrementWorkerFailureReportsIgnored();
+                yield FailureReportOutcome.ACCEPTED;
+            }
+            case APPLIED_REQUEUED, APPLIED_FAILED -> {
+                log.info("Worker-reported job failure: jobId={} workerId={} reason={}", jobId, workerId, reason);
+                yield FailureReportOutcome.ACCEPTED;
+            }
+        };
     }
 
     private boolean isOwner(ReviewJob job, String workerId) {

@@ -1,0 +1,256 @@
+package com.review.gateway.service;
+
+import com.review.gateway.config.GatewayProperties;
+import com.review.gateway.exception.PromptResolutionSaturatedException;
+import com.review.gateway.exception.PromptSourceInvalidException;
+import com.review.gateway.exception.PromptSourceMissingException;
+import com.review.gateway.exception.PromptSourceUnavailableException;
+import com.review.gateway.exception.PromptTooLargeException;
+import com.review.gateway.model.enums.PromptBundleMode;
+import com.review.gateway.model.enums.PromptSectionKind;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Service;
+
+import java.time.Instant;
+import java.util.List;
+import java.util.Optional;
+import java.util.concurrent.Semaphore;
+
+/**
+ * Orchestrates one Review's prompt-source resolution end to end (architecture §2/§3): sources → fetch
+ * → sanitize → assemble → cap. Not {@code @Transactional}, no DB access itself — a GitLab HTTP call
+ * must never hold a Hikari connection or a row lock (architecture §3). Called once, synchronously, from
+ * {@code ReviewService.createReview} — after the dedup lookup (no point calling GitLab for a request
+ * that will be deduplicated), before {@code persistNewReview}.
+ *
+ * <p>PMR-19: the whole resolve runs under a bounded {@link Semaphore} permit
+ * ({@code gateway.prompt.limits.max-concurrent-resolutions}) acquired non-blockingly — saturation is an
+ * immediate {@link PromptResolutionSaturatedException} (503), never a queued thread — plus a wall-clock
+ * deadline ({@code gateway.prompt.total-timeout}) checked between every outbound call, so a slow/hung
+ * GitLab cannot silently consume far more than the configured budget across the up to 6 calls one
+ * resolve can make.
+ *
+ * <p>ponytail: PMR-20 (SHOULD) — a small in-memory, content-addressed cache keyed on
+ * {@code (project, path, commitSha)} (immutable by construction, so no staleness risk) is not
+ * implemented; every resolve re-fetches the corporate sections from GitLab even though they are
+ * identical across every Review until the corporate repo's next commit. Not needed at 20-30 MR/day (§11
+ * of the architecture doc: add it when GitLab starts rate-limiting, or when {@code POST /reviews} p95
+ * latency exceeds ~2-3s — a bounded {@code ConcurrentHashMap}, not Caffeine, per the project's stdlib-
+ * only convention for this feature).
+ *
+ * <p>ponytail: PMR-27 (SHOULD) — no {@code gateway.prompt.allowed-project-ids} allowlist gate is
+ * implemented; any project the shared CI token can name may have its default branch/prompt sections
+ * read (PMT-08, an amplification of the pre-existing T-21/SR-16 residual, not a new one — see
+ * {@code docs/prompt-manager-threat-model.md} §4's PMR-27 note). Add the allowlist once per-project CI
+ * tokens are not yet available but cross-project reach needs to be bounded sooner.
+ */
+@Service
+public class PromptManager {
+
+    private static final Logger log = LoggerFactory.getLogger(PromptManager.class);
+    private static final String ON_ERROR_SKIP_OPTIONAL = "SKIP_OPTIONAL";
+
+    private final GatewayProperties properties;
+    private final GitLabClient gitLabClient;
+    private final PromptSourceResolver sourceResolver;
+    private final PromptAssembler assembler;
+    private final TextSanitizer textSanitizer;
+    private final Semaphore permits;
+
+    public PromptManager(GatewayProperties properties, GitLabClient gitLabClient,
+                          PromptSourceResolver sourceResolver, PromptAssembler assembler,
+                          TextSanitizer textSanitizer) {
+        this.properties = properties;
+        this.gitLabClient = gitLabClient;
+        this.sourceResolver = sourceResolver;
+        this.assembler = assembler;
+        this.textSanitizer = textSanitizer;
+        this.permits = new Semaphore(Math.max(1, properties.getPrompt().getLimits().getMaxConcurrentResolutions()));
+    }
+
+    /**
+     * Result of {@link #resolve}: the sections to persist (empty for {@link PromptBundleMode#NONE}),
+     * the aggregate token estimate, whether project-section resolution was degraded (skipped due to
+     * {@code on-error=SKIP_OPTIONAL}), and the explicitly-configured-override paths that were looked up
+     * and not found (PMR-11 — {@code ReviewService} emits one {@code PROMPT_SECTION_MISSING} event per
+     * entry, once the Review row exists to attribute it to).
+     */
+    public record PromptResolution(PromptBundleMode mode, List<PromptAssembler.AssembledSection> sections,
+                                    int estimatedTokens, boolean degraded, List<PromptSectionKind> explicitPathsMissing) {
+
+        public static PromptResolution none() {
+            return new PromptResolution(PromptBundleMode.NONE, List.of(), 0, false, List.of());
+        }
+    }
+
+    public PromptResolution resolve(Long reviewedProjectId) {
+        if (!properties.getPrompt().isEnabled()) {
+            return PromptResolution.none();
+        }
+        if (!permits.tryAcquire()) {
+            throw new PromptResolutionSaturatedException(
+                    "gateway.prompt.limits.max-concurrent-resolutions saturated; try again shortly");
+        }
+        try {
+            Instant deadline = Instant.now().plus(properties.getPrompt().getTotalTimeout());
+            return doResolve(reviewedProjectId, deadline);
+        } finally {
+            permits.release();
+        }
+    }
+
+    private PromptResolution doResolve(Long reviewedProjectId, Instant deadline) {
+        PromptSourceResolver.CorporateSource corp = sourceResolver.corporate();
+
+        checkDeadline(deadline);
+        String corpSha = gitLabClient.resolveCommitSha(corp.project(), corp.ref());
+
+        checkDeadline(deadline);
+        String corpBaseRaw = gitLabClient.fetchRawFile(corp.project(), corp.basePromptPath(), corpSha, maxFileBytes())
+                .orElseThrow(() -> new PromptSourceMissingException(
+                        "Mandatory corporate prompt source is missing: base-prompt-path"));
+
+        checkDeadline(deadline);
+        String corpRulesRaw = gitLabClient.fetchRawFile(corp.project(), corp.reviewRulesPath(), corpSha, maxFileBytes())
+                .orElseThrow(() -> new PromptSourceMissingException(
+                        "Mandatory corporate prompt source is missing: review-rules-path"));
+
+        PromptAssembler.SectionCandidate corpBaseCandidate = new PromptAssembler.SectionCandidate(
+                PromptSectionKind.CORPORATE_BASE, true, textSanitizer.sanitizeSectionText(corpBaseRaw),
+                corp.project(), corp.basePromptPath(), corp.ref(), corpSha);
+        PromptAssembler.SectionCandidate corpRulesCandidate = new PromptAssembler.SectionCandidate(
+                PromptSectionKind.CORPORATE_REVIEW_RULES, true, textSanitizer.sanitizeSectionText(corpRulesRaw),
+                corp.project(), corp.reviewRulesPath(), corp.ref(), corpSha);
+
+        PromptAssembler.SectionCandidate projectArchitecture = null;
+        PromptAssembler.SectionCandidate projectCodeRules = null;
+        boolean degraded = false;
+        List<PromptSectionKind> explicitPathsMissing = new java.util.ArrayList<>();
+
+        Optional<PromptSourceResolver.ProjectSource> projectSourceOpt = sourceResolver.project(reviewedProjectId);
+        if (projectSourceOpt.isPresent()) {
+            PromptSourceResolver.ProjectSource proj = projectSourceOpt.get();
+            try {
+                checkDeadline(deadline);
+                String ref = proj.explicitRef() != null ? proj.explicitRef() : gitLabClient.resolveDefaultBranch(proj.project());
+
+                checkDeadline(deadline);
+                String projSha = gitLabClient.resolveCommitSha(proj.project(), ref);
+
+                checkDeadline(deadline);
+                projectArchitecture = fetchOptionalSection(PromptSectionKind.PROJECT_ARCHITECTURE, proj.project(),
+                        proj.architecturePath(), ref, projSha, proj.architecturePathExplicit(), explicitPathsMissing);
+
+                checkDeadline(deadline);
+                projectCodeRules = fetchOptionalSection(PromptSectionKind.PROJECT_CODE_RULES, proj.project(),
+                        proj.codeRulesPath(), ref, projSha, proj.codeRulesPathExplicit(), explicitPathsMissing);
+            } catch (PromptSourceUnavailableException | PromptSourceInvalidException projectFailure) {
+                // F-PM-01: BOTH failure classes are "a project-section error" per architecture §3 step 4c
+                // ("other error => FAIL or SKIP_OPTIONAL per config"). Catching only
+                // PromptSourceUnavailableException made `on-error=SKIP_OPTIONAL` a no-op for the entire
+                // PromptSourceInvalidException family (file over max-file-bytes, invalid UTF-8, NUL byte,
+                // empty file) -- an *optional* project section could then hard-fail POST /reviews with a
+                // 422 regardless of how the operator configured error handling, and any developer able to
+                // land such a file on their project's default branch could keep AI review permanently
+                // un-runnable for that project with no operator escape hatch. Corporate (mandatory)
+                // sections are unaffected: they are fetched above this try block and always fail hard.
+                if (ON_ERROR_SKIP_OPTIONAL.equals(properties.getPrompt().getErrorHandling().getOnError())) {
+                    log.warn("Project prompt source unusable; skipping optional PROJECT_* sections "
+                            + "(prompt_degraded=true): {}", projectFailure.getClass().getSimpleName());
+                    degraded = true;
+                    projectArchitecture = null;
+                    projectCodeRules = null;
+                    explicitPathsMissing.clear();
+                } else {
+                    throw projectFailure;
+                }
+            }
+        }
+
+        PromptAssembler.ResolvedSystemPrompt resolved;
+        try {
+            resolved = assembler.assemble(corpBaseCandidate, corpRulesCandidate, projectArchitecture, projectCodeRules,
+                    degraded);
+        } catch (PromptTooLargeException tooLarge) {
+            // F-PM-03: an oversized but otherwise-valid *optional* PROJECT_* section must be able to
+            // degrade under on-error=SKIP_OPTIONAL, exactly like a missing/invalid project source above
+            // -- architecture §3 step 4c's "other error => FAIL or SKIP_OPTIONAL per config" did not
+            // originally cover this throw, because it happens after (not inside) that catch's scope, so
+            // a genuinely oversized-but-valid architecture.md/code-rules.md doc could 422 every
+            // POST /reviews for that project with no operator escape hatch, even under SKIP_OPTIONAL.
+            //
+            // Attribution matters: re-assemble corporate-only first. If *that* still throws, the
+            // overflow is attributable to the mandatory CORPORATE_* content itself and must remain a
+            // hard 422 regardless of on-error (PMR-21: never silently truncate the corporate rulebook --
+            // corporate-only overflow is a configuration error, not something SKIP_OPTIONAL exists to
+            // paper over). Only when the corporate-only re-assembly fits do we know the PROJECT_*
+            // sections were the cause, and only then do we drop them and proceed degraded.
+            boolean hadProjectContent = projectArchitecture != null || projectCodeRules != null;
+            if (!hadProjectContent || !ON_ERROR_SKIP_OPTIONAL.equals(properties.getPrompt().getErrorHandling().getOnError())) {
+                throw tooLarge;
+            }
+            // The WARN is deliberately emitted *after* the corporate-only re-assembly succeeds: if that
+            // re-assembly throws instead, the overflow was attributable to the mandatory corporate
+            // content and this is a hard 422 -- logging "dropping them and proceeding" first would have
+            // described an outcome that never happened, in the one line an operator reads while
+            // diagnosing exactly that failure.
+            resolved = assembler.assemble(corpBaseCandidate, corpRulesCandidate, null, null, true);
+            log.warn("Assembled system prompt exceeds gateway.prompt.limits.max-system-prompt-tokens with "
+                    + "optional PROJECT_* sections included; dropped them and proceeded with the "
+                    + "corporate rulebook only (prompt_degraded=true)");
+        }
+        return new PromptResolution(PromptBundleMode.REPO, resolved.sections(), resolved.estimatedTokens(),
+                resolved.degraded(), List.copyOf(explicitPathsMissing));
+    }
+
+    /**
+     * PMR-11: a 404 on an explicitly-configured override path is recorded (via {@code explicitPathsMissing})
+     * for the caller to WARN + emit a {@code PROMPT_SECTION_MISSING} event on; a 404 on the default path is
+     * normal and silent. Either way an {@code ABSENT} candidate is returned (never {@code null}) — the
+     * absence itself is always positively recorded in {@code review_prompt_sections}.
+     */
+    private PromptAssembler.SectionCandidate fetchOptionalSection(PromptSectionKind kind, String project, String path,
+                                                                    String ref, String commitSha, boolean explicit,
+                                                                    List<PromptSectionKind> explicitPathsMissing) {
+        Optional<String> raw = gitLabClient.fetchRawFile(project, path, commitSha, maxFileBytes());
+        if (raw.isPresent()) {
+            return new PromptAssembler.SectionCandidate(kind, true, textSanitizer.sanitizeSectionText(raw.get()),
+                    project, path, ref, commitSha);
+        }
+        if (explicit) {
+            log.warn("Explicitly-configured prompt source path not found (kind={}, project={}, pathLength={})",
+                    kind, project, path.length());
+            explicitPathsMissing.add(kind);
+        }
+        return new PromptAssembler.SectionCandidate(kind, false, null, project, path, ref, commitSha);
+    }
+
+    private int maxFileBytes() {
+        return properties.getPrompt().getLimits().getMaxFileBytes();
+    }
+
+    /**
+     * ponytail: F-PM-09 (Info) -- a deadline breach here throws the same {@link
+     * PromptSourceUnavailableException} as an ordinary GitLab failure, so it is caught by the same
+     * {@code on-error=SKIP_OPTIONAL} branch in {@link #doResolve} and reported as an ordinary
+     * degradation rather than as the deadline breach it actually is (both in the WARN log and in
+     * {@code prompt_degraded}). Giving the deadline its own exception type/flag so {@code
+     * SKIP_OPTIONAL} does not absorb it — i.e. a slow/hung GitLab always surfaces distinctly even when
+     * an operator has opted into graceful degradation for source-availability failures — is a
+     * deliberate policy call, not a mechanical fix: it would make SKIP_OPTIONAL's resilience guarantee
+     * narrower (a deadline breach would hard-fail POST /reviews even under SKIP_OPTIONAL), which is a
+     * real behavior change for production traffic during a slow GitLab period, not just a defect fix.
+     * Not implemented in this round for that reason. Re-evaluate if the two causes (deadline vs.
+     * ordinary unavailability) ever need to be told apart operationally — e.g. an alert wants to fire
+     * only on the former, or an operator reports "SKIP_OPTIONAL degraded silently, but it should have
+     * been an alarm" — at which point a distinct subclass is the mechanical part of the fix and this
+     * comment is the design note for the actual policy decision.
+     */
+    private void checkDeadline(Instant deadline) {
+        if (Instant.now().isAfter(deadline)) {
+            throw new PromptSourceUnavailableException(
+                    "gateway.prompt.total-timeout exceeded while resolving prompt sources");
+        }
+    }
+}

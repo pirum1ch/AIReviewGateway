@@ -10,6 +10,7 @@ import com.review.gateway.repository.ReviewChunkRepository;
 import com.review.gateway.repository.ReviewCommentRepository;
 import com.review.gateway.repository.ReviewInputRepository;
 import com.review.gateway.repository.ReviewJobRepository;
+import com.review.gateway.repository.ReviewPromptSectionRepository;
 import com.review.gateway.repository.ReviewRepository;
 import com.review.gateway.service.dto.CreateReviewCommand;
 import com.review.gateway.service.dto.CreateReviewResult;
@@ -30,8 +31,10 @@ import java.util.Optional;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
@@ -45,10 +48,13 @@ class ReviewServiceTest {
     private ReviewChunkRepository reviewChunkRepository;
     private ReviewJobRepository reviewJobRepository;
     private ReviewCommentRepository reviewCommentRepository;
+    private ReviewPromptSectionRepository reviewPromptSectionRepository;
     private DeduplicationService deduplicationService;
     private DiffSizeValidator diffSizeValidator;
     private DiffChunker diffChunker;
     private ChunkContextRenderer chunkContextRenderer;
+    private PromptManager promptManager;
+    private EventService eventService;
     private StateMachine stateMachine;
     private JobStateMachine jobStateMachine;
     private EntityManager entityManager;
@@ -62,10 +68,13 @@ class ReviewServiceTest {
         reviewChunkRepository = Mockito.mock(ReviewChunkRepository.class);
         reviewJobRepository = Mockito.mock(ReviewJobRepository.class);
         reviewCommentRepository = Mockito.mock(ReviewCommentRepository.class);
+        reviewPromptSectionRepository = Mockito.mock(ReviewPromptSectionRepository.class);
         deduplicationService = Mockito.mock(DeduplicationService.class);
         diffSizeValidator = Mockito.mock(DiffSizeValidator.class);
         diffChunker = Mockito.mock(DiffChunker.class);
         chunkContextRenderer = Mockito.mock(ChunkContextRenderer.class);
+        promptManager = Mockito.mock(PromptManager.class);
+        eventService = Mockito.mock(EventService.class);
         stateMachine = Mockito.mock(StateMachine.class);
         jobStateMachine = Mockito.mock(JobStateMachine.class);
         transactionManager = Mockito.mock(PlatformTransactionManager.class);
@@ -73,8 +82,10 @@ class ReviewServiceTest {
         Query lockTimeoutQuery = Mockito.mock(Query.class);
         when(entityManager.createNativeQuery(anyString())).thenReturn(lockTimeoutQuery);
 
+        // Kill-switch off by default -- most tests don't care about Prompt Manager specifics.
+        when(promptManager.resolve(any())).thenReturn(PromptManager.PromptResolution.none());
         // Single-chunk plan by default -- most tests don't care about chunking specifics.
-        when(diffChunker.split(anyString())).thenAnswer(inv -> new DiffChunker.ChunkPlan(
+        when(diffChunker.split(anyString(), anyInt())).thenAnswer(inv -> new DiffChunker.ChunkPlan(
                 List.of(new DiffChunker.DiffChunk(0, inv.getArgument(0), 10, List.of())), 10));
         when(reviewJobRepository.findNonTerminalJobs(any())).thenReturn(List.of());
         when(reviewChunkRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
@@ -87,8 +98,9 @@ class ReviewServiceTest {
         when(transactionManager.getTransaction(any(TransactionDefinition.class))).thenReturn(fakeStatus);
 
         reviewService = new ReviewService(reviewRepository, reviewInputRepository, reviewChunkRepository,
-                reviewJobRepository, reviewCommentRepository, deduplicationService, diffSizeValidator,
-                diffChunker, chunkContextRenderer, stateMachine, jobStateMachine, entityManager, transactionManager);
+                reviewJobRepository, reviewCommentRepository, reviewPromptSectionRepository, deduplicationService,
+                diffSizeValidator, diffChunker, chunkContextRenderer, promptManager, eventService, stateMachine,
+                jobStateMachine, entityManager, transactionManager);
     }
 
     private CreateReviewCommand command(String headSha) {
@@ -161,6 +173,40 @@ class ReviewServiceTest {
         assertThat(result.deduplicated()).isFalse();
         verify(reviewInputRepository).save(any(ReviewInput.class));
         verify(stateMachine).transition(any(Review.class), eq(ReviewStatus.QUEUED), eq(EventType.CREATED), any());
+    }
+
+    // ---- PMR-10: the kill-switch being off must be traceable per-Review, not just at startup ----
+
+    @Test
+    void killSwitchOffRecordsPromptDisabledEventOnEveryCreatedReview() {
+        when(reviewRepository.findByProjectIdAndMergeRequestIdAndHeadShaNotAndStatusInOrderByIdAsc(any(), any(), any(), any()))
+                .thenReturn(List.of());
+        when(deduplicationService.findActiveReview(1L, 2L, "sha-1")).thenReturn(Optional.empty());
+        when(reviewRepository.saveAndFlush(any(Review.class)))
+                .thenAnswer(inv -> ReviewTestSupport.withId(inv.getArgument(0), 301L));
+        when(diffSizeValidator.estimateTokens("diff content")).thenReturn(42);
+        // promptManager.resolve(...) is stubbed to PromptResolution.none() in setUp -- the kill-switch-off case.
+
+        reviewService.createReview(command("sha-1"));
+
+        verify(eventService).record(eq(301L), eq(EventType.PROMPT_DISABLED), isNull(), isNull(), anyString());
+    }
+
+    @Test
+    void repoModeSuccessfulResolutionNeverRecordsPromptDisabledOrSectionMissingEvents() {
+        when(reviewRepository.findByProjectIdAndMergeRequestIdAndHeadShaNotAndStatusInOrderByIdAsc(any(), any(), any(), any()))
+                .thenReturn(List.of());
+        when(deduplicationService.findActiveReview(1L, 2L, "sha-1")).thenReturn(Optional.empty());
+        when(reviewRepository.saveAndFlush(any(Review.class)))
+                .thenAnswer(inv -> ReviewTestSupport.withId(inv.getArgument(0), 302L));
+        when(diffSizeValidator.estimateTokens("diff content")).thenReturn(42);
+        when(promptManager.resolve(1L)).thenReturn(new PromptManager.PromptResolution(
+                com.review.gateway.model.enums.PromptBundleMode.REPO, List.of(), 10, false, List.of()));
+
+        reviewService.createReview(command("sha-1"));
+
+        verify(eventService, never()).record(any(), eq(EventType.PROMPT_DISABLED), any(), any(), anyString());
+        verify(eventService, never()).record(any(), eq(EventType.PROMPT_SECTION_MISSING), any(), any(), anyString());
     }
 
     @Test

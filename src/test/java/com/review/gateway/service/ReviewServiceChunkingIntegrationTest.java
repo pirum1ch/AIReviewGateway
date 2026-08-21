@@ -12,11 +12,13 @@ import com.review.gateway.repository.ReviewChunkRepository;
 import com.review.gateway.repository.ReviewCommentRepository;
 import com.review.gateway.repository.ReviewInputRepository;
 import com.review.gateway.repository.ReviewJobRepository;
+import com.review.gateway.repository.ReviewPromptSectionRepository;
 import com.review.gateway.repository.ReviewRepository;
 import com.review.gateway.service.dto.CreateReviewCommand;
 import com.review.gateway.service.dto.CreateReviewResult;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.mockito.Mockito;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.annotation.Propagation;
@@ -51,6 +53,8 @@ class ReviewServiceChunkingIntegrationTest extends AbstractPostgresIntegrationTe
     @Autowired
     private ReviewCommentRepository reviewCommentRepository;
     @Autowired
+    private ReviewPromptSectionRepository reviewPromptSectionRepository;
+    @Autowired
     private com.review.gateway.repository.ReviewEventRepository reviewEventRepository;
     @Autowired
     private jakarta.persistence.EntityManager entityManager;
@@ -63,20 +67,33 @@ class ReviewServiceChunkingIntegrationTest extends AbstractPostgresIntegrationTe
     }
 
     private ReviewService newReviewService(GatewayProperties properties) {
-        EventService eventService = new EventService(reviewEventRepository);
+        EventService eventService = new EventService(reviewEventRepository, new TextSanitizer());
         StateMachine stateMachine = new StateMachine(eventService);
         JobStateMachine jobStateMachine = new JobStateMachine(eventService);
         DeduplicationService deduplicationService = new DeduplicationService(reviewRepository);
         DiffSizeValidator diffSizeValidator = new DiffSizeValidator(properties);
-        ChunkContextRenderer chunkContextRenderer = new ChunkContextRenderer(properties);
+        ChunkContextRenderer chunkContextRenderer = new ChunkContextRenderer(properties, new TextSanitizer());
         DiffChunker diffChunker = new DiffChunker(properties, diffSizeValidator, chunkContextRenderer);
+        // Prompt Manager disabled in these pre-existing chunking tests (smallBudgetProperties() below)
+        // -- PromptManager.resolve short-circuits to PromptResolution.none() without ever touching
+        // gitLabClient, so a never-stubbed mock is safe here.
+        PromptManager promptManager = new PromptManager(properties, Mockito.mock(GitLabClient.class),
+                new PromptSourceResolver(properties), new PromptAssembler(properties, diffSizeValidator),
+                new TextSanitizer());
         return new ReviewService(reviewRepository, reviewInputRepository, reviewChunkRepository,
-                reviewJobRepository, reviewCommentRepository, deduplicationService, diffSizeValidator,
-                diffChunker, chunkContextRenderer, stateMachine, jobStateMachine, entityManager, transactionManager);
+                reviewJobRepository, reviewCommentRepository, reviewPromptSectionRepository, deduplicationService,
+                diffSizeValidator, diffChunker, chunkContextRenderer, promptManager, eventService, stateMachine,
+                jobStateMachine, entityManager, transactionManager);
     }
 
     private GatewayProperties smallBudgetProperties() {
         GatewayProperties properties = new GatewayProperties();
+        properties.getPrompt().setEnabled(false);
+        // Prompt Manager is disabled above (systemPromptTokens is always 0 here), but
+        // DiffSizeValidator.assertPromptFits still checks the resulting budget against the configured
+        // min-diff-budget-tokens floor (default 1000) regardless -- lower it to match this test's
+        // deliberately tiny max-diff-tokens budget below, which exists purely to exercise chunking.
+        properties.getPrompt().getLimits().setMinDiffBudgetTokens(0);
         properties.getDiff().setContextWindow(1_000_000);
         properties.getDiff().setPromptReserve(0);
         properties.getDiff().setAnswerReserve(0);

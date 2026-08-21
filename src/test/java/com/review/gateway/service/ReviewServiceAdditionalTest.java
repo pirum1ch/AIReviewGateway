@@ -7,6 +7,7 @@ import com.review.gateway.repository.ReviewChunkRepository;
 import com.review.gateway.repository.ReviewCommentRepository;
 import com.review.gateway.repository.ReviewInputRepository;
 import com.review.gateway.repository.ReviewJobRepository;
+import com.review.gateway.repository.ReviewPromptSectionRepository;
 import com.review.gateway.repository.ReviewRepository;
 import jakarta.persistence.EntityManager;
 import jakarta.persistence.Query;
@@ -44,10 +45,13 @@ class ReviewServiceAdditionalTest {
     private ReviewChunkRepository reviewChunkRepository;
     private ReviewJobRepository reviewJobRepository;
     private ReviewCommentRepository reviewCommentRepository;
+    private ReviewPromptSectionRepository reviewPromptSectionRepository;
     private DeduplicationService deduplicationService;
     private DiffSizeValidator diffSizeValidator;
     private DiffChunker diffChunker;
     private ChunkContextRenderer chunkContextRenderer;
+    private PromptManager promptManager;
+    private EventService eventService;
     private StateMachine stateMachine;
     private JobStateMachine jobStateMachine;
     private EntityManager entityManager;
@@ -61,10 +65,13 @@ class ReviewServiceAdditionalTest {
         reviewChunkRepository = Mockito.mock(ReviewChunkRepository.class);
         reviewJobRepository = Mockito.mock(ReviewJobRepository.class);
         reviewCommentRepository = Mockito.mock(ReviewCommentRepository.class);
+        reviewPromptSectionRepository = Mockito.mock(ReviewPromptSectionRepository.class);
         deduplicationService = Mockito.mock(DeduplicationService.class);
         diffSizeValidator = Mockito.mock(DiffSizeValidator.class);
         diffChunker = Mockito.mock(DiffChunker.class);
         chunkContextRenderer = Mockito.mock(ChunkContextRenderer.class);
+        promptManager = Mockito.mock(PromptManager.class);
+        eventService = Mockito.mock(EventService.class);
         stateMachine = Mockito.mock(StateMachine.class);
         jobStateMachine = Mockito.mock(JobStateMachine.class);
         transactionManager = Mockito.mock(PlatformTransactionManager.class);
@@ -80,8 +87,9 @@ class ReviewServiceAdditionalTest {
         when(transactionManager.getTransaction(any(TransactionDefinition.class))).thenReturn(fakeStatus);
 
         reviewService = new ReviewService(reviewRepository, reviewInputRepository, reviewChunkRepository,
-                reviewJobRepository, reviewCommentRepository, deduplicationService, diffSizeValidator,
-                diffChunker, chunkContextRenderer, stateMachine, jobStateMachine, entityManager, transactionManager);
+                reviewJobRepository, reviewCommentRepository, reviewPromptSectionRepository, deduplicationService,
+                diffSizeValidator, diffChunker, chunkContextRenderer, promptManager, eventService, stateMachine,
+                jobStateMachine, entityManager, transactionManager);
     }
 
     @ParameterizedTest

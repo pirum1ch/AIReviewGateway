@@ -3,6 +3,7 @@ package com.review.worker.gateway;
 import com.review.worker.error.GatewayUnavailableException;
 import com.review.worker.gateway.dto.ClaimRequest;
 import com.review.worker.gateway.dto.ClaimResponse;
+import com.review.worker.gateway.dto.FailRequest;
 import com.review.worker.gateway.dto.HeartbeatRequest;
 import com.review.worker.gateway.dto.HeartbeatResponse;
 import com.review.worker.gateway.dto.ResultRequest;
@@ -47,7 +48,13 @@ public class GatewayClient {
                     .body(new ClaimRequest(backendId, workerId))
                     .retrieve()
                     .body(ClaimResponse.class);
-            log.info("Claimed job (jobId={})", response == null ? "none" : response.jobId());
+            // WOC-01/WOC-06: INFO only on an actual claim; the far more frequent empty (204) case drops
+            // to DEBUG so a busy Worker isn't drowned out by an idle one polling every few seconds.
+            if (response != null) {
+                log.info("Claimed job (jobId={}, reviewId={})", response.jobId(), response.reviewId());
+            } else {
+                log.debug("Claim poll: no job available");
+            }
             return Optional.ofNullable(response);
         } catch (RestClientResponseException e) {
             throw mapServerError("claim", e);
@@ -112,6 +119,31 @@ public class GatewayClient {
             throw mapServerError("submitResult", e);
         } catch (ResourceAccessException e) {
             throw new GatewayUnavailableException("Gateway unreachable while submitting result (jobId=" + jobId + ")", e);
+        }
+    }
+
+    /**
+     * {@code POST /jobs/{id}/fail} (architecture §5, WOC-35): single best-effort attempt, no retry/
+     * backoff of its own — the caller ({@code WorkerLoop}) is expected to catch {@link
+     * GatewayUnavailableException}, log a WARN, count it, and move on. A non-2xx/unreachable outcome
+     * (including a {@code 404} from an older Gateway build that has no such endpoint) is exactly as safe
+     * to swallow as any other: this endpoint is a pure latency optimization and the Gateway's own
+     * stale-heartbeat sweep is the correctness backstop (WOC-36).
+     *
+     * @throws GatewayUnavailableException on any non-2xx response or a connection failure.
+     */
+    public void reportFailure(long jobId, FailRequest request) {
+        try {
+            gatewayRestClient.post()
+                    .uri("/jobs/{id}/fail", jobId)
+                    .body(request)
+                    .retrieve()
+                    .toBodilessEntity();
+            log.info("Failure reported (jobId={}, reason={})", jobId, request.reason());
+        } catch (RestClientResponseException e) {
+            throw mapServerError("reportFailure", e);
+        } catch (ResourceAccessException e) {
+            throw new GatewayUnavailableException("Gateway unreachable while reporting failure (jobId=" + jobId + ")", e);
         }
     }
 

@@ -29,6 +29,7 @@ illustrative hostnames chosen for this runbook, not values baked into the code.
 7. [Step 5: GitLab integration](#7-step-5-gitlab-integration)
 8. [Step 6: End-to-end smoke test](#8-step-6-end-to-end-smoke-test)
    - [8a. Upgrading to V2 (diff chunking)](#8a-upgrading-to-v2-diff-chunking)
+   - [8b. Upgrading to V4 (Worker Observability & Claim Latency)](#8b-upgrading-to-v4-worker-observability--claim-latency)
 9. [Operations quick reference](#9-operations-quick-reference)
 10. [Config file appendix](#10-config-file-appendix)
 11. [Docker deployment (verified, both images)](#11-docker-deployment-verified-both-images)
@@ -155,6 +156,41 @@ the token is issued in GitLab, not something the application enforces.
 call, and the Gateway compares it against its single configured `WORKER_TOKEN`). Copy the value out-of-band
 (a secrets manager, or manually) when provisioning each Worker host.
 
+**Prompt Manager (V3): a fifth secret, `GITLAB_PROMPT_TOKEN`, only if you opt in.** Repo-sourced
+corporate/project system prompts are **off by default** (`gateway.prompt.enabled` defaults to
+`${PROMPT_MANAGER_ENABLED:false}` — see `gateway.prompt.*` in [§10](#10-config-file-appendix)); a
+stock or freshly-upgraded Gateway boots with today's Worker-JAR-only behavior and never requires this
+token. This is a deliberate safe-by-default choice recorded in
+`docs/security/feature-prompt-manager-sast-report.md` (F-PM-02): the alternative (defaulting to
+`true`) would mean every existing deployment fails to restart on upgrade until this whole section is
+carried out, and the realistic operator response to an un-bootable Gateway — hard-coding the
+kill-switch off in `application.yml` — would durably disable the control by accident instead of by a
+deliberate decision (`GatewayProperties.validateOnStartup()`/`validatePromptOnStartup()`).
+
+To opt in, set `PROMPT_MANAGER_ENABLED=true` and provision:
+
+- `GITLAB_PROMPT_TOKEN` — a **separate, read-only** GitLab project/group access token
+  (`read_api`/`read_repository` scope — never `api`/write), used exclusively for the three Prompt
+  Manager reads (`GitLabClientImpl.resolveCommitSha`/`fetchRawFile`/`resolveDefaultBranch`) via the
+  dedicated `gitLabPromptRestClient` bean — the write-scoped `GITLAB_TOKEN` above is never sent on a
+  read call and vice versa (PMR-15). For the corporate prompt repo specifically, issue a **project
+  access token scoped to that one project**; for project reads, prefer a **group access token with
+  `read_repository` only** over an `api`-scoped personal token. Like `GITLAB_TOKEN`, this is checked
+  only for presence (not the 32-character floor), for the same reason — it is GitLab's own fixed token
+  format, not an operator-chosen secret.
+- `PROMPT_CORPORATE_PROJECT` — the numeric id or `group/project` path of the corporate prompt repo
+  (mandatory once enabled; `gateway.prompt.corporate.project` has no default and startup fails without
+  it). `PROMPT_CORPORATE_REF` (default `main`), `PROMPT_CORPORATE_BASE_PROMPT_PATH` (default
+  `prompts/base-system-prompt.md`) and `PROMPT_CORPORATE_REVIEW_RULES_PATH` (default
+  `prompts/review-rules.md`) are optional overrides of the corporate source paths.
+- `PROMPT_ON_ERROR` (default `FAIL`) — set to `SKIP_OPTIONAL` to let an unusable/oversized *optional*
+  `PROJECT_*` section degrade the Review rather than block `POST /reviews`; corporate sections are
+  always `FAIL`, not configurable.
+
+With the kill-switch at its default (`false`), `GatewayProperties.validateOnStartup()` skips all
+`gateway.prompt.*` validation, including `GITLAB_PROMPT_TOKEN`'s presence check, and behavior is
+byte-identical to pre-V3.
+
 ## 3. Step 1: PostgreSQL
 
 ```bash
@@ -181,6 +217,11 @@ first successful connection it automatically applies `V1__initial_schema.sql`, w
 `spring.jpa.hibernate.ddl-auto: validate` means Hibernate never generates DDL of its own — the schema is
 exclusively Flyway-owned; nothing further to run by hand beyond granting the role above access.
 
+**Worker Observability & Claim Latency (V4):** `V4__worker_failure_reporting_and_backend_health.sql` adds
+two additive, nullable columns — `backends.probe_failed_since` and `review_jobs.not_before` — no new
+table, no grant change (the role above already has `UPDATE` on both tables). See
+[§8b](#8b-upgrading-to-v4-worker-observability--claim-latency) before deploying it against a live system.
+
 **Grants** (per the SAST report's recommendation, root [README §4.3](README.md#43-deployment-must-dos-from-docssecurityfeature-03-sast-reportmd)
 item 4 — restrict `review_events` to append-only so the audit trail cannot be silently rewritten):
 
@@ -189,6 +230,9 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON
     reviews, review_inputs, backends, review_jobs, review_results, review_comments
     TO review_gateway;
 GRANT SELECT, INSERT ON review_events TO review_gateway;   -- no UPDATE/DELETE
+-- Prompt Manager (V3, PMR-07): same append-only contract as review_events -- the resolved sections
+-- are an immutable audit/provenance record, never rewritten after insert.
+GRANT SELECT, INSERT ON review_prompt_sections TO review_gateway;   -- no UPDATE/DELETE
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO review_gateway;
 ```
 
@@ -243,11 +287,18 @@ GITLAB_TOKEN=<GitLab project/group access token, api scope>
 # permissive ".*" default to the actual llama-server network. The Gateway only
 # reaches this host for health probes (GET {url}/health), never for inference. ---
 BACKEND_ALLOWED_HOST_PATTERN=^192\.168\.1\.101$
+
+# --- Prompt Manager (V3, optional -- omit entirely to stay on today's Worker-JAR-only prompts) ---
+# PROMPT_MANAGER_ENABLED=true
+# GITLAB_PROMPT_TOKEN=<separate, read-only GitLab token -- see §2>
+# PROMPT_CORPORATE_PROJECT=group/ai-review-prompts
 ```
 
 `GatewayProperties.validateOnStartup()` will refuse to start if any of the four secrets above is missing,
 if `CI_TOKEN`/`WORKER_TOKEN`/`ADMIN_TOKEN` is under 32 characters, or if `GITLAB_BASE_URL` doesn't start
 with `https://`. `GITLAB_TOKEN` itself is not length-checked — see [§2, Token generation](#2-prerequisites).
+The three commented-out `PROMPT_*` lines are optional: Prompt Manager defaults to disabled
+(`PROMPT_MANAGER_ENABLED` defaults to `false`), so the stock env file above boots without them.
 
 ### 4.2 systemd unit
 
@@ -661,6 +712,47 @@ anything is actually wrong.
   uninterrupted (it is ordinary transactional DDL/DML, no `CREATE INDEX CONCURRENTLY`, so it runs inside
   one Flyway transaction and will cleanly roll back if interrupted before commit).
 
+## 8b. Upgrading to V4 (Worker Observability & Claim Latency)
+
+`V4__worker_failure_reporting_and_backend_health.sql` adds two additive, nullable columns —
+`backends.probe_failed_since` and `review_jobs.not_before` — with no backfill and no constraint change.
+Unlike V2, this migration is **rollback-tolerant**: an older JAR simply ignores both columns and degrades
+to today's (pre-V4) behavior.
+
+### Rollback tolerance (unlike V2)
+
+- An older Gateway JAR ignoring `not_before` claims a requeued job **immediately** — exactly today's
+  behavior, safe.
+- An older Gateway JAR ignoring `probe_failed_since` demotes a backend on a **single** failed probe —
+  exactly today's behavior, safe.
+- Neither can double-execute a job the way a V2 rollback could (§8a) — `review_jobs.id`/`status` semantics
+  are completely unchanged by V4; it only adds two columns nothing pre-V4 code reads or writes.
+
+### Deployment notes
+
+- `ALTER TABLE review_jobs ADD COLUMN not_before ...` still takes an `ACCESS EXCLUSIVE` lock on the queue
+  table for the (metadata-only, sub-second) duration of the `ALTER`. The migration sets an explicit
+  `lock_timeout` so a stuck `ALTER` fails fast instead of silently blocking every claim behind it. In
+  practice this runs at Gateway startup while the Gateway is the only writer and is momentarily down; the
+  Worker fleet is **not** down (by design — `RUNNING` jobs survive Gateway restarts) and simply sees `204`
+  responses until the new Gateway is up.
+- **New required arithmetic at startup:** `gateway.retry.requeue-delay × (gateway.retry.max-attempts − 1)`
+  must be `≥ gateway.backend.failure-grace`, or the Gateway refuses to start (see root
+  [README §4.2](README.md#42-everything-else-has-a-working-default)). The shipped defaults
+  (`requeue-delay=90s`, `max-attempts=3`, `failure-grace=180s`) already satisfy this; only a concern if you
+  override any of the three.
+- **New env var:** `WORKER_IDLE_SUMMARY_INTERVAL_SEC` (Worker module, default `300`) — purely additive,
+  optional, no migration/coordination needed with the Gateway.
+- No grant changes (§3) and no new table — the existing `review_gateway` role already has `UPDATE` on both
+  `backends` and `review_jobs`.
+
+### What NOT to do
+
+- Do not set `gateway.retry.requeue-delay: 0` or `gateway.backend.failure-grace: 0` **individually** —
+  they are a paired escape hatch (both-or-neither) back to pre-V4 behavior; setting only one fails startup.
+- Do not manually edit `review_jobs.not_before`/`backends.probe_failed_since` outside the application —
+  both are written exclusively by `RetryManager`/`BackendHealthChecker` under their own lock discipline.
+
 ## 9. Operations quick reference
 
 | Task | How |
@@ -690,6 +782,11 @@ GITLAB_BASE_URL=https://gitlab.local/api/v4
 GITLAB_TOKEN=<GitLab project/group access token, api scope, Developer+ role>
 
 BACKEND_ALLOWED_HOST_PATTERN=^192\.168\.1\.101$
+
+# Prompt Manager (V3, optional -- defaults to disabled; uncomment all three to opt in, see §2)
+# PROMPT_MANAGER_ENABLED=true
+# GITLAB_PROMPT_TOKEN=<separate, read-only GitLab project/group access token, read_api/read_repository scope>
+# PROMPT_CORPORATE_PROJECT=<numeric project id or "group/project" path -- never a URL>
 ```
 
 ### 10.2 Gateway systemd unit (`/etc/systemd/system/review-gateway.service`)

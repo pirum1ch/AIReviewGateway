@@ -15,6 +15,7 @@ import com.review.gateway.repository.ReviewCommentRepository;
 import com.review.gateway.repository.ReviewEventRepository;
 import com.review.gateway.repository.ReviewInputRepository;
 import com.review.gateway.repository.ReviewJobRepository;
+import com.review.gateway.repository.ReviewPromptSectionRepository;
 import com.review.gateway.repository.ReviewRepository;
 import com.review.gateway.service.dto.ClaimedJob;
 import jakarta.persistence.EntityManager;
@@ -57,6 +58,8 @@ class QueueManagerPriorityOrderingIntegrationTest extends AbstractPostgresIntegr
     @Autowired
     private ReviewEventRepository reviewEventRepository;
     @Autowired
+    private ReviewPromptSectionRepository reviewPromptSectionRepository;
+    @Autowired
     private EntityManager entityManager;
     @Autowired
     private PlatformTransactionManager transactionManager;
@@ -68,18 +71,22 @@ class QueueManagerPriorityOrderingIntegrationTest extends AbstractPostgresIntegr
     }
 
     private QueueManager newQueueManager() {
-        EventService eventService = new EventService(reviewEventRepository);
+        EventService eventService = new EventService(reviewEventRepository, new TextSanitizer());
         StateMachine stateMachine = new StateMachine(eventService);
         JobStateMachine jobStateMachine = new JobStateMachine(eventService);
-        BackendDispatcher backendDispatcher = new BackendDispatcher(backendRepository, reviewJobRepository);
         GatewayProperties properties = new GatewayProperties();
+        BackendDispatcher backendDispatcher = new BackendDispatcher(backendRepository, reviewJobRepository, properties);
         ChunkCoordinator chunkCoordinator = new ChunkCoordinator(reviewRepository, reviewJobRepository,
                 reviewChunkRepository, reviewCommentRepository, stateMachine, jobStateMachine, properties,
                 entityManager, transactionManager);
-        ChunkContextRenderer chunkContextRenderer = new ChunkContextRenderer(properties);
-        return new QueueManager(reviewRepository, reviewJobRepository, reviewChunkRepository, backendDispatcher,
-                jobStateMachine, chunkCoordinator, eventService, Mockito.mock(ResultProcessor.class),
-                chunkContextRenderer, entityManager, transactionManager);
+        ChunkContextRenderer chunkContextRenderer = new ChunkContextRenderer(properties, new TextSanitizer());
+        PromptMessageFormatter promptMessageFormatter = new PromptMessageFormatter(properties, new PromptAssembler(properties, new DiffSizeValidator(properties)));
+        RetryManager retryManager = new RetryManager(reviewJobRepository, jobStateMachine, chunkCoordinator,
+                properties, new TextSanitizer(), entityManager, transactionManager);
+        return new QueueManager(reviewRepository, reviewJobRepository, reviewChunkRepository,
+                reviewPromptSectionRepository, backendDispatcher, jobStateMachine, chunkCoordinator, eventService,
+                Mockito.mock(ResultProcessor.class), chunkContextRenderer, promptMessageFormatter, retryManager,
+                new TextSanitizer(), new MetricsCounters(), entityManager, transactionManager);
     }
 
     private Review persistQueuedReview(long mrId, String headSha, int priority, Instant createdAt) {

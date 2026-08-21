@@ -14,5 +14,11 @@ public enum EventType {
     PUBLISHED,
     FAILED,
     OBSOLETE,
-    CANCELLED
+    CANCELLED,
+    /** Prompt Manager (V3, PMR-10): recorded on every Review created while {@code gateway.prompt.enabled=false}. */
+    PROMPT_DISABLED,
+    /** Prompt Manager (V3, PMR-11): a 404 on an explicitly-configured override path. */
+    PROMPT_SECTION_MISSING,
+    /** Prompt Manager (V3, PMR-09): claim-time fail-closed -- mode=REPO but zero CORPORATE_* rows found. */
+    PROMPT_SECTIONS_MISSING
 }

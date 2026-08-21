@@ -5,6 +5,11 @@ import com.review.gateway.exception.DiffTooLargeException;
 import com.review.gateway.exception.IncompatiblePromptVersionException;
 import com.review.gateway.exception.InvalidStateTransitionException;
 import com.review.gateway.exception.JobNotClaimableException;
+import com.review.gateway.exception.PromptResolutionSaturatedException;
+import com.review.gateway.exception.PromptSourceInvalidException;
+import com.review.gateway.exception.PromptSourceMissingException;
+import com.review.gateway.exception.PromptSourceUnavailableException;
+import com.review.gateway.exception.PromptTooLargeException;
 import com.review.gateway.exception.ReviewNotFoundException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -61,6 +66,44 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ErrorResponse> handleIncompatiblePromptVersion(IncompatiblePromptVersionException ex) {
         return ResponseEntity.status(HttpStatus.UNPROCESSABLE_ENTITY)
                 .body(new ErrorResponse("PROMPT_VERSION_INCOMPATIBLE_WITH_CHUNKING", ex.getMessage()));
+    }
+
+    /**
+     * PMR-26: deliberately coarse and undifferentiated — the response body never distinguishes "project
+     * not found" / "no access" / "MR not found" / "bad ref" (those would form a cross-project existence
+     * oracle under the shared CI token, PMT-08). The full reason is logged server-side by the throwing
+     * code and recorded in {@code review_events}; only a fixed, generic message reaches the caller here.
+     */
+    @ExceptionHandler(PromptSourceUnavailableException.class)
+    public ResponseEntity<ErrorResponse> handlePromptSourceUnavailable(PromptSourceUnavailableException ex) {
+        log.warn("Prompt source resolution failed: {}", ex.getMessage());
+        return ResponseEntity.status(HttpStatus.BAD_GATEWAY)
+                .body(new ErrorResponse("PROMPT_RESOLUTION_FAILED", "Failed to resolve one or more prompt sources"));
+    }
+
+    @ExceptionHandler(PromptSourceMissingException.class)
+    public ResponseEntity<ErrorResponse> handlePromptSourceMissing(PromptSourceMissingException ex) {
+        return ResponseEntity.status(HttpStatus.UNPROCESSABLE_ENTITY)
+                .body(new ErrorResponse("PROMPT_SOURCE_MISSING", ex.getMessage()));
+    }
+
+    @ExceptionHandler(PromptSourceInvalidException.class)
+    public ResponseEntity<ErrorResponse> handlePromptSourceInvalid(PromptSourceInvalidException ex) {
+        return ResponseEntity.status(HttpStatus.UNPROCESSABLE_ENTITY)
+                .body(new ErrorResponse("PROMPT_SOURCE_INVALID", ex.getMessage()));
+    }
+
+    @ExceptionHandler(PromptTooLargeException.class)
+    public ResponseEntity<ErrorResponse> handlePromptTooLarge(PromptTooLargeException ex) {
+        return ResponseEntity.status(HttpStatus.UNPROCESSABLE_ENTITY)
+                .body(new ErrorResponse("PROMPT_TOO_LARGE", ex.getMessage()));
+    }
+
+    /** PMR-19: immediate 503, never a 500/hang — see {@code PromptManager}'s bounded concurrency permit. */
+    @ExceptionHandler(PromptResolutionSaturatedException.class)
+    public ResponseEntity<ErrorResponse> handlePromptResolutionSaturated(PromptResolutionSaturatedException ex) {
+        return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
+                .body(new ErrorResponse("PROMPT_RESOLUTION_SATURATED", "Too many concurrent prompt resolutions; retry shortly"));
     }
 
     /** Postgres SQLSTATE for a genuine detected deadlock (class {@code 40}, "transaction rollback"). */

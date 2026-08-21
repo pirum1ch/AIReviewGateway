@@ -52,9 +52,14 @@ public class HeartbeatScheduler {
             return thread;
         });
         AtomicInteger consecutiveFailures = new AtomicInteger();
+        // WOC-02: process-local logging state, scoped to this one job's heartbeat cadence -- created
+        // here (alongside consecutiveFailures) so the public start/stop signature does not change and no
+        // caller is touched.
+        long startedAtMillis = System.currentTimeMillis();
+        AtomicInteger tickCount = new AtomicInteger();
         long intervalSec = properties.getHeartbeat().getIntervalSec();
         ScheduledFuture<?> ignored = executor.scheduleAtFixedRate(
-                () -> tick(jobId, workerId, abortSignal, consecutiveFailures),
+                () -> tick(jobId, workerId, abortSignal, consecutiveFailures, startedAtMillis, tickCount),
                 intervalSec, intervalSec, TimeUnit.SECONDS);
     }
 
@@ -67,13 +72,21 @@ public class HeartbeatScheduler {
     }
 
     /** Package-private so unit tests can exercise one tick synchronously, without waiting on a real schedule. */
-    void tick(long jobId, String workerId, AbortSignal abortSignal, AtomicInteger consecutiveFailures) {
+    void tick(long jobId, String workerId, AbortSignal abortSignal, AtomicInteger consecutiveFailures,
+              long startedAtMillis, AtomicInteger tickCount) {
         try {
             HeartbeatOutcome outcome = gatewayClient.heartbeat(jobId, workerId);
             consecutiveFailures.set(0);
             switch (outcome.status()) {
                 case ACCEPTED -> {
-                    if (!outcome.shouldContinue()) {
+                    if (outcome.shouldContinue()) {
+                        // WOC-02: the normal-case, once-a-minute "still alive and working" signal that
+                        // was previously silent for up to request-timeout-sec (1800s) of a busy Worker.
+                        int ticks = tickCount.incrementAndGet();
+                        long elapsedSec = (System.currentTimeMillis() - startedAtMillis) / 1000L;
+                        log.info("Job in progress (jobId={}, workerId={}, elapsedSec={}, heartbeats={})",
+                                jobId, workerId, elapsedSec, ticks);
+                    } else {
                         log.info("Gateway requested this job stop (jobId={})", jobId);
                         abortSignal.abort();
                     }

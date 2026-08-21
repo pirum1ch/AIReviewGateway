@@ -40,11 +40,20 @@ public interface ReviewJobRepository extends JpaRepository<ReviewJob, Long> {
      * {@code review_jobs} only — CSR-17: the parent {@code reviews} row is deliberately NOT locked
      * here; ownership afterward is enforced by {@code RUNNING} status + heartbeat, and the parent's
      * derived status is applied by {@code ChunkCoordinator} in a separate, independent transaction.
+     *
+     * <p><b>WOC-41 (Worker Observability &amp; Claim Latency):</b> additionally requires {@code
+     * not_before IS NULL OR not_before <= now()} — {@code NULL}-tolerant (an older row, or a Review
+     * created before this column existed, is claimable immediately, exactly as today) and compared
+     * against the <b>database</b> clock (never the application's — WOT-08), same predicate used to write
+     * it in {@code RetryManager}. Additive filter on an already-partial index
+     * ({@code ix_review_jobs_queue}, {@code status='QUEUED'}); at this project's scale (tens of rows) no
+     * index change is warranted.
      */
     @Query(value = """
             SELECT j.id
             FROM review_jobs j
             WHERE j.status = 'QUEUED'
+              AND (j.not_before IS NULL OR j.not_before <= now())
             ORDER BY j.priority DESC, j.created_at ASC, j.chunk_index ASC
             FOR UPDATE SKIP LOCKED
             LIMIT 1
@@ -111,6 +120,45 @@ public interface ReviewJobRepository extends JpaRepository<ReviewJob, Long> {
               AND j.status IN (com.review.gateway.model.enums.JobStatus.QUEUED, com.review.gateway.model.enums.JobStatus.RUNNING)
             """)
     List<ReviewJob> findNonTerminalJobs(@Param("reviewId") Long reviewId);
+
+    /**
+     * WOC-13/WOR-10: whether the given backend has at least one currently-{@code RUNNING} job whose
+     * heartbeat is still fresh (within {@code gateway.heartbeat.timeout}) — the "at capacity with a live
+     * job" half of the at-capacity demotion deferral.
+     */
+    @Query(value = """
+            SELECT EXISTS (
+                SELECT 1 FROM review_jobs j
+                WHERE j.backend_id = :backendId AND j.status = 'RUNNING' AND j.heartbeat_at > :cutoff
+            )
+            """, nativeQuery = true)
+    boolean existsFreshRunningJobForBackend(@Param("backendId") Long backendId, @Param("cutoff") Instant cutoff);
+
+    /**
+     * WOC-18/WOR-11: number of jobs currently {@code QUEUED} — used by the backend-health pass to decide
+     * whether the "queue stalled, 0 eligible ACTIVE backend(s)" WARN should fire.
+     */
+    @Query(value = "SELECT count(*) FROM review_jobs j WHERE j.status = 'QUEUED'", nativeQuery = true)
+    long countQueuedJobs();
+
+    /**
+     * WOR-15(a): number of {@code QUEUED} jobs whose {@code not_before} has been in the past for longer
+     * than {@code gateway.job.max-duration} — i.e. {@code not_before < :cutoff} where
+     * {@code cutoff = now() - gateway.job.max-duration}. A {@code NULL not_before} is immediately
+     * claimable and never stuck by this definition, so it is excluded. Distinct from
+     * {@code countQueuedJobs()}/WOC-18 (which fires only when there is no eligible {@code ACTIVE}
+     * backend at all): this covers the case where backends are healthy but a job is nonetheless
+     * permanently parked in {@code QUEUED} — e.g. a {@code not_before} far in the future from clock
+     * skew, a misconfigured {@code requeue-delay}, or a bug — a scenario nothing else sweeps (WOT-08).
+     */
+    @Query(value = """
+            SELECT count(*)
+            FROM review_jobs j
+            WHERE j.status = 'QUEUED'
+              AND j.not_before IS NOT NULL
+              AND j.not_before < :cutoff
+            """, nativeQuery = true)
+    long countStuckQueuedJobs(@Param("cutoff") Instant cutoff);
 
     /**
      * Average time (ms) a job waits in {@code QUEUED} before being claimed, over every job that has

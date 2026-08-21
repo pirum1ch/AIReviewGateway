@@ -196,4 +196,154 @@ class ReviewJobRepositoryTest extends AbstractPostgresIntegrationTest {
 
         assertThat(reviewJobRepository.countRunningJobsForBackend(backend.getId())).isEqualTo(1);
     }
+
+    // =================================================================================================
+    // Worker Observability & Claim Latency: WOC-41 (not_before claim predicate), WOC-13 (fresh-heartbeat
+    // existence check), WOC-18 (queued-job count)
+    // =================================================================================================
+
+    @Test
+    void findNextQueuedJobIdForUpdateSkipsAJobWhoseNotBeforeIsInTheFuture() {
+        Backend backend = persistBackend("backend-not-before-future");
+        Review review = persistReview(5L, 40L, "sha-not-before-future");
+        ReviewJob job = jobWithStatus(review, backend, null, JobStatus.QUEUED);
+        job.setNotBefore(Instant.now().plus(1, ChronoUnit.HOURS));
+        entityManager.persistAndFlush(job);
+
+        Optional<Long> claimable = reviewJobRepository.findNextQueuedJobIdForUpdate();
+
+        assertThat(claimable).isEmpty();
+    }
+
+    @Test
+    void findNextQueuedJobIdForUpdateClaimsAJobWhoseNotBeforeHasElapsed() {
+        Backend backend = persistBackend("backend-not-before-past");
+        Review review = persistReview(5L, 41L, "sha-not-before-past");
+        ReviewJob job = jobWithStatus(review, backend, null, JobStatus.QUEUED);
+        job.setNotBefore(Instant.now().minus(1, ChronoUnit.MINUTES));
+        ReviewJob saved = entityManager.persistFlushFind(job);
+
+        Optional<Long> claimable = reviewJobRepository.findNextQueuedJobIdForUpdate();
+
+        assertThat(claimable).contains(saved.getId());
+    }
+
+    @Test
+    void findNextQueuedJobIdForUpdateTreatsNullNotBeforeAsImmediatelyClaimable() {
+        // Rollback tolerance / today's-behavior-preserved case: a job with no not_before at all (or a
+        // Gateway build predating this column) must remain claimable exactly as before.
+        Backend backend = persistBackend("backend-not-before-null");
+        Review review = persistReview(5L, 42L, "sha-not-before-null");
+        ReviewJob job = jobWithStatus(review, backend, null, JobStatus.QUEUED);
+        ReviewJob saved = entityManager.persistFlushFind(job);
+
+        Optional<Long> claimable = reviewJobRepository.findNextQueuedJobIdForUpdate();
+
+        assertThat(claimable).contains(saved.getId());
+    }
+
+    @Test
+    void existsFreshRunningJobForBackendIsTrueOnlyWithinTheHeartbeatWindow() {
+        Backend backend = persistBackend("backend-fresh-heartbeat");
+        Review review = persistReview(6L, 50L, "sha-fresh-heartbeat");
+        ReviewJob job = jobWithStatus(review, backend, "worker-1", JobStatus.RUNNING);
+        job.setHeartbeatAt(Instant.now());
+        entityManager.persistAndFlush(job);
+
+        Instant cutoff = Instant.now().minus(3, ChronoUnit.MINUTES);
+        assertThat(reviewJobRepository.existsFreshRunningJobForBackend(backend.getId(), cutoff)).isTrue();
+
+        Instant futureCutoff = Instant.now().plus(1, ChronoUnit.MINUTES);
+        assertThat(reviewJobRepository.existsFreshRunningJobForBackend(backend.getId(), futureCutoff)).isFalse();
+    }
+
+    @Test
+    void existsFreshRunningJobForBackendIsFalseWhenNoJobsAreRunning() {
+        Backend backend = persistBackend("backend-no-running-jobs");
+        Instant cutoff = Instant.now().minus(3, ChronoUnit.MINUTES);
+
+        assertThat(reviewJobRepository.existsFreshRunningJobForBackend(backend.getId(), cutoff)).isFalse();
+    }
+
+    @Test
+    void findNextQueuedJobIdForUpdateSkipsAFutureNotBeforeJobAndStillReturnsTheNextEligibleOneInPriorityOrder() {
+        // QA-added (T-3.7, second half): the architecture doc's own test guidance explicitly calls out
+        // that not_before must not disturb ordering among OTHER, unrelated QUEUED jobs -- i.e. a blocked
+        // job must be transparently skipped, not just "the only job present is blocked" (already covered
+        // above). Three jobs, same priority: the highest-priority-and-oldest one is blocked by a future
+        // not_before and must be skipped entirely; the query must still return the next eligible job by
+        // the normal priority DESC, created_at ASC ordering, not fall through to something arbitrary.
+        Backend backend = persistBackend("backend-not-before-ordering");
+        Review reviewBlocked = persistReview(8L, 70L, "sha-ordering-blocked");
+        Review reviewEligibleOlder = persistReview(8L, 71L, "sha-ordering-eligible-older");
+        Review reviewEligibleNewer = persistReview(8L, 72L, "sha-ordering-eligible-newer");
+
+        // Highest priority, oldest -- would normally be first, but its not_before is in the future.
+        ReviewJob blocked = jobWithStatus(reviewBlocked, backend, null, JobStatus.QUEUED);
+        blocked.setPriority(10);
+        blocked.setNotBefore(Instant.now().plus(1, ChronoUnit.HOURS));
+        entityManager.persistAndFlush(blocked);
+
+        // Lower priority than the blocked job, but immediately claimable and older than its sibling below
+        // -- this is the one the query must actually return.
+        ReviewJob eligibleOlder = jobWithStatus(reviewEligibleOlder, backend, null, JobStatus.QUEUED);
+        eligibleOlder.setPriority(5);
+        ReviewJob eligibleOlderSaved = entityManager.persistFlushFind(eligibleOlder);
+
+        ReviewJob eligibleNewer = jobWithStatus(reviewEligibleNewer, backend, null, JobStatus.QUEUED);
+        eligibleNewer.setPriority(5);
+        entityManager.persistAndFlush(eligibleNewer);
+
+        Optional<Long> claimable = reviewJobRepository.findNextQueuedJobIdForUpdate();
+
+        assertThat(claimable)
+                .as("the future-not_before job must be skipped and normal priority/created_at ordering "
+                        + "must still govern which of the remaining eligible jobs is returned")
+                .contains(eligibleOlderSaved.getId());
+    }
+
+    @Test
+    void countQueuedJobsCountsOnlyQueuedStatus() {
+        Backend backend = persistBackend("backend-count-queued");
+        Review queued1 = persistReview(7L, 60L, "sha-queued-1");
+        entityManager.persistAndFlush(jobWithStatus(queued1, backend, null, JobStatus.QUEUED));
+        Review queued2 = persistReview(7L, 61L, "sha-queued-2");
+        entityManager.persistAndFlush(jobWithStatus(queued2, backend, null, JobStatus.QUEUED));
+        Review running = persistReview(7L, 62L, "sha-running-not-counted");
+        entityManager.persistAndFlush(jobWithStatus(running, backend, "worker-1", JobStatus.RUNNING));
+
+        assertThat(reviewJobRepository.countQueuedJobs()).isEqualTo(2L);
+    }
+
+    // WOR-15(a): countStuckQueuedJobs -- a QUEUED job whose not_before has been in the past for longer
+    // than gateway.job.max-duration (i.e. not_before < cutoff, cutoff = now() - max-duration).
+    @Test
+    void countStuckQueuedJobsCountsOnlyQueuedJobsWithNotBeforePastTheCutoff() {
+        Backend backend = persistBackend("backend-count-stuck-queued");
+        Instant cutoff = Instant.now().minus(45, ChronoUnit.MINUTES);
+
+        // Stuck: QUEUED, not_before well before the cutoff.
+        Review stuck = persistReview(8L, 70L, "sha-stuck");
+        ReviewJob stuckJob = jobWithStatus(stuck, backend, null, JobStatus.QUEUED);
+        stuckJob.setNotBefore(Instant.now().minus(50, ChronoUnit.MINUTES));
+        entityManager.persistAndFlush(stuckJob);
+
+        // Not stuck: QUEUED, not_before recent (after the cutoff) -- e.g. a normal requeue-delay wait.
+        Review recentlyRequeued = persistReview(8L, 71L, "sha-recently-requeued");
+        ReviewJob recentlyRequeuedJob = jobWithStatus(recentlyRequeued, backend, null, JobStatus.QUEUED);
+        recentlyRequeuedJob.setNotBefore(Instant.now().minus(1, ChronoUnit.MINUTES));
+        entityManager.persistAndFlush(recentlyRequeuedJob);
+
+        // Not stuck: QUEUED, not_before is NULL (immediately claimable, never "stuck" by this definition).
+        Review immediatelyClaimable = persistReview(8L, 72L, "sha-immediately-claimable");
+        entityManager.persistAndFlush(jobWithStatus(immediatelyClaimable, backend, null, JobStatus.QUEUED));
+
+        // Not stuck: RUNNING with a stale-looking not_before -- wrong status, must not be counted.
+        Review running = persistReview(8L, 73L, "sha-running-not-counted");
+        ReviewJob runningJob = jobWithStatus(running, backend, "worker-1", JobStatus.RUNNING);
+        runningJob.setNotBefore(Instant.now().minus(60, ChronoUnit.MINUTES));
+        entityManager.persistAndFlush(runningJob);
+
+        assertThat(reviewJobRepository.countStuckQueuedJobs(cutoff)).isEqualTo(1L);
+    }
 }

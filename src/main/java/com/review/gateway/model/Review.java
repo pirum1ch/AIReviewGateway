@@ -1,5 +1,6 @@
 package com.review.gateway.model;
 
+import com.review.gateway.model.enums.PromptBundleMode;
 import com.review.gateway.model.enums.ReviewStatus;
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
@@ -57,6 +58,18 @@ public class Review {
     @Column(name = "attempts", nullable = false)
     private Integer attempts;
 
+    /**
+     * Prompt Manager (V3, PMR-09): the mode this Review was created under. {@code NONE} (legacy/
+     * kill-switch-off) means claim-time assembly must fall back to the Worker's own template
+     * {@code system:} block ({@code systemMessages=null}); {@code REPO} means repo-sourced sections
+     * were resolved and persisted, and claim-time assembly must find at least the mandatory
+     * {@code CORPORATE_*} rows or fail the job loudly — never silently degrade to an empty/partial
+     * system prompt.
+     */
+    @Enumerated(EnumType.STRING)
+    @Column(name = "prompt_bundle_mode", nullable = false, length = 16)
+    private PromptBundleMode promptBundleMode;
+
     @Column(name = "created_at", nullable = false, updatable = false)
     private Instant createdAt;
 
@@ -69,6 +82,12 @@ public class Review {
 
     public Review(Long projectId, Long mergeRequestId, String headSha, String baseSha,
                   String promptVersion, Integer priority) {
+        this(projectId, mergeRequestId, headSha, baseSha, promptVersion, priority, PromptBundleMode.NONE);
+    }
+
+    /** Prompt Manager (V3) constructor: additionally records the {@link PromptBundleMode} this Review was created under. */
+    public Review(Long projectId, Long mergeRequestId, String headSha, String baseSha,
+                  String promptVersion, Integer priority, PromptBundleMode promptBundleMode) {
         this.projectId = Objects.requireNonNull(projectId, "projectId");
         this.mergeRequestId = Objects.requireNonNull(mergeRequestId, "mergeRequestId");
         this.headSha = Objects.requireNonNull(headSha, "headSha");
@@ -77,6 +96,7 @@ public class Review {
         this.priority = priority != null ? priority : 10;
         this.status = ReviewStatus.NEW;
         this.attempts = 0;
+        this.promptBundleMode = promptBundleMode != null ? promptBundleMode : PromptBundleMode.NONE;
     }
 
     @PrePersist
@@ -149,6 +169,10 @@ public class Review {
 
     public Instant getUpdatedAt() {
         return updatedAt;
+    }
+
+    public PromptBundleMode getPromptBundleMode() {
+        return promptBundleMode;
     }
 
     @Override

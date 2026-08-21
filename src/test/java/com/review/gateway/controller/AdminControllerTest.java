@@ -36,7 +36,7 @@ class AdminControllerTest {
     @Test
     void listBackendsRequiresAdmin() throws Exception {
         when(statisticsService.listBackends()).thenReturn(List.of(
-                new BackendSnapshot(1L, "mac-mini-1", "model-x", 2, BackendStatus.ACTIVE, 1L, Instant.now())));
+                new BackendSnapshot(1L, "mac-mini-1", "model-x", 2, BackendStatus.ACTIVE, 1L, Instant.now(), null)));
 
         mockMvc.perform(get("/backends").header("Authorization", "Bearer " + SecurityTestTokens.ADMIN_TOKEN))
                 .andExpect(status().isOk())
@@ -60,12 +60,17 @@ class AdminControllerTest {
     void metricsRequiresAdmin() throws Exception {
         Map<ReviewStatus, Long> byStatus = new EnumMap<>(ReviewStatus.class);
         byStatus.put(ReviewStatus.QUEUED, 3L);
-        when(statisticsService.computeMetrics()).thenReturn(new MetricsSnapshot(10, byStatus, 100.0, 200.0, 5, 1));
+        when(statisticsService.computeMetrics())
+                .thenReturn(new MetricsSnapshot(10, byStatus, 100.0, 200.0, 5, 1, 2, 1, Map.of(), 0));
 
         mockMvc.perform(get("/metrics").header("Authorization", "Bearer " + SecurityTestTokens.ADMIN_TOKEN))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.total").value(10))
-                .andExpect(jsonPath("$.byStatus.QUEUED").value(3));
+                .andExpect(jsonPath("$.byStatus.QUEUED").value(3))
+                .andExpect(jsonPath("$.promptDisabledCount").value(2))
+                .andExpect(jsonPath("$.promptSectionMissingCount").value(1))
+                // Prompt Manager kill-switch off in the shared test application.yml (PMR-10 premise).
+                .andExpect(jsonPath("$.promptManagerEnabled").value(false));
     }
 
     @Test

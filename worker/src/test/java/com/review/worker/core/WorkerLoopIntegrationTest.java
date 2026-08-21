@@ -126,10 +126,12 @@ class WorkerLoopIntegrationTest {
     private static final class GatewayDispatcher extends Dispatcher {
         private static final Pattern HEARTBEAT_PATH = Pattern.compile("^/jobs/\\d+/heartbeat$");
         private static final Pattern RESULT_PATH = Pattern.compile("^/jobs/\\d+/result$");
+        private static final Pattern FAIL_PATH = Pattern.compile("^/jobs/\\d+/fail$");
 
         private final Map<String, Queue<MockResponse>> queuesByExactPath = new ConcurrentHashMap<>();
         private final Queue<MockResponse> heartbeatQueue = new ConcurrentLinkedQueue<>();
         private final Queue<MockResponse> resultQueue = new ConcurrentLinkedQueue<>();
+        private final Queue<MockResponse> failQueue = new ConcurrentLinkedQueue<>();
 
         void enqueueClaim(MockResponse response) {
             queuesByExactPath.computeIfAbsent("/jobs/claim", k -> new ConcurrentLinkedQueue<>()).add(response);
@@ -141,6 +143,10 @@ class WorkerLoopIntegrationTest {
 
         void enqueueResult(MockResponse response) {
             resultQueue.add(response);
+        }
+
+        void enqueueFail(MockResponse response) {
+            failQueue.add(response);
         }
 
         @Override
@@ -160,6 +166,12 @@ class WorkerLoopIntegrationTest {
             if (RESULT_PATH.matcher(path).matches()) {
                 MockResponse queued = poll(resultQueue);
                 return queued != null ? queued : jsonResponse("{\"reviewId\":0,\"status\":\"COMPLETED\"}");
+            }
+            if (FAIL_PATH.matcher(path).matches()) {
+                // WOC-34/WOC-35: a Worker-Observability-and-Claim-Latency-aware Gateway; a benign default
+                // so existing failure-path scenarios don't spuriously start incrementing worker.gateway.errors.
+                MockResponse queued = poll(failQueue);
+                return queued != null ? queued : jsonResponse("{\"accepted\":true}");
             }
             return new MockResponse().setResponseCode(404);
         }

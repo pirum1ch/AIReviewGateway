@@ -2,6 +2,8 @@ package com.review.worker.gateway.dto;
 
 import org.junit.jupiter.api.Test;
 
+import java.util.List;
+
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
@@ -10,15 +12,19 @@ import static org.assertj.core.api.Assertions.assertThat;
  * accidental {@code log.debug("{}", dto)} dumping proprietary source/model output into logs. Does not
  * affect JSON (de)serialization, which Jackson performs via accessors, not {@code toString()} (verified
  * separately below).
+ *
+ * <p>Prompt Manager (V3, PMR-25): {@code systemMessages} must be masked identically to {@code diff}/
+ * {@code chunkContext} -- counts + total chars only, never section content.
  */
 class SensitiveDtoToStringMaskingTest {
 
     private static final String SECRET_DIFF = "diff --git a/Secret.java\n+String apiKey = \"THE-SECRET-DIFF-CONTENT\";";
     private static final String SECRET_RAW_RESPONSE = "THE-SECRET-RAW-MODEL-RESPONSE-CONTENT";
+    private static final String SECRET_SYSTEM_MESSAGE = "SECRET-CORPORATE-RULEBOOK-CONTENT";
 
     @Test
     void jobPayloadToStringNeverContainsTheRawDiff() {
-        JobPayload payload = new JobPayload(SECRET_DIFF, "v1", null);
+        JobPayload payload = new JobPayload(SECRET_DIFF, "v1", null, null);
 
         String rendered = payload.toString();
 
@@ -32,7 +38,7 @@ class SensitiveDtoToStringMaskingTest {
     @Test
     void jobPayloadAccessorStillReturnsTheFullDiffUnmasked() {
         // The masking is toString()-only; the actual field/accessor (what Jackson serializes) must be untouched.
-        JobPayload payload = new JobPayload(SECRET_DIFF, "v1", null);
+        JobPayload payload = new JobPayload(SECRET_DIFF, "v1", null, null);
 
         assertThat(payload.diff()).isEqualTo(SECRET_DIFF);
     }
@@ -60,7 +66,7 @@ class SensitiveDtoToStringMaskingTest {
 
     @Test
     void claimResponseToStringNeverContainsTheRawDiffEvenViaNestedPayload() {
-        ClaimResponse response = new ClaimResponse(1L, 2L, new JobPayload(SECRET_DIFF, "v1", null));
+        ClaimResponse response = new ClaimResponse(1L, 2L, new JobPayload(SECRET_DIFF, "v1", null, null));
 
         String rendered = response.toString();
 
@@ -72,7 +78,7 @@ class SensitiveDtoToStringMaskingTest {
 
     @Test
     void toStringMaskingHandlesNullContentGracefully() {
-        assertThat(new JobPayload(null, "v1", null).toString()).contains("0 chars");
+        assertThat(new JobPayload(null, "v1", null, null).toString()).contains("0 chars");
         assertThat(new ResultRequest("w", null, null, null, null, null).toString()).contains("0 chars");
     }
 
@@ -80,12 +86,55 @@ class SensitiveDtoToStringMaskingTest {
     @Test
     void jobPayloadToStringNeverContainsTheRawChunkContext() {
         String secretChunkContext = "part 2 of 6\nSECRET-FILE-PATH-CONTENT.java";
-        JobPayload payload = new JobPayload("small diff", "v2", secretChunkContext);
+        JobPayload payload = new JobPayload("small diff", "v2", secretChunkContext, null);
 
         String rendered = payload.toString();
 
         assertThat(rendered).doesNotContain(secretChunkContext);
         assertThat(rendered).doesNotContain("SECRET-FILE-PATH-CONTENT");
         assertThat(rendered).contains("chunkContext=<masked, " + secretChunkContext.length() + " chars>");
+    }
+
+    // ---- Prompt Manager (V3, PMR-25): systemMessages masking ----
+
+    @Test
+    void jobPayloadToStringNeverContainsRawSystemMessages() {
+        JobPayload payload = new JobPayload("small diff", "v2", null, List.of(SECRET_SYSTEM_MESSAGE, "second message"));
+
+        String rendered = payload.toString();
+
+        assertThat(rendered).doesNotContain(SECRET_SYSTEM_MESSAGE);
+        assertThat(rendered).contains("systemMessages=<masked, 2 msg, "
+                + (SECRET_SYSTEM_MESSAGE.length() + "second message".length()) + " chars>");
+    }
+
+    @Test
+    void jobPayloadToStringDistinguishesNullFromEmptySystemMessages() {
+        // PMR-24: null (legacy/kill-switch-off) vs [] (Gateway resolved zero sections) must render
+        // distinguishably, not collapse to the same "0 chars" text.
+        JobPayload nullMessages = new JobPayload("diff", "v1", null, null);
+        JobPayload emptyMessages = new JobPayload("diff", "v1", null, List.of());
+
+        assertThat(nullMessages.toString()).contains("systemMessages=null");
+        assertThat(emptyMessages.toString()).contains("systemMessages=<masked, 0 msg, 0 chars>");
+    }
+
+    @Test
+    void jobPayloadAccessorStillReturnsSystemMessagesUnmasked() {
+        List<String> messages = List.of(SECRET_SYSTEM_MESSAGE);
+        JobPayload payload = new JobPayload("diff", "v2", null, messages);
+
+        assertThat(payload.systemMessages()).isEqualTo(messages);
+    }
+
+    @Test
+    void claimResponseToStringNeverContainsRawSystemMessagesEvenViaNestedPayload() {
+        ClaimResponse response = new ClaimResponse(1L, 2L,
+                new JobPayload("diff", "v2", null, List.of(SECRET_SYSTEM_MESSAGE)));
+
+        String rendered = response.toString();
+
+        assertThat(rendered).doesNotContain(SECRET_SYSTEM_MESSAGE);
+        assertThat(rendered).contains("masked, 1 msg");
     }
 }

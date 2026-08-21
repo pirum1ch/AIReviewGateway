@@ -2,6 +2,7 @@ package com.review.gateway.service;
 
 import com.review.gateway.config.GatewayProperties;
 import com.review.gateway.exception.DiffTooLargeException;
+import com.review.gateway.exception.PromptTooLargeException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
@@ -36,11 +37,45 @@ public class DiffSizeValidator {
      * The enforced budget: the explicit configured cap, further bounded by whatever the context
      * window leaves after reserving room for the prompt scaffolding and the model's answer. Taking
      * the minimum of the two guards against the two settings drifting out of sync.
+     *
+     * <p>Retained (systemPromptTokens=0) for callers that predate Prompt Manager, and for the
+     * deliberately permissive CSR-01 pre-filter ({@link #rejectIfAbsurdlyLarge}), which must stay
+     * IO-free and run before any GitLab call could ever produce a real system-prompt size.
      */
     public int budgetTokens() {
+        return budgetTokens(0);
+    }
+
+    /**
+     * Prompt Manager (architecture §9, PMR-21): the diff budget shrinks by the actual resolved
+     * system-prompt size for <em>this</em> Review — {@code gateway.diff.prompt-reserve} now means only
+     * the {@code user}-template's fixed wrapper text, not "the whole system prompt" (that was the
+     * pre-Prompt-Manager meaning).
+     */
+    public int budgetTokens(int systemPromptTokens) {
         GatewayProperties.Diff cfg = properties.getDiff();
-        int derived = cfg.getContextWindow() - cfg.getPromptReserve() - cfg.getAnswerReserve();
+        int derived = cfg.getContextWindow() - cfg.getPromptReserve() - Math.max(0, systemPromptTokens)
+                - cfg.getAnswerReserve();
         return Math.min(cfg.getMaxDiffTokens(), Math.max(0, derived));
+    }
+
+    /**
+     * PMR-21: fails with {@code PROMPT_TOO_LARGE} (422) — distinct from {@code DIFF_TOO_LARGE} — when
+     * the diff budget remaining after subtracting {@code systemPromptTokens} falls below
+     * {@code gateway.prompt.limits.min-diff-budget-tokens}. Called after {@code PromptManager.resolve}
+     * and before {@code DiffChunker.split}, so an oversized resolved system prompt is reported with its
+     * own diagnostic rather than silently shrinking every chunk or overflowing the model context.
+     */
+    public void assertPromptFits(int systemPromptTokens) {
+        int minDiffBudgetTokens = properties.getPrompt().getLimits().getMinDiffBudgetTokens();
+        int budget = budgetTokens(systemPromptTokens);
+        if (budget < minDiffBudgetTokens) {
+            log.info("Rejecting review: system prompt of {} tokens leaves only {} tokens of diff budget, "
+                    + "below the configured minimum of {}", systemPromptTokens, budget, minDiffBudgetTokens);
+            throw new PromptTooLargeException("Resolved system prompt (" + systemPromptTokens
+                    + " tokens) leaves less than the configured minimum diff budget of " + minDiffBudgetTokens
+                    + " tokens");
+        }
     }
 
     /**

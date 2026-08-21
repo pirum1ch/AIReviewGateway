@@ -2,6 +2,8 @@ package com.review.gateway.controller;
 
 import com.review.gateway.dto.ClaimJobRequest;
 import com.review.gateway.dto.ClaimJobResponse;
+import com.review.gateway.dto.FailJobRequest;
+import com.review.gateway.dto.FailJobResponse;
 import com.review.gateway.dto.HeartbeatRequest;
 import com.review.gateway.dto.HeartbeatResponse;
 import com.review.gateway.dto.JobPayload;
@@ -9,6 +11,7 @@ import com.review.gateway.dto.SubmitResultRequest;
 import com.review.gateway.dto.SubmitResultResponse;
 import com.review.gateway.service.QueueManager;
 import com.review.gateway.service.dto.ClaimedJob;
+import com.review.gateway.service.dto.FailureReportOutcome;
 import com.review.gateway.service.dto.HeartbeatOutcome;
 import com.review.gateway.service.dto.HeartbeatResult;
 import com.review.gateway.service.dto.ResultOutcome;
@@ -88,8 +91,27 @@ public class JobController {
         return ResponseEntity.ok(new SubmitResultResponse(outcome.reviewId(), outcome.currentStatus().name()));
     }
 
+    /**
+     * Worker-reported job failure (architecture §5.2, WOC-26..WOC-33). Best-effort, latency-only
+     * optimization — the stale-heartbeat sweep remains the correctness backstop (WOC-36). {@code 404}/
+     * {@code 403} mirror {@code heartbeat}/{@code submitResult}'s opacity (F02-05/SR-04); {@code 200} is
+     * deliberately identical for an applied report and an idempotent no-op (WOC-28) and never carries a
+     * {@code reviewId} or Review status.
+     */
+    @PostMapping("/{id}/fail")
+    public ResponseEntity<FailJobResponse> reportFailure(@PathVariable("id") Long id, @Valid @RequestBody FailJobRequest request) {
+        FailureReportOutcome outcome = queueManager.reportFailure(id, request.workerId(), request.reason(), request.detail());
+        if (outcome == FailureReportOutcome.NOT_FOUND) {
+            return ResponseEntity.notFound().build();
+        }
+        if (outcome == FailureReportOutcome.OWNERSHIP_MISMATCH) {
+            return ResponseEntity.status(403).build();
+        }
+        return ResponseEntity.ok(new FailJobResponse(true));
+    }
+
     private ClaimJobResponse toResponse(ClaimedJob job) {
         return new ClaimJobResponse(job.jobId(), job.reviewId(),
-                new JobPayload(job.diff(), job.promptVersion(), job.chunkContext()));
+                new JobPayload(job.diff(), job.promptVersion(), job.chunkContext(), job.systemMessages()));
     }
 }

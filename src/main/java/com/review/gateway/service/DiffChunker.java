@@ -71,13 +71,28 @@ public class DiffChunker {
     }
 
     /**
+     * Retained for callers that predate Prompt Manager (equivalent to {@code split(diff, 0)}).
+     *
      * @throws DiffTooLargeException if bin-packing would need more than {@code gateway.diff.max-chunks}
      *                                 chunks, or if a single file's diff (even split at hunk boundaries,
      *                                 with its header replayed) still can't fit in one chunk
      */
     public ChunkPlan split(String diff) {
+        return split(diff, 0);
+    }
+
+    /**
+     * Prompt Manager (architecture §9): {@code systemPromptTokens} is the actual resolved system-prompt
+     * size for this Review (0 if Prompt Manager is disabled or produced no sections), subtracted from
+     * the per-chunk budget exactly like {@link DiffSizeValidator#budgetTokens(int)}.
+     *
+     * @throws DiffTooLargeException if bin-packing would need more than {@code gateway.diff.max-chunks}
+     *                                 chunks, or if a single file's diff (even split at hunk boundaries,
+     *                                 with its header replayed) still can't fit in one chunk
+     */
+    public ChunkPlan split(String diff, int systemPromptTokens) {
         String effectiveDiff = diff == null ? "" : diff;
-        int wholeBudgetTokens = Math.max(1, diffSizeValidator.budgetTokens());
+        int wholeBudgetTokens = Math.max(1, diffSizeValidator.budgetTokens(systemPromptTokens));
         int estimatedWhole = diffSizeValidator.estimateTokens(effectiveDiff);
 
         ParsedDiff parsed = parseSections(effectiveDiff);

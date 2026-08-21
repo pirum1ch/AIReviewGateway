@@ -81,12 +81,33 @@ ai-review-wait:
     - apk add --no-cache curl jq
   script:
     - |
-      for i in $(seq 1 30); do
+      # ${REVIEW_WAIT_MAX_ITERATIONS:-30} x ${REVIEW_WAIT_INTERVAL_SECONDS:-20}s = 10 minutes by default.
+      # Multi-chunk Reviews (diff chunking, README §6.1a) and/or a large Prompt-Manager-assembled system
+      # prompt (README §6.1b -- resent in full on every chunk) both make individual chunk runs slower;
+      # raise these two CI/CD variables per-project rather than editing this script if 10 minutes isn't
+      # enough for your MR sizes / backend hardware.
+      max_iterations="${REVIEW_WAIT_MAX_ITERATIONS:-30}"
+      interval_seconds="${REVIEW_WAIT_INTERVAL_SECONDS:-20}"
+      status="UNKNOWN"
+      for i in $(seq 1 "$max_iterations"); do
         status=$(curl -s "$REVIEW_GATEWAY_URL/reviews/$REVIEW_ID" \
           -H "Authorization: Bearer $REVIEW_GATEWAY_CI_TOKEN" | jq -r '.status')
         echo "Review $REVIEW_ID status: $status"
         case "$status" in
           PUBLISHED|FAILED|CANCELLED|OBSOLETE) break ;;
         esac
-        sleep 20
+        sleep "$interval_seconds"
       done
+
+      # Do NOT silently exit 0 just because the loop ran out of iterations -- that reports pipeline
+      # success while the review may still be RUNNING (or worse, never got published) with nobody
+      # ever told. A timeout is a real failure signal, not "nothing to report".
+      case "$status" in
+        PUBLISHED) echo "Review $REVIEW_ID published." ;;
+        FAILED|CANCELLED|OBSOLETE) echo "Review $REVIEW_ID ended as $status."; exit 1 ;;
+        *)
+          echo "Timed out after $((max_iterations * interval_seconds))s waiting for Review $REVIEW_ID" \
+               "to reach a terminal status (last seen: $status)."
+          exit 1
+          ;;
+      esac

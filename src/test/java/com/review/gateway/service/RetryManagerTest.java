@@ -14,6 +14,7 @@ import com.review.gateway.repository.ReviewCommentRepository;
 import com.review.gateway.repository.ReviewEventRepository;
 import com.review.gateway.repository.ReviewJobRepository;
 import com.review.gateway.repository.ReviewRepository;
+import com.review.gateway.service.dto.RequeueOutcome;
 import jakarta.persistence.EntityManager;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -22,6 +23,7 @@ import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.Duration;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -60,14 +62,22 @@ class RetryManagerTest extends AbstractPostgresIntegrationTest {
     }
 
     private RetryManager newRetryManager(int maxAttempts) {
-        EventService eventService = new EventService(reviewEventRepository);
+        return newRetryManager(maxAttempts, null);
+    }
+
+    private RetryManager newRetryManager(int maxAttempts, java.time.Duration requeueDelay) {
+        EventService eventService = new EventService(reviewEventRepository, new TextSanitizer());
         StateMachine stateMachine = new StateMachine(eventService);
         JobStateMachine jobStateMachine = new JobStateMachine(eventService);
         GatewayProperties properties = new GatewayProperties();
         properties.getRetry().setMaxAttempts(maxAttempts);
+        if (requeueDelay != null) {
+            properties.getRetry().setRequeueDelay(requeueDelay);
+        }
         ChunkCoordinator chunkCoordinator = new ChunkCoordinator(reviewRepository, reviewJobRepository,
                 reviewChunkRepository, reviewCommentRepository, stateMachine, jobStateMachine, properties, entityManager, transactionManager);
-        return new RetryManager(reviewJobRepository, jobStateMachine, chunkCoordinator, properties, entityManager, transactionManager);
+        return new RetryManager(reviewJobRepository, jobStateMachine, chunkCoordinator, properties,
+                new TextSanitizer(), entityManager, transactionManager);
     }
 
     private Review persistRunningReview(String headSha) {
@@ -161,6 +171,99 @@ class RetryManagerTest extends AbstractPostgresIntegrationTest {
 
         // Must not throw for a job id that doesn't exist.
         retryManager.requeueOrFail(999_999L, "heartbeat timeout");
+    }
+
+    // WOC-27: the owner-aware overload re-checks ownership INSIDE the job-row lock.
+    @Test
+    void ownerAwareRequeueOrFailWithMatchingWorkerIdSucceeds() {
+        Review review = persistRunningReview("sha-owner-match");
+        ReviewJob job = persistRunningJob(review, 1); // owned by "worker-7", see persistRunningJob
+
+        RetryManager retryManager = newRetryManager(3);
+        RequeueOutcome outcome = retryManager.requeueOrFail(job.getId(), "worker-reported: reason=LLM_ERROR", "worker-7");
+
+        assertThat(outcome.outcome()).isEqualTo(RequeueOutcome.Outcome.APPLIED_REQUEUED);
+        assertThat(outcome.reviewId()).isEqualTo(review.getId());
+        ReviewJob reloaded = reviewJobRepository.findById(job.getId()).orElseThrow();
+        assertThat(reloaded.getStatus()).isEqualTo(JobStatus.QUEUED);
+    }
+
+    @Test
+    void ownerAwareRequeueOrFailWithWrongWorkerIdIsRejectedWithoutChangingState() {
+        Review review = persistRunningReview("sha-owner-mismatch");
+        ReviewJob job = persistRunningJob(review, 1); // owned by "worker-7"
+
+        RetryManager retryManager = newRetryManager(3);
+        RequeueOutcome outcome = retryManager.requeueOrFail(job.getId(), "worker-reported: reason=LLM_ERROR", "worker-impostor");
+
+        assertThat(outcome.outcome()).isEqualTo(RequeueOutcome.Outcome.OWNERSHIP_MISMATCH);
+        assertThat(outcome.reviewId()).isNull();
+        ReviewJob reloaded = reviewJobRepository.findById(job.getId()).orElseThrow();
+        assertThat(reloaded.getStatus()).isEqualTo(JobStatus.RUNNING);
+        assertThat(reloaded.getLastError()).isNull();
+    }
+
+    @Test
+    void nullExpectedWorkerIdSkipsTheOwnershipCheckLikeTheSweepAlwaysHas() {
+        Review review = persistRunningReview("sha-owner-null");
+        ReviewJob job = persistRunningJob(review, 1);
+
+        RetryManager retryManager = newRetryManager(3);
+        RequeueOutcome outcome = retryManager.requeueOrFail(job.getId(), "heartbeat timeout", null);
+
+        assertThat(outcome.outcome()).isEqualTo(RequeueOutcome.Outcome.APPLIED_REQUEUED);
+    }
+
+    // WOC-29: review_jobs.last_error is written on both the requeue and fail branches.
+    @Test
+    void lastErrorIsWrittenOnTheRequeueBranch() {
+        Review review = persistRunningReview("sha-last-error-requeue");
+        ReviewJob job = persistRunningJob(review, 1);
+
+        RetryManager retryManager = newRetryManager(3);
+        retryManager.requeueOrFail(job.getId(), "heartbeat timeout");
+
+        ReviewJob reloaded = reviewJobRepository.findById(job.getId()).orElseThrow();
+        assertThat(reloaded.getLastError()).contains("heartbeat timeout").contains("attempt");
+    }
+
+    @Test
+    void lastErrorIsWrittenOnTheFailBranch() {
+        Review review = persistRunningReview("sha-last-error-fail");
+        ReviewJob job = persistRunningJob(review, 3); // exhausted
+
+        RetryManager retryManager = newRetryManager(3);
+        retryManager.requeueOrFail(job.getId(), "max duration exceeded");
+
+        ReviewJob reloaded = reviewJobRepository.findById(job.getId()).orElseThrow();
+        assertThat(reloaded.getLastError()).contains("max duration exceeded").contains("attempts exhausted");
+    }
+
+    // WOC-40/WOR-14: not_before is set on the requeue branch, computed against the DATABASE clock, and
+    // omitted entirely (disabled) when requeue-delay is 0.
+    @Test
+    void notBeforeIsSetOnRequeueWhenRequeueDelayIsConfigured() {
+        Review review = persistRunningReview("sha-not-before");
+        ReviewJob job = persistRunningJob(review, 1);
+
+        RetryManager retryManager = newRetryManager(3, Duration.ofSeconds(90));
+        retryManager.requeueOrFail(job.getId(), "heartbeat timeout");
+
+        ReviewJob reloaded = reviewJobRepository.findById(job.getId()).orElseThrow();
+        assertThat(reloaded.getNotBefore()).isNotNull();
+        assertThat(reloaded.getNotBefore()).isAfter(java.time.Instant.now().plusSeconds(60));
+    }
+
+    @Test
+    void notBeforeStaysNullWhenRequeueDelayIsZero() {
+        Review review = persistRunningReview("sha-not-before-disabled");
+        ReviewJob job = persistRunningJob(review, 1);
+
+        RetryManager retryManager = newRetryManager(3, Duration.ZERO);
+        retryManager.requeueOrFail(job.getId(), "heartbeat timeout");
+
+        ReviewJob reloaded = reviewJobRepository.findById(job.getId()).orElseThrow();
+        assertThat(reloaded.getNotBefore()).isNull();
     }
 
     /**

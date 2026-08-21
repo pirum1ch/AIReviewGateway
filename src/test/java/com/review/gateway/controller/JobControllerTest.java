@@ -5,6 +5,7 @@ import com.review.gateway.config.SecurityConfig;
 import com.review.gateway.model.enums.ReviewStatus;
 import com.review.gateway.service.QueueManager;
 import com.review.gateway.service.dto.ClaimedJob;
+import com.review.gateway.service.dto.FailureReportOutcome;
 import com.review.gateway.service.dto.HeartbeatResult;
 import com.review.gateway.service.dto.SubmitResultCommand;
 import com.review.gateway.service.dto.SubmitResultOutcome;
@@ -16,6 +17,7 @@ import org.springframework.http.MediaType;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.web.servlet.MockMvc;
 
+import java.util.List;
 import java.util.Optional;
 
 import static org.mockito.ArgumentMatchers.any;
@@ -37,7 +39,7 @@ class JobControllerTest {
     @Test
     void claimReturns200WithPayloadWhenAJobIsAvailable() throws Exception {
         when(queueManager.claim(eq("mac-mini-1"), eq("worker-1")))
-                .thenReturn(Optional.of(new ClaimedJob(10L, 20L, "diff content", "v1", null)));
+                .thenReturn(Optional.of(new ClaimedJob(10L, 20L, "diff content", "v1", null, null)));
 
         mockMvc.perform(post("/jobs/claim")
                         .header("Authorization", "Bearer " + SecurityTestTokens.WORKER_TOKEN)
@@ -49,6 +51,24 @@ class JobControllerTest {
                 .andExpect(jsonPath("$.jobId").value(10))
                 .andExpect(jsonPath("$.reviewId").value(20))
                 .andExpect(jsonPath("$.payload.diff").value("diff content"));
+    }
+
+    @Test
+    void claimReturns200WithSystemMessagesWhenPromptManagerResolvedSections() throws Exception {
+        // Prompt Manager (V3): systemMessages passes through from ClaimedJob into the response payload.
+        when(queueManager.claim(eq("mac-mini-1"), eq("worker-1")))
+                .thenReturn(Optional.of(new ClaimedJob(10L, 20L, "diff content", "v2", null,
+                        List.of("corporate base", "corporate rules"))));
+
+        mockMvc.perform(post("/jobs/claim")
+                        .header("Authorization", "Bearer " + SecurityTestTokens.WORKER_TOKEN)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"backendId":"mac-mini-1","workerId":"worker-1"}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.payload.systemMessages[0]").value("corporate base"))
+                .andExpect(jsonPath("$.payload.systemMessages[1]").value("corporate rules"));
     }
 
     @Test
@@ -155,6 +175,195 @@ class JobControllerTest {
                                 {"workerId":"worker-IMPOSTOR","rawResponse":"raw text"}
                                 """))
                 .andExpect(status().isForbidden());
+    }
+
+    // =================================================================================================
+    // POST /jobs/{id}/fail (architecture §5.2, WOC-26..WOC-33, WOR-18)
+    // =================================================================================================
+
+    @Test
+    void reportFailureReturns200Accepted() throws Exception {
+        when(queueManager.reportFailure(eq(10L), eq("worker-1"), eq("LLM_TIMEOUT"), eq("some detail")))
+                .thenReturn(FailureReportOutcome.ACCEPTED);
+
+        mockMvc.perform(post("/jobs/{id}/fail", 10)
+                        .header("Authorization", "Bearer " + SecurityTestTokens.WORKER_TOKEN)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"workerId":"worker-1","reason":"LLM_TIMEOUT","detail":"some detail"}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.accepted").value(true));
+    }
+
+    @Test
+    void reportFailureWithoutDetailReturns200Accepted() throws Exception {
+        when(queueManager.reportFailure(eq(10L), eq("worker-1"), eq("PROMPT_INVALID"), eq(null)))
+                .thenReturn(FailureReportOutcome.ACCEPTED);
+
+        mockMvc.perform(post("/jobs/{id}/fail", 10)
+                        .header("Authorization", "Bearer " + SecurityTestTokens.WORKER_TOKEN)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"workerId":"worker-1","reason":"PROMPT_INVALID"}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.accepted").value(true));
+    }
+
+    @Test
+    void reportFailureReturns404ForUnknownJob() throws Exception {
+        when(queueManager.reportFailure(eq(999L), any(), any(), any())).thenReturn(FailureReportOutcome.NOT_FOUND);
+
+        mockMvc.perform(post("/jobs/{id}/fail", 999)
+                        .header("Authorization", "Bearer " + SecurityTestTokens.WORKER_TOKEN)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"workerId":"worker-1","reason":"LLM_ERROR"}
+                                """))
+                .andExpect(status().isNotFound());
+    }
+
+    @Test
+    void reportFailureReturns403OnOwnershipMismatch() throws Exception {
+        when(queueManager.reportFailure(eq(10L), eq("worker-IMPOSTOR"), any(), any()))
+                .thenReturn(FailureReportOutcome.OWNERSHIP_MISMATCH);
+
+        mockMvc.perform(post("/jobs/{id}/fail", 10)
+                        .header("Authorization", "Bearer " + SecurityTestTokens.WORKER_TOKEN)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"workerId":"worker-IMPOSTOR","reason":"LLM_ERROR"}
+                                """))
+                .andExpect(status().isForbidden());
+    }
+
+    @Test
+    void reportFailureResponseNeverCarriesReviewIdOrStatus() throws Exception {
+        // WOC-28: deliberately stricter than /result -- no response field ever echoes Review state.
+        when(queueManager.reportFailure(eq(10L), eq("worker-1"), any(), any())).thenReturn(FailureReportOutcome.ACCEPTED);
+
+        mockMvc.perform(post("/jobs/{id}/fail", 10)
+                        .header("Authorization", "Bearer " + SecurityTestTokens.WORKER_TOKEN)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"workerId":"worker-1","reason":"LLM_ERROR"}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath("$.reviewId").doesNotExist())
+                .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath("$.status").doesNotExist());
+    }
+
+    // WOR-18: role matrix -- /jobs/{id}/fail is reachable only with the WORKER token.
+    @Test
+    void reportFailureRequires401WithoutAToken() throws Exception {
+        mockMvc.perform(post("/jobs/{id}/fail", 10)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"workerId":"worker-1","reason":"LLM_ERROR"}
+                                """))
+                .andExpect(status().isUnauthorized());
+    }
+
+    @Test
+    void reportFailureRejectsCiToken() throws Exception {
+        mockMvc.perform(post("/jobs/{id}/fail", 10)
+                        .header("Authorization", "Bearer " + SecurityTestTokens.CI_TOKEN)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"workerId":"worker-1","reason":"LLM_ERROR"}
+                                """))
+                .andExpect(status().isForbidden());
+    }
+
+    @Test
+    void reportFailureRejectsAdminToken() throws Exception {
+        mockMvc.perform(post("/jobs/{id}/fail", 10)
+                        .header("Authorization", "Bearer " + SecurityTestTokens.ADMIN_TOKEN)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"workerId":"worker-1","reason":"LLM_ERROR"}
+                                """))
+                .andExpect(status().isForbidden());
+    }
+
+    // =================================================================================================
+    // WOR-06: workerId/reason/detail bean-validation on the four Worker-facing DTOs
+    // =================================================================================================
+
+    @Test
+    void reportFailureRejectsCrlfInWorkerIdWith400() throws Exception {
+        mockMvc.perform(post("/jobs/{id}/fail", 10)
+                        .header("Authorization", "Bearer " + SecurityTestTokens.WORKER_TOKEN)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"workerId":"w\\r\\n2026-01-01 INFO forged","reason":"LLM_ERROR"}
+                                """))
+                .andExpect(status().isBadRequest());
+    }
+
+    @Test
+    void reportFailureRejectsOversizedWorkerIdWith400() throws Exception {
+        String oversized = "w".repeat(65);
+        mockMvc.perform(post("/jobs/{id}/fail", 10)
+                        .header("Authorization", "Bearer " + SecurityTestTokens.WORKER_TOKEN)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"workerId\":\"" + oversized + "\",\"reason\":\"LLM_ERROR\"}"))
+                .andExpect(status().isBadRequest());
+    }
+
+    @Test
+    void reportFailureRejectsOversizedReasonWith400() throws Exception {
+        String oversized = "R".repeat(33);
+        mockMvc.perform(post("/jobs/{id}/fail", 10)
+                        .header("Authorization", "Bearer " + SecurityTestTokens.WORKER_TOKEN)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"workerId\":\"worker-1\",\"reason\":\"" + oversized + "\"}"))
+                .andExpect(status().isBadRequest());
+    }
+
+    @Test
+    void reportFailureRejectsBlankReasonWith400() throws Exception {
+        mockMvc.perform(post("/jobs/{id}/fail", 10)
+                        .header("Authorization", "Bearer " + SecurityTestTokens.WORKER_TOKEN)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"workerId":"worker-1","reason":""}
+                                """))
+                .andExpect(status().isBadRequest());
+    }
+
+    @Test
+    void claimRejectsCrlfInWorkerIdWith400() throws Exception {
+        mockMvc.perform(post("/jobs/claim")
+                        .header("Authorization", "Bearer " + SecurityTestTokens.WORKER_TOKEN)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"backendId":"mac-mini-1","workerId":"w\\r\\nforged"}
+                                """))
+                .andExpect(status().isBadRequest());
+    }
+
+    @Test
+    void heartbeatRejectsCrlfInWorkerIdWith400() throws Exception {
+        mockMvc.perform(post("/jobs/{id}/heartbeat", 10)
+                        .header("Authorization", "Bearer " + SecurityTestTokens.WORKER_TOKEN)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"workerId":"w\\r\\nforged"}
+                                """))
+                .andExpect(status().isBadRequest());
+    }
+
+    @Test
+    void submitResultRejectsCrlfInWorkerIdWith400() throws Exception {
+        mockMvc.perform(post("/jobs/{id}/result", 10)
+                        .header("Authorization", "Bearer " + SecurityTestTokens.WORKER_TOKEN)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"workerId":"w\\r\\nforged","rawResponse":"raw text"}
+                                """))
+                .andExpect(status().isBadRequest());
     }
 
     @Test

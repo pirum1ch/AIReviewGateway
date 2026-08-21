@@ -43,7 +43,7 @@ class HeartbeatSchedulerTest {
         when(gatewayClient.heartbeat(anyLong(), anyString())).thenReturn(HeartbeatOutcome.accepted(true));
         AbortSignal abortSignal = new AbortSignal();
 
-        scheduler.tick(1L, "worker-1", abortSignal, new AtomicInteger());
+        scheduler.tick(1L, "worker-1", abortSignal, new AtomicInteger(), System.currentTimeMillis(), new AtomicInteger());
 
         assertThat(abortSignal.isAborted()).isFalse();
     }
@@ -53,7 +53,7 @@ class HeartbeatSchedulerTest {
         when(gatewayClient.heartbeat(anyLong(), anyString())).thenReturn(HeartbeatOutcome.accepted(false));
         AbortSignal abortSignal = new AbortSignal();
 
-        scheduler.tick(1L, "worker-1", abortSignal, new AtomicInteger());
+        scheduler.tick(1L, "worker-1", abortSignal, new AtomicInteger(), System.currentTimeMillis(), new AtomicInteger());
 
         assertThat(abortSignal.isAborted()).isTrue();
     }
@@ -63,7 +63,7 @@ class HeartbeatSchedulerTest {
         when(gatewayClient.heartbeat(anyLong(), anyString())).thenReturn(HeartbeatOutcome.notFound());
         AbortSignal abortSignal = new AbortSignal();
 
-        scheduler.tick(1L, "worker-1", abortSignal, new AtomicInteger());
+        scheduler.tick(1L, "worker-1", abortSignal, new AtomicInteger(), System.currentTimeMillis(), new AtomicInteger());
 
         assertThat(abortSignal.isAborted()).isTrue();
     }
@@ -73,7 +73,7 @@ class HeartbeatSchedulerTest {
         when(gatewayClient.heartbeat(anyLong(), anyString())).thenReturn(HeartbeatOutcome.forbidden());
         AbortSignal abortSignal = new AbortSignal();
 
-        scheduler.tick(1L, "worker-1", abortSignal, new AtomicInteger());
+        scheduler.tick(1L, "worker-1", abortSignal, new AtomicInteger(), System.currentTimeMillis(), new AtomicInteger());
 
         assertThat(abortSignal.isAborted()).isTrue();
     }
@@ -84,7 +84,7 @@ class HeartbeatSchedulerTest {
         AbortSignal abortSignal = new AbortSignal();
         AtomicInteger failures = new AtomicInteger();
 
-        scheduler.tick(1L, "worker-1", abortSignal, failures);
+        scheduler.tick(1L, "worker-1", abortSignal, failures, System.currentTimeMillis(), new AtomicInteger());
 
         assertThat(abortSignal.isAborted()).isFalse();
         assertThat(failures.get()).isEqualTo(1);
@@ -97,7 +97,7 @@ class HeartbeatSchedulerTest {
         AtomicInteger failures = new AtomicInteger();
 
         for (int i = 0; i < HeartbeatScheduler.MAX_CONSECUTIVE_FAILURES; i++) {
-            scheduler.tick(1L, "worker-1", abortSignal, failures);
+            scheduler.tick(1L, "worker-1", abortSignal, failures, System.currentTimeMillis(), new AtomicInteger());
         }
 
         assertThat(abortSignal.isAborted()).isTrue();
@@ -110,21 +110,21 @@ class HeartbeatSchedulerTest {
         AtomicInteger failures = new AtomicInteger();
 
         when(gatewayClient.heartbeat(anyLong(), anyString())).thenThrow(new RuntimeException("boom"));
-        scheduler.tick(1L, "worker-1", abortSignal, failures);
-        scheduler.tick(1L, "worker-1", abortSignal, failures);
+        scheduler.tick(1L, "worker-1", abortSignal, failures, System.currentTimeMillis(), new AtomicInteger());
+        scheduler.tick(1L, "worker-1", abortSignal, failures, System.currentTimeMillis(), new AtomicInteger());
         assertThat(failures.get()).isEqualTo(2);
 
         reset(gatewayClient);
         when(gatewayClient.heartbeat(anyLong(), anyString())).thenReturn(HeartbeatOutcome.accepted(true));
-        scheduler.tick(1L, "worker-1", abortSignal, failures);
+        scheduler.tick(1L, "worker-1", abortSignal, failures, System.currentTimeMillis(), new AtomicInteger());
 
         assertThat(failures.get()).isZero();
         assertThat(abortSignal.isAborted()).isFalse();
 
         // Two more failures after the reset must NOT yet reach the fail-safe threshold on their own.
         when(gatewayClient.heartbeat(anyLong(), anyString())).thenThrow(new RuntimeException("boom again"));
-        scheduler.tick(1L, "worker-1", abortSignal, failures);
-        scheduler.tick(1L, "worker-1", abortSignal, failures);
+        scheduler.tick(1L, "worker-1", abortSignal, failures, System.currentTimeMillis(), new AtomicInteger());
+        scheduler.tick(1L, "worker-1", abortSignal, failures, System.currentTimeMillis(), new AtomicInteger());
         assertThat(abortSignal.isAborted()).isFalse();
     }
 

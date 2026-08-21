@@ -23,7 +23,7 @@ class EventServiceTest {
     void setUp() {
         reviewEventRepository = Mockito.mock(ReviewEventRepository.class);
         when(reviewEventRepository.save(any())).thenAnswer(invocation -> invocation.getArgument(0));
-        eventService = new EventService(reviewEventRepository);
+        eventService = new EventService(reviewEventRepository, new TextSanitizer());
     }
 
     @Test
@@ -86,5 +86,32 @@ class EventServiceTest {
         ArgumentCaptor<ReviewEvent> captor = ArgumentCaptor.forClass(ReviewEvent.class);
         verify(reviewEventRepository).save(captor.capture());
         assertThat(captor.getValue().getDetails()).isEqualTo("attempt=2/3");
+    }
+
+    // WOR-07 (Worker Observability & Claim Latency): the first caller whose `details` text can carry
+    // attacker-influenced content (a Worker-reported /jobs/{id}/fail `detail`) -- scrub() must strip
+    // Cc/Cf/Zl/Zp BEFORE the existing token-shape redaction and length cap (CSR-09 ordering).
+    @Test
+    void crlfInDetailsIsStrippedPreventingLogAndRowInjection() {
+        eventService.record(1L, EventType.RETRY, "worker-1", 2L,
+                "worker-reported: reason=LLM_ERROR; detail=line1\r\n2026-01-01 INFO forged log line");
+
+        ArgumentCaptor<ReviewEvent> captor = ArgumentCaptor.forClass(ReviewEvent.class);
+        verify(reviewEventRepository).save(captor.capture());
+        String details = captor.getValue().getDetails();
+        assertThat(details).doesNotContain("\r").doesNotContain("\n");
+        assertThat(details).startsWith("worker-reported: reason=LLM_ERROR");
+    }
+
+    @Test
+    void bidiOverrideCharactersAreStrippedFromDetails() {
+        // U+202E (RIGHT-TO-LEFT OVERRIDE) -- a Trojan-Source-style character class, not a CRLF. Written as
+        // an escape (not a literal code point) so this source file itself never carries a bidi override.
+        String bidiOverride = "\u202E";
+        eventService.record(1L, EventType.RETRY, "worker-1", 2L, "detail=safe" + bidiOverride + "hidden");
+
+        ArgumentCaptor<ReviewEvent> captor = ArgumentCaptor.forClass(ReviewEvent.class);
+        verify(reviewEventRepository).save(captor.capture());
+        assertThat(captor.getValue().getDetails()).doesNotContain(bidiOverride);
     }
 }

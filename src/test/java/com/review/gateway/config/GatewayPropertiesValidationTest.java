@@ -20,6 +20,10 @@ class GatewayPropertiesValidationTest {
         properties.getSecurity().setAdminToken("c".repeat(32));
         properties.getGitlab().setToken("d".repeat(32));
         properties.getGitlab().setBaseUrl("https://gitlab.example.com/api/v4");
+        // Prompt Manager validation is exercised separately (GatewayPropertiesPromptValidationTest) --
+        // out of scope for this pre-existing SR-01/SR-15 file; disable the kill-switch so its own
+        // startup rules (requiring gateway.gitlab.prompt-token/corporate.project) don't apply here.
+        properties.getPrompt().setEnabled(false);
         return properties;
     }
 

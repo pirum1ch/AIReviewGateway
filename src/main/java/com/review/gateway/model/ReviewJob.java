@@ -71,6 +71,17 @@ public class ReviewJob {
     @Column(name = "last_error")
     private String lastError;
 
+    /**
+     * Worker Observability & Claim Latency (V4, WOC-40/WOR-14): earliest instant this job may be
+     * claimed again, set on the requeue branch of {@code RetryManager.requeueOrFail} to
+     * {@code now + gateway.retry.requeue-delay} (computed against the <b>database</b> clock, never the
+     * JVM's). {@code NULL} means claimable immediately (today's behavior; also the state after a
+     * fresh claim, which always nulls this out). {@code ReviewJobRepository.findNextQueuedJobIdForUpdate}
+     * filters on it.
+     */
+    @Column(name = "not_before")
+    private Instant notBefore;
+
     @Column(name = "created_at", nullable = false, updatable = false)
     private Instant createdAt;
 
@@ -211,6 +222,14 @@ public class ReviewJob {
 
     public void setLastError(String lastError) {
         this.lastError = lastError;
+    }
+
+    public Instant getNotBefore() {
+        return notBefore;
+    }
+
+    public void setNotBefore(Instant notBefore) {
+        this.notBefore = notBefore;
     }
 
     public Instant getCreatedAt() {

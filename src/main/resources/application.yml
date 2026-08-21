@@ -1,85 +1,137 @@
 spring:
   application:
-    name: review-gateway
+    name: review-gateway          # имя приложения Spring — используется в логах, actuator, метриках
   threads:
     virtual:
-      enabled: true                 # Java 21 virtual threads (requirements §2.1)
+      enabled: true                 # Java 21 virtual threads (requirements §2.1) — включает виртуальные потоки Java 21 для обработки запросов, повышает пропускную способность при большом числе одновременных блокирующих операций
   datasource:
-    url: ${DB_URL:jdbc:postgresql://localhost:5432/review_gateway}
-    username: ${DB_USER}
-    password: ${DB_PASSWORD}
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/review_gateway}   # JDBC-URL PostgreSQL — единственного источника истины для состояния Gateway
+    username: ${DB_USER}          # имя пользователя для подключения к БД
+    password: ${DB_PASSWORD}      # пароль пользователя БД (секрет, берётся только из переменной окружения)
     hikari:
-      maximum-pool-size: 20
+      maximum-pool-size: 20       # максимальный размер пула соединений HikariCP к PostgreSQL
   jpa:
     hibernate:
-      ddl-auto: validate            # schema owned by Flyway only
-    open-in-view: false
+      ddl-auto: validate            # schema owned by Flyway only — Hibernate только сверяет соответствие JPA-сущностей текущей схеме БД, но не изменяет её; схемой управляет исключительно Flyway
+    open-in-view: false            # отключает Open Session In View — не даёт ленивой загрузке JPA происходить вне транзакционного сервисного слоя (например, в контроллерах)
   flyway:
-    enabled: true
-    locations: classpath:db/migration
+    enabled: true                  # включает применение миграций Flyway при старте приложения
+    locations: classpath:db/migration   # путь внутри jar, откуда Flyway читает файлы миграций
   servlet:
     multipart:
-      max-file-size: 1MB
-      max-request-size: 1MB
+      max-file-size: 1MB           # максимальный размер одного файла в multipart-запросе
+      max-request-size: 1MB        # максимальный суммарный размер multipart-запроса
 
 server:
-  port: 8080
-  max-http-request-header-size: 16KB
+  port: 8080                      # TCP-порт, на котором Gateway принимает HTTP-запросы
+  max-http-request-header-size: 16KB   # максимальный суммарный размер HTTP-заголовков запроса (защита от чрезмерно больших заголовков)
 
 management:
   endpoints:
     web:
       exposure:
-        include: health             # NO prometheus; business metrics = custom /metrics
+        include: health             # NO prometheus; business metrics = custom /metrics — через actuator наружу отдаётся только /health; собственные бизнес-метрики публикуются отдельным эндпоинтом GET /metrics, а не через Prometheus
   endpoint:
     health:
       probes:
-        enabled: true
+        enabled: true               # включает liveness/readiness-пробы Spring Boot Actuator (используются оркестратором/системой мониторинга для проверки готовности сервиса)
 
 gateway:
   diff:
-    context-window: 16384
-    prompt-reserve: 2000
-    answer-reserve: 4000
-    max-diff-tokens: 10000          # derived cap; per-chunk budget as of V2 diff chunking (CSR-05)
-    chars-per-token: 4              # heuristic for the token estimator
-    # F-DC-04 fix: this MUST match the CSR-02 formula (max-chunks * max-diff-tokens * chars-per-token
-    # * 1.5 safety-factor + 20000 fixed overhead) -- 5 * 10000 * 4 * 1.5 + 20000 = 320000 with the
-    # stock defaults below. This value previously stayed at the pre-chunking 100000, silently capping
-    # every chunked Review at ~2 chunks regardless of gateway.diff.max-chunks. Recompute and update
-    # this (and MAX_REQUEST_BODY_BYTES if set) if max-chunks/max-diff-tokens/chars-per-token change.
-    max-request-body-bytes: ${MAX_REQUEST_BODY_BYTES:320000}  # SR-11/CSR-02 edge cap for POST /reviews
+    context-window: 32768          # размер контекстного окна используемой LLM в токенах — база для расчёта бюджетов на промпт/diff/ответ
+    prompt-reserve: 4000            # сколько токенов контекстного окна резервируется под системный промпт
+    answer-reserve: 8000            # сколько токенов контекстного окна резервируется под ответ модели
+    max-diff-tokens: 20000          # derived cap; per-chunk budget as of V2 diff chunking (CSR-05) — производный предел: максимум токенов diff на один чанк/запрос к LLM
+    chars-per-token: 4              # heuristic for the token estimator — эвристика "символов на токен", применяемая для оценки числа токенов без реального токенайзера
+    # F-DC-04 fix: это значение ОБЯЗАНО соответствовать формуле CSR-02 (max-chunks * max-diff-tokens *
+    # chars-per-token * коэффициент запаса 1.5 + фиксированные накладные расходы 20000) -- при
+    # приведённых ниже значениях по умолчанию: 5 * 10000 * 4 * 1.5 + 20000 = 320000. Ранее это
+    # значение оставалось равным дочанкинговому 100000, что незаметно ограничивало каждый
+    # чанкованный Review примерно 2 чанками, независимо от gateway.diff.max-chunks. Пересчитывайте и
+    # обновляйте это значение (и MAX_REQUEST_BODY_BYTES, если он задан), если изменятся
+    # max-chunks/max-diff-tokens/chars-per-token.
+    max-request-body-bytes: ${MAX_REQUEST_BODY_BYTES:320000}  # SR-11/CSR-02 edge cap for POST /reviews — максимальный размер тела запроса POST /reviews в байтах; должен быть согласован с формулой CSR-02 выше
   heartbeat:
-    interval: 60s                   # expected worker ping cadence
-    timeout: 180s                   # stuck if now - heartbeat_at exceeds this
+    interval: 60s                   # expected worker ping cadence — ожидаемый интервал между heartbeat-пингами воркера
+    timeout: 180s                   # stuck if now - heartbeat_at exceeds this — если с момента последнего heartbeat прошло больше этого времени, джоба считается "зависшей" и возвращается в очередь
   retry:
-    max-attempts: 3
+    max-attempts: 3                 # максимальное число попыток выполнения одной джобы, прежде чем Review переводится в FAILED
   job:
-    max-duration: 45m               # hard cap backstop
+    max-duration: 45m               # hard cap backstop — жёсткий предел общей длительности джобы; запасной механизм поверх мониторинга по heartbeat
   publish:
-    max-comment-count: 50
-    max-comment-length: 4000
-    max-raw-response-length: 200000 # SR-21
-    max-request-body-bytes: 500000  # SR-11 edge cap for POST /jobs/{id}/result
+    max-comment-count: 50           # максимальное число комментариев ревью, публикуемых в один merge request
+    max-comment-length: 4000        # максимальная длина одного комментария в символах
+    max-raw-response-length: 200000 # SR-21 — максимальная длина "сырого" ответа LLM, сохраняемого в БД
+    max-request-body-bytes: 500000  # SR-11 edge cap for POST /jobs/{id}/result — максимальный размер тела запроса POST /jobs/{id}/result в байтах
   scheduler:
-    heartbeat-check-interval: 30s
-    backend-health-interval: 60s
-    publish-retry-interval: 60s
+    heartbeat-check-interval: 30s   # как часто фоновый планировщик проверяет джобы на "зависание" по heartbeat
+    backend-health-interval: 60s    # как часто планировщик опрашивает backend'ы (llama-server) для проверки их состояния
+    publish-retry-interval: 60s     # как часто планировщик повторяет неудавшиеся попытки публикации комментариев в GitLab
   gitlab:
-    base-url: ${GITLAB_BASE_URL:https://gitlab.example.com/api/v4}
-    token: ${GITLAB_TOKEN}          # masked in toString; only Gateway holds this
-    connect-timeout: 5s
-    read-timeout: 30s
+    base-url: ${GITLAB_BASE_URL:https://gitlab.example.com/api/v4}   # базовый URL GitLab API — используется для получения diff'ов MR и публикации комментариев
+    token: ${GITLAB_TOKEN}          # masked in toString; only Gateway holds this — токен GitLab с правом записи (публикация комментариев); маскируется в toString, хранится только у Gateway
+    # Prompt Manager (V3, PMR-15): ОТДЕЛЬНЫЙ, доступный только на чтение GitLab-креденшел -- никогда не
+    # тот же токен с правом записи, что выше. Требуется (проверяется на наличие, SR-01) только если
+    # gateway.prompt.enabled=true; при значении по умолчанию для kill-switch (false, см. ниже) остаётся
+    # незаданным и не проверяется.
+    prompt-token: ${GITLAB_PROMPT_TOKEN:}   # read-only токен GitLab для Prompt Manager (чтение корпоративных/проектных промпт-файлов из репозиториев)
+    connect-timeout: 5s             # таймаут установления TCP-соединения с GitLab API
+    read-timeout: 30s               # таймаут ожидания ответа от GitLab API
   backend:
-    connect-timeout: 3s
-    read-timeout: 5s
-    allowed-host-pattern: ${BACKEND_ALLOWED_HOST_PATTERN:.*}   # SR-10: tighten per deployment
+    connect-timeout: 3s             # таймаут установления соединения с backend'ом (llama-server) при health-пробе
+    read-timeout: 10s               # WOC-16: raised from 5s -- safe because WOC-14 moved probe I/O
+                                     # outside any DB transaction (see GatewayProperties.Backend#readTimeout)
+                                     # — таймаут чтения ответа backend'а при health-пробе; увеличен с 5s, т.к. WOC-14 вынес ввод-вывод пробы за пределы транзакции БД, и это стало безопасно
+    allowed-host-pattern: ${BACKEND_ALLOWED_HOST_PATTERN:.*}   # SR-10: tighten per deployment — regex-паттерн допустимых хостов для URL backend'ов (защита от SSRF); в конкретном окружении следует сузить
   security:
-    ci-token: ${CI_TOKEN}
-    worker-token: ${WORKER_TOKEN}
-    admin-token: ${ADMIN_TOKEN}
+    ci-token: ${CI_TOKEN}           # Bearer-токен, которым GitLab CI аутентифицируется к API создания/статуса Review (POST/GET /reviews)
+    worker-token: ${WORKER_TOKEN}   # отдельный Bearer-токен для Worker-facing API (/jobs/*), с более узкими правами, чем у CI-токена
+    admin-token: ${ADMIN_TOKEN}     # Bearer-токен для административных операций (например, DELETE /reviews/{id})
+  prompt:
+    # F-PM-02: изначально отгружается выключенным (безопасное значение по умолчанию) — намеренное
+    # отклонение от примера в документе архитектуры (${PROMPT_MANAGER_ENABLED:true}) -- обновлённый
+    # или свежеразвёрнутый Gateway должен продолжать загружаться с сегодняшним поведением "промпт
+    # только из JAR воркера" (побайтово идентичным до-V3, что и есть предпосылка PMR-10), пока
+    # оператор явно не подготовит GITLAB_PROMPT_TOKEN + PROMPT_CORPORATE_PROJECT и не включит функцию
+    # осознанно. Это то же значение по умолчанию, что и у GatewayProperties.Prompt#enabled в коде,
+    # поэтому они не могут разойтись между собой, как это произошло в первопричине данной находки.
+    # См. docs/security/feature-prompt-manager-sast-report.md F-PM-02 и DEPLOYMENT.md §2 для полного
+    # обоснования.
+    enabled: ${PROMPT_MANAGER_ENABLED:false}   # флаг-выключатель (kill-switch) функции Prompt Manager (V3): промпт из Git-репозиториев вместо промпта, зашитого в JAR воркера
+    corporate:
+      project: ${PROMPT_CORPORATE_PROJECT:}   # numeric id or "group/project" path -- NEVER a URL (PMR-14) — числовой id или путь "group/project" корпоративного репозитория с базовым промптом; НИКОГДА не URL
+      ref: ${PROMPT_CORPORATE_REF:main}       # git-ref (ветка/тег) корпоративного репозитория, из которого читается промпт
+      base-prompt-path: ${PROMPT_CORPORATE_BASE_PROMPT_PATH:prompts/base-system-prompt.md}   # путь к файлу базового системного промпта внутри корпоративного репозитория
+      review-rules-path: ${PROMPT_CORPORATE_REVIEW_RULES_PATH:prompts/review-rules.md}       # путь к файлу правил ревью внутри корпоративного репозитория
+    project:
+      enabled: true                # включает подмешивание промпт-файлов конкретного проекта (репозитория, для которого делается Review), в дополнение к корпоративным
+      # ref всегда берётся из ветки по умолчанию проекта, если только не задан явный ref в
+      # gateway.prompt.project.overrides.*.ref (архитектура §0.1) -- поэтому отдельной переменной
+      # окружения верхнего уровня для него намеренно нет.
+      architecture-path: .ai-review/architecture.md   # путь к файлу описания архитектуры проекта внутри самого проекта
+      code-rules-path: .ai-review/code-rules.md       # путь к файлу правил кодирования проекта внутри самого проекта
+    error-handling:
+      on-error: ${PROMPT_ON_ERROR:FAIL}   # FAIL | SKIP_OPTIONAL -- corporate sections are ALWAYS FAIL, not configurable — поведение при ошибке получения промпт-секции: FAIL (прервать Review) или SKIP_OPTIONAL (пропустить необязательную секцию); для корпоративных секций всегда FAIL, не настраивается
+    message-format: MULTI       # MULTI | SINGLE -- default MULTI (PMR-22); backends.prompt_message_format overrides per-backend — формат передачи системного промпта модели: несколькими system-сообщениями (MULTI) или одним объединённым сообщением (SINGLE); переопределяется индивидуально по backend'у
+    section-separator: "\n\n---\n\n"   # SINGLE mode only — разделитель между секциями промпта при их объединении в одно сообщение (режим SINGLE)
+    limits:
+      max-file-bytes: 262144              # максимальный размер одного файла промпта (в байтах), читаемого из Git
+      max-system-prompt-tokens: 6000      # максимальный суммарный размер системного промпта в токенах
+      min-diff-budget-tokens: 1000        # минимально допустимый остаток токенового бюджета под сам diff после вычитания промпта; если промпт "съедает" больше — ошибка
+      max-sections: 4                     # максимальное число промпт-секций (корпоративных + проектных), которые могут быть подмешаны в один Review
+      max-concurrent-resolutions: 4          # PMR-19 semaphore permits — сколько параллельных операций разрешения/загрузки промпт-файлов из Git допускается одновременно (ограничение семафором)
+    connect-timeout: 3s          # таймаут установления соединения при чтении промпт-файлов из GitLab
+    read-timeout: 8s             # таймаут чтения ответа при получении одного промпт-файла из GitLab
+    total-timeout: 20s           # суммарный таймаут на получение всех промпт-секций для одного Review
 
-# NOTE: gateway.security.*/gateway.gitlab.token MUST be >=32 chars (SR-01) and
-# gateway.gitlab.base-url MUST be https:// (SR-15) -- GatewayProperties fails startup otherwise.
-# All four secrets come from environment variables, never committed (see systemd EnvironmentFile /
-# a local .env excluded from version control for a dev deployment).
+# ПРИМЕЧАНИЕ: gateway.security.*/gateway.gitlab.token ОБЯЗАНЫ быть длиной >=32 символов (SR-01), а
+# gateway.gitlab.base-url ОБЯЗАН начинаться с https:// (SR-15) -- иначе GatewayProperties прерывает
+# запуск приложения. Все четыре секрета берутся из переменных окружения и никогда не коммитятся
+# (см. systemd EnvironmentFile / локальный .env, исключённый из системы контроля версий, для
+# dev-окружения).
+#
+# Prompt Manager (V3): gateway.prompt.enabled по умолчанию false (переменная окружения
+# PROMPT_MANAGER_ENABLED) -- пока он выключен, ничего из gateway.prompt.* ниже не валидируется при
+# старте (GatewayProperties.validatePromptOnStartup), и GITLAB_PROMPT_TOKEN никогда не требуется.
+# Чтобы включить функцию, установите PROMPT_MANAGER_ENABLED=true и подготовьте
+# GITLAB_PROMPT_TOKEN + PROMPT_CORPORATE_PROJECT (см. DEPLOYMENT.md §2).
