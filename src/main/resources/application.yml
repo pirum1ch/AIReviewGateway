@@ -63,6 +63,11 @@ gateway:
     max-comment-length: 4000        # максимальная длина одного комментария в символах
     max-raw-response-length: 200000 # SR-21 — максимальная длина "сырого" ответа LLM, сохраняемого в БД
     max-request-body-bytes: 500000  # SR-11 edge cap for POST /jobs/{id}/result — максимальный размер тела запроса POST /jobs/{id}/result в байтах
+    # DPR-10: ОБЯЗАНО совпадать с GatewayProperties.Publish#positionAnchoringEnabled (default true) --
+    # тот же класс дрейфа default'ов, что F-PM-02/F-DC-04. Kill-switch: false отключает якорение
+    # комментариев на конкретные строки diff'а (GitLab position), деградируя к сегодняшнему поведению
+    # (обычные top-level заметки) без перезапуска с пересборкой.
+    position-anchoring-enabled: ${POSITION_ANCHORING_ENABLED:true}   # включает привязку комментариев к конкретным строкам diff'а в GitLab (нативные diff-треды) вместо обычных заметок
   scheduler:
     heartbeat-check-interval: 30s   # как часто фоновый планировщик проверяет джобы на "зависание" по heartbeat
     backend-health-interval: 60s    # как часто планировщик опрашивает backend'ы (llama-server) для проверки их состояния

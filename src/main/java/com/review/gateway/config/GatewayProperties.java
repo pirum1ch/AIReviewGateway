@@ -630,6 +630,14 @@ public class GatewayProperties {
          * allow for JSON-escaping overhead plus the request's other (small) fields.
          */
         private long maxRequestBodyBytes = 500_000;
+        /**
+         * Diff Position Anchoring (DPR-10): kill-switch, default {@code true} — every failure mode of
+         * this feature degrades to today's plain-note behavior (DPT-13's endorsed default), so shipping
+         * it on is safe once DPT-01's containment is in place. Must match {@code application.yml}'s
+         * {@code ${POSITION_ANCHORING_ENABLED:true}} exactly (F-PM-02/F-DC-04 drift class — this is the
+         * third feature to carry this exact warning, so it is not optional to check by hand at merge).
+         */
+        private boolean positionAnchoringEnabled = true;
 
         public int getMaxCommentCount() {
             return maxCommentCount;
@@ -661,6 +669,14 @@ public class GatewayProperties {
 
         public void setMaxRequestBodyBytes(long maxRequestBodyBytes) {
             this.maxRequestBodyBytes = maxRequestBodyBytes;
+        }
+
+        public boolean isPositionAnchoringEnabled() {
+            return positionAnchoringEnabled;
+        }
+
+        public void setPositionAnchoringEnabled(boolean positionAnchoringEnabled) {
+            this.positionAnchoringEnabled = positionAnchoringEnabled;
         }
     }
 

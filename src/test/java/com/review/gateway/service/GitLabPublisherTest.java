@@ -1,14 +1,18 @@
 package com.review.gateway.service;
 
 import com.review.gateway.AbstractPostgresIntegrationTest;
+import com.review.gateway.config.GatewayProperties;
 import com.review.gateway.exception.GitLabPublishException;
 import com.review.gateway.model.Review;
 import com.review.gateway.model.ReviewComment;
+import com.review.gateway.model.ReviewInput;
 import com.review.gateway.model.enums.ReviewStatus;
 import com.review.gateway.model.enums.Severity;
 import com.review.gateway.repository.ReviewCommentRepository;
 import com.review.gateway.repository.ReviewEventRepository;
+import com.review.gateway.repository.ReviewInputRepository;
 import com.review.gateway.repository.ReviewRepository;
+import com.review.gateway.service.dto.DiffRefs;
 import com.review.gateway.service.dto.PublishOutcome;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -19,11 +23,13 @@ import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.util.List;
+import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -41,12 +47,18 @@ import static org.mockito.Mockito.when;
 @Transactional(propagation = Propagation.NOT_SUPPORTED)
 class GitLabPublisherTest extends AbstractPostgresIntegrationTest {
 
+    private static final String SHA_A = "a".repeat(40);
+    private static final String SHA_B = "b".repeat(40);
+    private static final String SHA_C = "c".repeat(40);
+
     @Autowired
     private ReviewRepository reviewRepository;
     @Autowired
     private ReviewCommentRepository reviewCommentRepository;
     @Autowired
     private ReviewEventRepository reviewEventRepository;
+    @Autowired
+    private ReviewInputRepository reviewInputRepository;
     @Autowired
     private PlatformTransactionManager transactionManager;
 
@@ -64,9 +76,16 @@ class GitLabPublisherTest extends AbstractPostgresIntegrationTest {
     }
 
     private GitLabPublisher newPublisher(GitLabClient gitLabClient) {
+        return newPublisher(gitLabClient, new GatewayProperties(), new DiffPositionResolver());
+    }
+
+    /** Diff Position Anchoring tests: lets a test supply its own flag state and/or a stubbed resolver. */
+    private GitLabPublisher newPublisher(GitLabClient gitLabClient, GatewayProperties properties,
+                                          DiffPositionResolver diffPositionResolver) {
         EventService eventService = new EventService(reviewEventRepository, new TextSanitizer());
         StateMachine stateMachine = new StateMachine(eventService);
-        return new GitLabPublisher(reviewRepository, reviewCommentRepository, stateMachine, gitLabClient, transactionManager);
+        return new GitLabPublisher(reviewRepository, reviewCommentRepository, reviewInputRepository, stateMachine,
+                gitLabClient, diffPositionResolver, properties, new MetricsCounters(), transactionManager);
     }
 
     private Review persistReview(String headSha, ReviewStatus status) {
@@ -86,7 +105,7 @@ class GitLabPublisherTest extends AbstractPostgresIntegrationTest {
         persistComment(review, "finding two");
 
         GitLabClient gitLabClient = Mockito.mock(GitLabClient.class);
-        when(gitLabClient.postDiscussion(any(), any(), any())).thenReturn("discussion-1", "discussion-2");
+        when(gitLabClient.postDiscussion(any(), any(), any(), any())).thenReturn("discussion-1", "discussion-2");
 
         GitLabPublisher publisher = newPublisher(gitLabClient);
         PublishOutcome outcome = publisher.publishReview(review.getId());
@@ -113,7 +132,7 @@ class GitLabPublisherTest extends AbstractPostgresIntegrationTest {
 
         assertThat(outcome).isEqualTo(PublishOutcome.PUBLISHED);
         assertThat(reviewRepository.findById(review.getId()).orElseThrow().getStatus()).isEqualTo(ReviewStatus.PUBLISHED);
-        verify(gitLabClient, never()).postDiscussion(any(), any(), any());
+        verify(gitLabClient, never()).postDiscussion(any(), any(), any(), any());
     }
 
     @Test
@@ -126,14 +145,14 @@ class GitLabPublisherTest extends AbstractPostgresIntegrationTest {
         persistComment(review, "still pending");
 
         GitLabClient gitLabClient = Mockito.mock(GitLabClient.class);
-        when(gitLabClient.postDiscussion(any(), any(), any())).thenReturn("new-discussion");
+        when(gitLabClient.postDiscussion(any(), any(), any(), any())).thenReturn("new-discussion");
 
         GitLabPublisher publisher = newPublisher(gitLabClient);
         PublishOutcome outcome = publisher.publishReview(review.getId());
 
         assertThat(outcome).isEqualTo(PublishOutcome.PUBLISHED);
-        verify(gitLabClient, org.mockito.Mockito.times(1)).postDiscussion(any(), any(), eq("still pending"));
-        verify(gitLabClient, never()).postDiscussion(any(), any(), eq("already done"));
+        verify(gitLabClient, times(1)).postDiscussion(any(), any(), eq("still pending"), any());
+        verify(gitLabClient, never()).postDiscussion(any(), any(), eq("already done"), any());
     }
 
     @Test
@@ -147,7 +166,7 @@ class GitLabPublisherTest extends AbstractPostgresIntegrationTest {
         PublishOutcome outcome = publisher.publishReview(review.getId());
 
         assertThat(outcome).isEqualTo(PublishOutcome.NOT_APPLICABLE);
-        verify(gitLabClient, never()).postDiscussion(any(), any(), any());
+        verify(gitLabClient, never()).postDiscussion(any(), any(), any(), any());
         assertThat(reviewRepository.findById(review.getId()).orElseThrow().getStatus()).isEqualTo(ReviewStatus.OBSOLETE);
     }
 
@@ -162,7 +181,7 @@ class GitLabPublisherTest extends AbstractPostgresIntegrationTest {
         PublishOutcome outcome = publisher.publishReview(review.getId());
 
         assertThat(outcome).isEqualTo(PublishOutcome.NOT_APPLICABLE);
-        verify(gitLabClient, never()).postDiscussion(any(), any(), any());
+        verify(gitLabClient, never()).postDiscussion(any(), any(), any(), any());
     }
 
     @Test
@@ -171,7 +190,7 @@ class GitLabPublisherTest extends AbstractPostgresIntegrationTest {
         persistComment(review, "will fail to publish");
 
         GitLabClient gitLabClient = Mockito.mock(GitLabClient.class);
-        when(gitLabClient.postDiscussion(any(), any(), any())).thenThrow(new GitLabPublishException("GitLab unavailable"));
+        when(gitLabClient.postDiscussion(any(), any(), any(), any())).thenThrow(new GitLabPublishException("GitLab unavailable"));
 
         GitLabPublisher publisher = newPublisher(gitLabClient);
         PublishOutcome outcome = publisher.publishReview(review.getId());
@@ -191,8 +210,8 @@ class GitLabPublisherTest extends AbstractPostgresIntegrationTest {
         persistComment(review, "will fail");
 
         GitLabClient gitLabClient = Mockito.mock(GitLabClient.class);
-        when(gitLabClient.postDiscussion(any(), any(), eq("will succeed"))).thenReturn("discussion-ok");
-        when(gitLabClient.postDiscussion(any(), any(), eq("will fail"))).thenThrow(new GitLabPublishException("boom"));
+        when(gitLabClient.postDiscussion(any(), any(), eq("will succeed"), any())).thenReturn("discussion-ok");
+        when(gitLabClient.postDiscussion(any(), any(), eq("will fail"), any())).thenThrow(new GitLabPublishException("boom"));
 
         GitLabPublisher publisher = newPublisher(gitLabClient);
         PublishOutcome outcome = publisher.publishReview(review.getId());
@@ -221,5 +240,95 @@ class GitLabPublisherTest extends AbstractPostgresIntegrationTest {
         PublishOutcome outcome = publisher.publishReview(review.getId());
 
         assertThat(outcome).isEqualTo(PublishOutcome.NOT_APPLICABLE);
+    }
+
+    // ---- Diff Position Anchoring (DPR-01/DPR-06/DPR-11) ----
+
+    @Test
+    void positionResolverThrowingStillPublishesEveryCommentAsAPlainNoteAndReachesPublished() {
+        // DPR-01: buildPositionContext's failure must never propagate out of publishReview -- a single
+        // poisoned diff (e.g. a crafted hunk header) degrades this Review to plain notes, not FAILED.
+        Review review = persistReview(SHA_A, ReviewStatus.COMPLETED);
+        persistComment(review, "finding one");
+        reviewInputRepository.saveAndFlush(new ReviewInput(review.getId(), "some diff", "v1", SHA_A, "base", 10));
+
+        GitLabClient gitLabClient = Mockito.mock(GitLabClient.class);
+        when(gitLabClient.fetchDiffRefs(any(), any())).thenReturn(Optional.of(new DiffRefs(SHA_B, SHA_C, SHA_A)));
+        when(gitLabClient.postDiscussion(any(), any(), any(), any())).thenReturn("discussion-1");
+
+        DiffPositionResolver throwingResolver = Mockito.mock(DiffPositionResolver.class);
+        when(throwingResolver.resolve(any(), any())).thenThrow(new RuntimeException("boom: crafted hunk header"));
+
+        GitLabPublisher publisher = newPublisher(gitLabClient, new GatewayProperties(), throwingResolver);
+        PublishOutcome outcome = publisher.publishReview(review.getId());
+
+        assertThat(outcome).isEqualTo(PublishOutcome.PUBLISHED);
+        verify(gitLabClient).postDiscussion(any(), any(), eq("finding one"), org.mockito.ArgumentMatchers.isNull());
+    }
+
+    @Test
+    void flagOffMeansZeroFetchDiffRefsCallsAndStillPublishes() {
+        // DPR-11: the flag is checked before any I/O.
+        Review review = persistReview(SHA_A, ReviewStatus.COMPLETED);
+        persistComment(review, "finding one");
+
+        GitLabClient gitLabClient = Mockito.mock(GitLabClient.class);
+        when(gitLabClient.postDiscussion(any(), any(), any(), any())).thenReturn("discussion-1");
+
+        GatewayProperties properties = new GatewayProperties();
+        properties.getPublish().setPositionAnchoringEnabled(false);
+        GitLabPublisher publisher = newPublisher(gitLabClient, properties, new DiffPositionResolver());
+
+        PublishOutcome outcome = publisher.publishReview(review.getId());
+
+        assertThat(outcome).isEqualTo(PublishOutcome.PUBLISHED);
+        verify(gitLabClient, never()).fetchDiffRefs(any(), any());
+    }
+
+    @Test
+    void headShaMismatchFallsBackToPlainNotes() {
+        // DPR-06: diff_refs.head_sha (SHA_B) does not equal review.headSha (SHA_A) -- stale MR state,
+        // anchoring must be skipped, never a prefix/startsWith match.
+        Review review = persistReview(SHA_A, ReviewStatus.COMPLETED);
+        persistComment(review, "finding one");
+        reviewInputRepository.saveAndFlush(new ReviewInput(review.getId(), "some diff", "v1", SHA_A, "base", 10));
+
+        GitLabClient gitLabClient = Mockito.mock(GitLabClient.class);
+        when(gitLabClient.fetchDiffRefs(any(), any())).thenReturn(Optional.of(new DiffRefs(SHA_A, SHA_C, SHA_B)));
+        when(gitLabClient.postDiscussion(any(), any(), any(), any())).thenReturn("discussion-1");
+
+        GitLabPublisher publisher = newPublisher(gitLabClient, new GatewayProperties(), new DiffPositionResolver());
+        PublishOutcome outcome = publisher.publishReview(review.getId());
+
+        assertThat(outcome).isEqualTo(PublishOutcome.PUBLISHED);
+        verify(gitLabClient).fetchDiffRefs(review.getProjectId(), review.getMergeRequestId());
+        verify(gitLabClient).postDiscussion(any(), any(), eq("finding one"), org.mockito.ArgumentMatchers.isNull());
+    }
+
+    @Test
+    void matchingHeadShaAndAResolvableLineAttachesAPosition() {
+        Review review = persistReview(SHA_A, ReviewStatus.COMPLETED);
+        persistComment(review, "finding one"); // filePath="A.java", lineNumber=1 (see persistComment)
+        String diff = "diff --git a/A.java b/A.java\n"
+                + "--- a/A.java\n"
+                + "+++ b/A.java\n"
+                + "@@ -1,1 +1,1 @@\n"
+                + "+new line\n";
+        reviewInputRepository.saveAndFlush(new ReviewInput(review.getId(), diff, "v1", SHA_A, "base", 10));
+
+        GitLabClient gitLabClient = Mockito.mock(GitLabClient.class);
+        when(gitLabClient.fetchDiffRefs(any(), any())).thenReturn(Optional.of(new DiffRefs(SHA_B, SHA_C, SHA_A)));
+        when(gitLabClient.postDiscussion(any(), any(), any(), any())).thenReturn("discussion-1");
+
+        GitLabPublisher publisher = newPublisher(gitLabClient, new GatewayProperties(), new DiffPositionResolver());
+        PublishOutcome outcome = publisher.publishReview(review.getId());
+
+        assertThat(outcome).isEqualTo(PublishOutcome.PUBLISHED);
+        org.mockito.ArgumentCaptor<com.review.gateway.service.dto.DiffPosition> captor =
+                org.mockito.ArgumentCaptor.forClass(com.review.gateway.service.dto.DiffPosition.class);
+        verify(gitLabClient).postDiscussion(any(), any(), eq("finding one"), captor.capture());
+        assertThat(captor.getValue()).isNotNull();
+        assertThat(captor.getValue().newPath()).isEqualTo("A.java");
+        assertThat(captor.getValue().newLine()).isEqualTo(1);
     }
 }
