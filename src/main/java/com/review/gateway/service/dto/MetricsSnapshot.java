@@ -22,5 +22,9 @@ public record MetricsSnapshot(
         long promptDisabledCount,
         long promptSectionMissingCount,
         Map<String, Long> ownershipMismatches,
-        long workerFailureReportsIgnored) {
+        long workerFailureReportsIgnored,
+        long positionsAnchored,
+        long positionsUnresolved,
+        long diffRefsUnavailable,
+        long positionRejectedByGitLab) {
 }

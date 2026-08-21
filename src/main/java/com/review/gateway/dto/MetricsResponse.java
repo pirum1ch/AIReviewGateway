@@ -19,5 +19,10 @@ public record MetricsResponse(
         long promptDisabledCount,
         long promptSectionMissingCount,
         Map<String, Long> ownershipMismatches,
-        long workerFailureReportsIgnored) {
+        long workerFailureReportsIgnored,
+        boolean positionAnchoringEnabled,
+        long positionsAnchored,
+        long positionsUnresolved,
+        long diffRefsUnavailable,
+        long positionRejectedByGitLab) {
 }
