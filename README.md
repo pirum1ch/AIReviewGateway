@@ -48,7 +48,10 @@ GitLab CI job  ──POST /reviews──▶  Review Gateway  ──▶  PostgreS
        │                       (OpenAI-Chat-Completions-compatible)
        │
        └──────── discussions posted to the Merge Request ◀── GitLab API
-                 (Gateway → GitLab, via a configured project/group token)
+                 (Gateway → GitLab, via a configured project/group token; comments with a resolvable
+                 file+line are anchored to that diff position — native diff threads, not just top-level
+                 notes — Diff Position Anchoring, see `gateway.publish.position-anchoring-enabled` in §4.2
+                 and `docs/diff-position-anchoring-architecture.md`)
 ```
 
 - **GitLab CI** submits a diff for a Merge Request and gets a review id back immediately; it does not
@@ -123,7 +126,7 @@ for the URL check, the scheme.
 | `CI_TOKEN` | `gateway.security.ci-token` | Bearer token for GitLab-CI-facing endpoints (`POST /reviews`, `GET /reviews/{id}`). **≥32 chars.** |
 | `WORKER_TOKEN` | `gateway.security.worker-token` | Bearer token for Worker-facing endpoints (`POST /jobs/**`). **≥32 chars.** |
 | `ADMIN_TOKEN` | `gateway.security.admin-token` | Bearer token for admin endpoints (`DELETE /reviews/{id}`, `GET /backends`, `GET /metrics`). **≥32 chars.** |
-| `GITLAB_TOKEN` | `gateway.gitlab.token` | Token the Gateway itself uses to call the GitLab API when publishing comments (`PRIVATE-TOKEN` header). Never exposed to CI or Workers. **Presence-only check — a real `glpat-...` token (26 chars) is expected and accepted.** |
+| `GITLAB_TOKEN` | `gateway.gitlab.token` | Token the Gateway itself uses to call the GitLab API when publishing comments (`PRIVATE-TOKEN` header). Never exposed to CI or Workers. **Presence-only check — a real `glpat-...` token (26 chars) is expected and accepted.** **Diff Position Anchoring** (`gateway.publish.position-anchoring-enabled`, default `true`) additionally uses this token for a *read* call (`GET /projects/{id}/merge_requests/{iid}`, to fetch `diff_refs`) — it now needs **Reporter+/`api`** access to the reviewed MRs, not just write access to post discussions. A token that lacks this read scope degrades **silently** to plain (non-anchored) notes; set `gateway.publish.position-anchoring-enabled=false` if you cannot widen the token's scope. |
 | `DB_USER` | `spring.datasource.username` | PostgreSQL username. No default. |
 | `DB_PASSWORD` | `spring.datasource.password` | PostgreSQL password. No default. |
 
@@ -165,6 +168,7 @@ kill-switch at its default, this token is never required and `validatePromptOnSt
 | `gateway.publish.max-comment-length` | `4000` | Max characters per parsed comment; excess is truncated. |
 | `gateway.publish.max-raw-response-length` | `200000` | Max characters of the raw LLM response actually persisted; oversized responses are truncated (not rejected) before storage and parsing. |
 | `gateway.publish.max-request-body-bytes` | `500000` | Hard byte cap on the whole `POST /jobs/{id}/result` body (edge filter, see [§6.9](#69-body-size-limits)). |
+| `gateway.publish.position-anchoring-enabled` | `true` | **Diff Position Anchoring.** Anchors published comments that have a resolvable `(file, line)` to that diff position (native GitLab diff thread) instead of a top-level note. Every failure mode (flag off, stale/short `headSha`, GitLab unreachable, unresolvable line) degrades silently to today's plain-note behavior — never fails a Review. Requires `GITLAB_TOKEN` to additionally have read access to the reviewed MRs (see [§4.1](#41-required-secrets-no-default--startup-fails-without-them)); a token lacking that scope also degrades silently to plain notes. `false` is the supported kill switch. |
 | `gateway.scheduler.heartbeat-check-interval` | `30s` | Tick interval for the stale-heartbeat sweep and the max-duration sweep. |
 | `gateway.scheduler.backend-health-interval` | `60s` | Tick interval for the backend health probe. |
 | `gateway.scheduler.publish-retry-interval` | `60s` | Tick interval for retrying publication of `COMPLETED` reviews. |
@@ -659,16 +663,26 @@ curl -s http://localhost:8080/metrics -H "Authorization: Bearer $ADMIN_TOKEN"
   "totalComments": 214,
   "retries": 5,
   "ownershipMismatches": { "heartbeat": 0, "result": 0, "fail": 0 },
-  "workerFailureReportsIgnored": 0
+  "workerFailureReportsIgnored": 0,
+  "positionAnchoringEnabled": true,
+  "positionsAnchored": 142,
+  "positionsUnresolved": 9,
+  "diffRefsUnavailable": 0,
+  "positionRejectedByGitLab": 1
 }
 ```
-`ownershipMismatches` (broken down by endpoint) and `workerFailureReportsIgnored` (Worker Observability &
-Claim Latency, WOR-03) are process-local, in-memory counters — they reset on a Gateway restart, unlike
-every other field on this endpoint, which is derived from PostgreSQL. This is deliberate: writing a
-`review_events` row for every rejected/no-op `POST /jobs/{id}/fail` report would turn the endpoint into an
-authenticated, unbounded `INSERT` primitive for any worker-token holder — a worse problem than the
-repudiation gap these counters close. A `workerId`-guessing campaign against `/jobs/**` is necessarily
-noisy; these counters (plus the existing `WARN` logs) are what makes that noise visible without that risk.
+`ownershipMismatches` (broken down by endpoint), `workerFailureReportsIgnored` (Worker Observability &
+Claim Latency, WOR-03), and the four Diff Position Anchoring counters — `positionsAnchored` (a comment was
+successfully anchored to a diff position), `positionsUnresolved` (a comment had a `file`/`line` but no
+matching diff line was found), `diffRefsUnavailable` (`fetchDiffRefs` came back empty — network, stale MR
+state, or an insufficiently-scoped token), `positionRejectedByGitLab` (GitLab 400'd a positioned POST and
+the position-less fallback ran) — are all process-local, in-memory counters that reset on a Gateway
+restart, unlike every other field on this endpoint, which is derived from PostgreSQL. This is deliberate
+for the same reason in both cases: writing a `review_events` row for every one of these would turn the
+endpoint into an authenticated, unbounded `INSERT` primitive (for a worker-token holder in the first case,
+for anyone triggering a publish pass in the second). Every failure mode of Diff Position Anchoring is
+silent by design (it always falls back to a plain note, never fails a Review) — these four counters are
+the only way to notice "anchoring stopped working" without reading logs.
 
 ### 6.8 Error format
 
@@ -819,7 +833,7 @@ transition is validated and applied in exactly one place (`StateMachine`) and wr
 | `RUNNING → COMPLETED` | `POST /jobs/{id}/result` is processed successfully. |
 | `RUNNING → QUEUED` | Heartbeat timeout, max-duration backstop, **or** a Worker-reported failure (`POST /jobs/{id}/fail`) — any of the three, **and** attempts remaining (retry). |
 | `RUNNING → FAILED` | Any of the three triggers above with attempts exhausted, **or** the result could not be parsed at all. |
-| `COMPLETED → PUBLISHED` | All parsed comments were successfully posted to the MR. |
+| `COMPLETED → PUBLISHED` | All parsed comments were successfully posted to the MR (as native diff threads where a comment's `file`/`line` could be resolved against the stored diff — Diff Position Anchoring, `gateway.publish.position-anchoring-enabled` — otherwise as a plain top-level note, identical to pre-feature behavior). |
 | `COMPLETED → COMPLETED` | A transient GitLab API failure during publish — stays `COMPLETED`, retried later; not a state change, no new event. |
 | `(NEW/QUEUED/RUNNING/COMPLETED) → OBSOLETE` | A new `head_sha` arrives for the same `(projectId, mergeRequestId)`. |
 | `(NEW/QUEUED/RUNNING/COMPLETED) → CANCELLED` | `DELETE /reviews/{id}` (admin). |

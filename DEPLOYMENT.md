@@ -150,6 +150,19 @@ to it. The root README's own recommendation (from the threat model) is to make t
 group-scoped and expiring**, not a full personal access token — this is an operational choice made when
 the token is issued in GitLab, not something the application enforces.
 
+**Diff Position Anchoring widens this token's required scope.** With
+`gateway.publish.position-anchoring-enabled` at its default (`true`), the Gateway also calls
+`GET /projects/{id}/merge_requests/{iid}` with this same token (`GitLabClientImpl.fetchDiffRefs`) to
+resolve the MR's current `diff_refs` — this is a **read**, not a write, but it means the `api` scope above
+must also come with **Reporter+** role on the projects under review (the `api` scope alone does not imply
+read access if the token's role is below Reporter). A token that already has `api` + Developer, as
+recommended above, already satisfies this — no separate token is minted for this read (a third credential
+was considered and rejected: see `docs/diff-position-anchoring-threat-model.md` §4.5). If the token
+genuinely cannot be widened, the deployment still boots and posts comments exactly as before; anchoring
+just silently never activates (`GET /metrics`'s `diffRefsUnavailable` counter climbs, `positionsAnchored`
+stays at 0) — set `POSITION_ANCHORING_ENABLED=false` to make that an explicit, documented choice instead
+of an accidental one.
+
 **How the Worker gets the `WORKER_TOKEN` value.** There is no token-exchange mechanism — the Worker's own
 `GATEWAY_API_KEY` environment variable must simply be set to the **exact same value** as the Gateway's
 `WORKER_TOKEN` (verified: `worker.gateway.api-key` is sent as `Authorization: Bearer` on every Worker→Gateway
@@ -281,7 +294,12 @@ ADMIN_TOKEN=<32+ char random value>
 
 # --- GitLab (§2 Token generation; publishing MR comments) ---
 GITLAB_BASE_URL=https://gitlab.local/api/v4
-GITLAB_TOKEN=<GitLab project/group access token, api scope>
+GITLAB_TOKEN=<GitLab project/group access token, api scope, Reporter+ role -- see §2 for why Reporter+>
+
+# --- Diff Position Anchoring (optional; defaults to true -- comments anchor to a diff position when
+# resolvable, else fall back to a plain note). Set to false only if GITLAB_TOKEN cannot be given the
+# Reporter+ read scope §2 describes, or as an emergency kill switch. ---
+# POSITION_ANCHORING_ENABLED=true
 
 # --- Backend network restriction (SAST-report must-do #1): tighten from the
 # permissive ".*" default to the actual llama-server network. The Gateway only
@@ -580,18 +598,37 @@ headSha)` already existed — dedup, root [README §8](README.md#8-review-lifecy
 
 ### 7.3 What the Gateway needs from GitLab, and the resulting MR flow
 
-The Gateway calls exactly one GitLab API endpoint, via `GitLabClientImpl.postDiscussion`:
+The Gateway's write-scoped `GITLAB_TOKEN` drives two GitLab API calls, both in `GitLabClientImpl`
+(Prompt Manager's three separate reads, if opted into, use the different `GITLAB_PROMPT_TOKEN` and are
+documented in [§4.4 of the README](README.md#44-prompt-manager-v3-optional) — not this token, not this
+section):
 
 ```
 POST {GITLAB_BASE_URL}/projects/{projectId}/merge_requests/{mergeRequestIid}/discussions
 Header: PRIVATE-TOKEN: <GITLAB_TOKEN>
 Body:   { "body": "<one parsed comment's text>" }
+        # or, when the comment's file+line resolved against the stored diff (Diff Position Anchoring,
+        # gateway.publish.position-anchoring-enabled, default true):
+        # { "body": "...", "position": { "position_type": "text", "base_sha": "...", "start_sha": "...",
+        #   "head_sha": "...", "old_path": "...", "new_path": "...", "new_line": 42 } }
 ```
 
 — once per parsed review comment (not one combined comment), each in its own request, each tracked by
-the returned discussion `id` (stored in `review_comments.discussion_id`) for idempotent retry. This is
-the **only** direction of GitLab traffic; the Gateway never reads anything else from the GitLab API
-(no MR metadata fetch, no repository access).
+the returned discussion `id` (stored in `review_comments.discussion_id`) for idempotent retry. If GitLab
+rejects a positioned request with `400`, the Gateway retries that one comment exactly once with the
+`position` omitted before giving up.
+
+```
+GET {GITLAB_BASE_URL}/projects/{projectId}/merge_requests/{mergeRequestIid}
+Header: PRIVATE-TOKEN: <GITLAB_TOKEN>
+```
+
+— **Diff Position Anchoring**'s one read call (`GitLabClientImpl.fetchDiffRefs`), issued at most once per
+publish attempt per Review, and only when at least one unpublished comment has both a `file` and a `line`
+(never per-comment, never when the flag is off). Only `diff_refs.{base_sha,start_sha,head_sha}` is ever
+read from the response — every other MR field (title, description, labels, ...) is ignored. This is what
+requires the widened token scope described in [§2](#2-prerequisites); on any failure (including a token
+that lacks read access) this call degrades to "publish as a plain note", never to a failed Review.
 
 End-to-end MR flow: CI job posts the diff (`POST /reviews`, `202`-equivalent `201`/`200` + `reviewId`) →
 Gateway queues it (`QUEUED`) → a Worker claims and runs it (`RUNNING`) → the parsed comments are stored
@@ -779,7 +816,10 @@ WORKER_TOKEN=<32+ char random value>
 ADMIN_TOKEN=<32+ char random value>
 
 GITLAB_BASE_URL=https://gitlab.local/api/v4
-GITLAB_TOKEN=<GitLab project/group access token, api scope, Developer+ role>
+GITLAB_TOKEN=<GitLab project/group access token, api scope, Reporter+ role (Diff Position Anchoring needs read access too, see §2)>
+
+# Diff Position Anchoring (optional; defaults to true). Uncomment to disable.
+# POSITION_ANCHORING_ENABLED=false
 
 BACKEND_ALLOWED_HOST_PATTERN=^192\.168\.1\.101$
 
