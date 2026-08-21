@@ -156,10 +156,12 @@ class DiffPositionResolverTest {
 
     @Test
     void addedLineStartingWithPlusPlusSpaceIsTreatedAsHunkBodyAndALaterLineInTheSameHunkStillResolves() {
-        // An added line whose content happens to start with "++ " serializes as "+++ <text>". Pre-fix,
-        // that was misread as a new file header (garbage path, inHunk reset to false), which would have
-        // made the hunk's later "+real added" line unresolvable.
-        String diff = "--- a/A.java\n+++ b/A.java\n@@ -1,1 +1,3 @@\n context\n++ trap line\n+real added\n";
+        // An added line whose content happens to start with "++ " serializes as "+++ <text>" -- note the
+        // THREE '+' (marker + the two content characters); a two-'+' literal would not match
+        // startsWith("+++ ") at all and so would never exercise this guard (it passed pre-fix too).
+        // Pre-fix, this line was misread as a new file header (garbage path, inHunk reset to false),
+        // which made the hunk's later "+real added" line unresolvable.
+        String diff = "--- a/A.java\n+++ b/A.java\n@@ -1,1 +1,3 @@\n context\n+++ trap line\n+real added\n";
 
         Map<PathLine, ResolvedLine> result = resolver.resolve(diff, wanted(new PathLine("A.java", 3)));
 
@@ -167,6 +169,24 @@ class DiffPositionResolverTest {
         assertThat(resolved).isNotNull();
         assertThat(resolved.newPath()).isEqualTo("A.java");
         assertThat(resolved.newLine()).isEqualTo(3);
+    }
+
+    @Test
+    void anExhaustedHunkBudgetReEnablesHeaderRecognitionForAPrefixlessMultiFileDiff() {
+        // The load-bearing half of F-DP-01's guard: it must suppress header recognition only WHILE the
+        // hunk's declared budget is unconsumed, and hand it back the moment the budget is exhausted.
+        // A naive "&& !state.inHunk" guard would pass the two tests above but fail here -- the second
+        // file's "--- ./y.java"/"+++ ./y.java" arrive with inHunk still true (there is no "diff --git"
+        // line to reset state), so its line would be emitted under the FIRST file's path.
+        String diff = "--- a/x.java\n+++ b/x.java\n@@ -1,1 +1,2 @@\n ctx\n+added\n"
+                + "--- ./y.java\n+++ ./y.java\n@@ -1,1 +1,2 @@\n ctx\n+second file line\n";
+
+        Map<PathLine, ResolvedLine> result = resolver.resolve(diff, wanted(new PathLine("y.java", 2)));
+
+        ResolvedLine resolved = result.get(new PathLine("y.java", 2));
+        assertThat(resolved).isNotNull();
+        assertThat(resolved.newPath()).isEqualTo("y.java");
+        assertThat(resolved.oldPath()).isEqualTo("y.java"); // not x.java -- both headers were recognised
     }
 
     // ---- basic resolution: added / context / removed / multi-hunk / multi-file ----

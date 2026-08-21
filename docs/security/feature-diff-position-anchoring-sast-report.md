@@ -187,3 +187,209 @@ no new credential; rollback is safe both directions; 692 tests green on two inde
 The three Low findings are all in the "make the silent thing observable / keep it correct next year"
 category, none of them changes the fail-safe invariant, and each has a fix measured in single-digit lines.
 **Sign off for merge to `master`**, with the follow-up list above tracked rather than gated.
+
+---
+
+# Final verification round (release gate) — HEAD `7209554` + this commit
+
+Scope: the developer's three fix commits `74e40c4` (F-DP-01) → `7862726` (F-DP-02) → `7209554` (F-DP-03),
+i.e. `af9bfc4..HEAD`: 6 files, +202/−24, **zero dependency delta** (`git diff af9bfc4..HEAD -- pom.xml
+worker/pom.xml` is empty), zero migrations, zero new endpoints, zero new config keys. Method: read each
+diff rather than the summary; then **empirically discriminate every new test** by compiling the pre-fix
+(`af9bfc4`) and post-fix (`HEAD`) `DiffPositionResolver` side by side as standalone classes and running
+both over each test's exact diff literal, plus a third "naive `!state.inHunk` guard" variant to check what
+the new tests would and would not catch.
+
+**Suite (run by me, JDK 26 / Maven 3.9.14):** `mvn -o test` → **`Tests run: 696, Failures: 0, Errors: 0,
+Skipped: 0`, BUILD SUCCESS** — matches the developer's reported number exactly. After the two test-side
+corrections I landed in this commit (below): **697**, still 0/0/0.
+
+**Scanners (re-run by me against current HEAD, Docker):**
+- `semgrep`, exact SR-23 gate config (`p/java` + `p/sql-injection` + `p/secrets`, `--severity ERROR`) over
+  `src/main/java` → **0 findings**, 56 rules on 122 files — byte-identical posture to the first round.
+- The **four custom threat-model-§7 rules**, rebuilt and re-run over `DiffPositionResolver`/
+  `GitLabPublisher`/`GitLabClientImpl`/`PublishRetryService` → **0 findings**. **Discriminator-checked
+  again**: 4/4 fire on a freshly-poisoned copy of the current HEAD sources (a `throw`, an
+  `Integer.parseInt`, a `review.getHeadSha()` log argument, and a `Map` log argument). This is the check
+  that matters most this round, because F-DP-01 rewrote the number-parsing path that **DPR-02** governs —
+  `dp-no-throw-in-resolver` and `dp-no-integer-parse-in-resolver` are still clean on the rewritten code.
+- `gitleaks` full history (`.gitleaks.toml`) → **no leaks found**, 122 commits / 2.91 MB (was 118 commits).
+- SCA: unchanged — zero dependency delta, verified-clean baseline carries over.
+
+## Verdict: **SIGN OFF — merge to `master`.** All three Lows are genuinely closed.
+
+Severity counts for this round: Critical 0 · High 0 · Medium 0 · Low 0 · **Info 2 (both closed by me in
+this commit)** · Info 3 (recorded, no action).
+
+---
+
+### F-DP-01 — hunk-body `--- `/`+++ ` misparsed as file headers → **CLOSED (fix correct)**
+
+The fix is real and it is the shape I asked for, not a cheaper approximation. `HunkHeader` gained
+`oldCount`/`newCount` parsed from the optional `,b`/`,d` (defaulting to **1** when omitted, which is the
+correct unified-diff convention); `State` carries `hunkOldRemaining`/`hunkNewRemaining`; `activeHunkBody`
+is `inHunk && (oldRemaining > 0 || newRemaining > 0)`; both header branches are guarded by
+`&& !activeHunkBody(state)`. The decrement placement is **exactly** right and this is the part that had to
+be checked line by line: `+` decrements new only, `-` decrements old only, `' '` decrements both, `'\'`
+(the "\ No newline" marker) decrements neither. That is precisely the unified-diff accounting, so on a
+well-formed hunk both budgets reach zero simultaneously at the natural end of the hunk — the guard hands
+header recognition back at the right instant rather than approximately.
+
+**DPR-02 totality re-verified against the rewritten parser** (this is the one that mattered — DPR-02 was
+one of the eleven blocking MUSTs and F-DP-01 touches exactly the code it governs):
+- **No new `throw`, no new throwing parse.** `parseLeadingNumber` became `scanLeadingNumber` returning a
+  `NumberScan(value, end)` record; the arithmetic is unchanged (same bounded 9-digit scan, same
+  `value * 10 + digit` accumulation, same `-1` sentinel). `parseOptionalCount` is a pure
+  `charAt`/delegate. Both Semgrep rules confirm it, discriminator-checked.
+- **No new index-out-of-bounds surface.** `parseOptionalCount`'s `line.charAt(afterStart)` is guarded by
+  `afterStart >= line.length()`; `afterStart` is `NumberScan.end`, which is `≤ line.length()` by the scan
+  loop's own bound, and `afterStart + 1 ≤ line.length()` follows, so the recursive scan can only ever
+  return the zero-digit `-1`. Verified by reading and by ~19 adversarial shapes run through the compiled
+  class without a throw.
+- **No new overflow.** The counts are `long` and are only ever decremented, one per diff line, so with
+  CSR-01's 194,880-char cap the reachable range is roughly `[-195_000, 999_999_999]` — nowhere near
+  `long` underflow. Deliberately unclamped at zero, which is fine: negative simply means "budget spent",
+  the same as zero, for the only predicate that reads it.
+- **`@@` handling is deliberately *not* budget-guarded**, so a hunk header always restarts resolution
+  even after a corrupt hunk — the escape hatch that keeps the parser from wedging. Correct call.
+
+**Empirical non-regression over the DPR-02 adversarial suite (the "green but meaningless" check).** I ran
+every adversarial shape through both the pre-fix and post-fix classes and compared resolved maps, not just
+exit status:
+
+| Shape | pre-fix | post-fix | assessment |
+|---|---|---|---|
+| `@@ -1 +1 @@` (counts omitted — real git single-line hunk) | HIT | HIT | **critical non-regression, holds** |
+| `@@ -1,2 +1,2 @@ void foo()` (git funcname suffix) | HIT | HIT | holds |
+| 21-digit start, bare `@@`, `@@ -`, `@@ - + @@`, no-`+` header, `+++ ` with no path, 100k-line hunk, lone surrogate, NUL, `\r`-only, 195k single line, unexpected marker | identical | identical | all 13 DPR-02 cases keep their original meaning |
+| well-formed prefix-less 2-file diff | HIT `y.java`/`y.java` | HIT `y.java`/`y.java` | **the case a naive `!state.inHunk` guard would break — holds** |
+| `@@ -1,x +1,1 @@`, `@@ -1,, +1,1 @@`, 10-digit count | HIT | MISS | new, strictly-more-conservative reject; fail-safe (§below) |
+| inflated count (declared 100, body 1 line) | HIT `B.java` | MISS | new, fail-safe (§below) |
+
+The `ambiguousDiffDerivedPathsAreDroppedFromTheIndexEntirely` test was the specific "still green but now
+meaningless?" risk, since `doesNotContainKey` is satisfied both by the ambiguity-drop working *and* by the
+second file never being registered at all. **Traced and cleared:** the second file's `--- ./x.java` *is*
+now swallowed as hunk body (the fixture's `@@ -1,1 +1,1 @@` declares an old line the body never supplies,
+so the old budget never drains), but its `+++ ./x.java` arrives with both budgets at zero and **is** still
+recognised — and `registerPath` is called only from the `+++` branch, so the ambiguity is still genuinely
+registered and the assertion still means what it says. Verified by the run above, not by reading alone.
+
+**Two new fail-safe behaviour changes, both accepted, neither a finding:** a malformed or >9-digit `,count`
+now rejects the whole hunk header (previously the header was accepted and the count ignored), and a
+count-inflated hunk swallows the *next* file's headers. Both require a diff git cannot produce; both lose
+an anchor rather than creating a wrong one; and the structural key==value invariant re-verified in the
+first round still holds — I re-confirmed empirically that even under an inflated count the resolver emits
+`new_path`/`new_line` identical to the map key it matched, so a comment naming `(P, L)` still cannot be
+anchored anywhere but `P:L`. The one cosmetic casualty is `old_path`, which can pair across files on such
+a diff; GitLab's server-side position validation rejects that → DPR-08 fallback → plain note, i.e. the
+same fail-safe the original F-DP-01 write-up documented.
+
+**Test quality — one real defect, fixed by me in this commit (F-DP-10 below).** Of the two new regression
+tests, the removed-line one is a genuine discriminator (pre-fix MISS → post-fix HIT, proven). The
+added-line one was **vacuous**: its literal was `++ trap line` (two `+`), which never matches
+`startsWith("+++ ")`, so it exercised no guard at all and **passed against the pre-fix class**, proven by
+running it there. With the literal corrected to `+++ trap line` it becomes a real discriminator (pre-fix
+MISS → post-fix HIT, also proven).
+
+### F-DP-02 — DPR-12 counters blind on total-unresolvability and stale `head_sha` → **CLOSED**
+
+Both halves land, and both new tests are genuine discriminators (each asserts a counter that reads **0**
+against the pre-fix code):
+- The `if (resolved.isEmpty()) return null;` early return is gone; an empty-`resolved` `PositionContext`
+  now flows into `resolvePositionFor`, which counts each miss. `totalResolutionMissMovesPositionsUnresolved
+  NotJustAPartialMiss` builds the real end-to-end shape (real `DiffPositionResolver`, a persisted
+  `ReviewInput` whose diff names `Other.java` while the comment names `A.java:1`, matching `head_sha`) and
+  asserts `positionsUnresolved == 1` **and** `positionsAnchored == 0` **and** `diffRefsUnavailable == 0` —
+  all three, so it pins which counter moved, not merely that one did. Pre-fix: `0/0/0`.
+- The `head_sha`-mismatch branch increments `diffRefsUnavailable`; the existing
+  `headShaMismatchFallsBackToPlainNotes` gained the same three-way assertion. I checked the fixture's
+  `DiffRefs(baseSha, startSha, headSha)` argument order against the record declaration — both tests set
+  `headSha` in the right slot, so the mismatch/match arms really are what their names claim.
+- No double-count and no new cost: the `null` return still short-circuits `resolvePositionFor` at
+  `positionContext == null` (asserted by the `positionsUnresolved == 0` arm), and an empty-map context
+  costs one `HashMap` miss per comment.
+
+**On reusing `diffRefsUnavailable` instead of adding a fifth counter — my independent judgement, since
+this was the developer's call, not a pre-approved one.** My original remediation offered both options and
+explicitly said the fifth counter "is more diagnosable"; it did not endorse the reuse. Judging it on the
+merits now: **the reuse is acceptable and I am not asking for a split.** The two modes are distinguishable
+where it counts — each branch already logs its own distinct DEBUG reason (verified, and neither echoes the
+SHA it is complaining about, so DPR-04 is untouched) — and the metric's job here is to be a smoke alarm,
+not the diagnosis. The stale-`head_sha` case is also rarer than it first looks: a new `head_sha` normally
+drives the Review to `OBSOLETE`, and `publishReview` skips anything not `COMPLETED`, so the mismatch fires
+only in a narrow race rather than as steady-state traffic on a busy repo. Pre-fix the branch moved nothing
+at all, so this is a strict improvement either way.
+
+**But the reuse did degrade one documented operational promise, and the fix missed it.** `README.md` §6.7
+was correctly updated to name both causes; `DEPLOYMENT.md` §2 was not, and it is the one that tells the
+operator how to *diagnose* an under-scoped token: "`diffRefsUnavailable` climbs, `positionsAnchored` stays
+at 0". That signature now has a second, benign producer. Recorded as **F-DP-11** and fixed by me in this
+commit — the sentence now names all three causes, points at the DEBUG reasons that separate them, and
+gives the two distinguishing signatures (sustained + `positionsAnchored == 0` across every Review = token
+scope; intermittent alongside a healthy non-zero `positionsAnchored` = the stale-MR race, no action).
+
+### F-DP-03 — no drift guard between the Java default and `application.yml` → **CLOSED (empirically proven)**
+
+I did not take this one on reading, because a config-drift test that passes vacuously is worse than none.
+Three probes, all run:
+
+1. **Drift is caught.** Flipping the shipped `src/main/resources/application.yml` to
+   `${POSITION_ANCHORING_ENABLED:false}` makes
+   `shippedApplicationYamlBindsPositionAnchoringEnabledToTheJavaDefault` **fail**, with its own message.
+   Restored clean afterwards (`git status` empty). This is the drift class that shipped three times
+   (F-PM-02, F-DC-04, WOC-16) and it is now genuinely gated.
+2. **Hermetic against the environment.** Running the class with `POSITION_ANCHORING_ENABLED=false` in the
+   process environment still passes — `PropertySourcesPlaceholdersResolver(mutableSources)` resolves only
+   against the loaded yml, never process env or system properties. That is the *right* behaviour (a CI box
+   with that variable set must not turn this into a flake), but the helper's inline comment claims the
+   opposite ("against process env/system properties, same as a real Spring Environment would"). Comment-
+   only inaccuracy in test code, recorded as Info, no change requested.
+3. **Vacuous-pass boundary, assessed and accepted.** Deleting the key from the yml entirely leaves the test
+   green. That is correct rather than a hole: with the key absent, the runtime effective value *is* the
+   Java default, so there is no drift to catch by definition. What a key rename/typo would silently break
+   is the `POSITION_ANCHORING_ENABLED` env override — a functional concern, not DPR-10's, and out of scope.
+
+The `bindShippedConfig(prefix, subtree)` refactor itself is clean: no new dependency, no reflection, the
+`Function<GatewayProperties, T>` subtree accessor keeps `Bindable.ofInstance` binding onto a live instance
+(which is what makes the assertion have teeth), and the existing backend assertions keep their meaning —
+the only behavioural change to them is that `allowed-host-pattern`'s `${BACKEND_ALLOWED_HOST_PATTERN:.*}`
+now resolves to `.*` instead of binding as a literal placeholder string, which no assertion reads. Test-
+only code, no production surface, nothing to flag.
+
+---
+
+### New findings this round
+
+| # | Severity | Where | Description | Status |
+|---|----------|-------|-------------|--------|
+| **F-DP-10** | Info (test-coverage) | `DiffPositionResolverTest.java` — `addedLineStartingWithPlusPlusSpace...` | **The added-line regression test for F-DP-01 was vacuous.** Its diff literal was `++ trap line` (two `+`), which cannot match `startsWith("+++ ")`; the test therefore exercised none of the new guard and **passes unmodified against the pre-fix resolver** (proven by running it there). The *fix* is correct for this case — the corrected literal `+++ trap line` is a clean pre-MISS/post-HIT discriminator — only the guard against a future regression was missing. **Separately**, neither new test pinned the load-bearing half of the fix: a naive `&& !state.inHunk` guard passes **both** of them and only fails on a well-formed prefix-less multi-file diff, the exact case F-DP-01's remediation warned about. | **Fixed by me in this commit**: literal corrected (+ a comment saying why the third `+` matters), and one new test `anExhaustedHunkBudgetReEnablesHeaderRecognitionForAPrefixlessMultiFileDiff` added, verified to MISS under the naive-guard variant and HIT under HEAD. |
+| **F-DP-11** | Info (doc accuracy) | `DEPLOYMENT.md` §2 | F-DP-02 added a second, benign producer (stale-MR `head_sha`) to `diffRefsUnavailable`. `README.md` §6.7 was updated to say so; `DEPLOYMENT.md` §2 — the place that actually tells an operator how to recognise an under-scoped token — still promised that signature as unambiguous. | **Fixed by me in this commit** (all three causes named, DEBUG-reason separation and the two distinguishing signatures documented). |
+| F-DP-12 | Info | `GatewayPropertiesApplicationYamlBindingTest.bindShippedConfig` | Inline comment claims placeholder resolution runs "against process env/system properties, same as a real Spring Environment would". It does not — only against the loaded yml. The behaviour is the correct/hermetic one; only the comment is wrong. | No action requested. |
+| F-DP-13 | Info | `DiffPositionResolver.parseOptionalCount` | The `,count` reuses `MAX_HUNK_NUMBER_DIGITS = 9`, a cap justified for the *start* number by `int` overflow reasoning that does not apply to a `long` budget; a ≥10-digit count now rejects the whole header. Unreachable under CSR-01's 194,880-char diff cap and fail-safe (lost anchor, never a wrong one). | Accepted, no change. |
+| F-DP-14 | Info | `DiffPositionResolver` | A count-inflated (git-unproducible) hunk header swallows the next file's `--- `/`+++ ` headers, which can pair a stale `old_path` with a fresh `new_path`. Re-verified structurally and empirically that `new_path`/`new_line` still equal the matched map key, so no cross-file anchor is reachable; GitLab's server-side validation rejects the stale pair → DPR-08 fallback → plain note. Same fail-safe class the original F-DP-01 documented. | Accepted, no change. |
+
+### Release-gate checklist
+
+| Gate | Result |
+|---|---|
+| Each fix does what its commit message claims (diffs read, not summaries) | **PASS** — all three |
+| New tests assert the right thing (assertions read *and* empirically discriminated) | **PASS after F-DP-10 fix** — 4 of the 5 new tests were genuine discriminators as committed; the 5th is now |
+| No regression from the fixes themselves (DPR-02 suite intent re-checked, not just re-run) | **PASS** — 13/13 adversarial cases keep their original meaning; the ambiguity test's assertion re-traced and still load-bearing |
+| DPR-02 "total function, no throw" survives the parser rewrite | **PASS** — no new throw/parse/index/overflow surface; both custom Semgrep rules clean, discriminator-checked |
+| F-DP-02 counter semantics coherent for an operator | **PASS** — reuse accepted on the merits; the one degraded doc promise fixed |
+| `mvn -o test` independently | **PASS** — 696/0/0/0 at `7209554`; 697/0/0/0 with this commit |
+| semgrep SR-23 gate + 4 custom rules + gitleaks at HEAD | **PASS** — 0 / 0 / no leaks |
+| New Info/Low introduced by the fixes | 2 found, **both closed in this commit**; 3 recorded and accepted |
+| Non-regression set (§8) still holds | **PASS** — no production file outside `DiffPositionResolver`/`GitLabPublisher` changed; no migration, no endpoint, no dependency, no credential, no new env var |
+
+### Bottom line
+
+The developer fixed the right three things and, on F-DP-01, fixed them the *hard* way rather than the
+cheap way — the declared-line-budget approach is what I asked for precisely because the obvious
+`!state.inHunk` shortcut silently breaks prefix-less multi-file diffs, and I confirmed by building that
+shortcut and watching it fail. DPR-02's totality contract survives the parser rewrite intact, verified
+three ways. The only substantive defect this round was a one-character typo that turned one regression
+test into a no-op, plus a missing guard on the fix's load-bearing property and one stale operator-facing
+doc sentence — all three closed in this commit, none of them a production-code change.
+
+**Release gate: PASS. Merge `feature/diff-position-anchoring` to `master`.**

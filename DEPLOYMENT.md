@@ -161,7 +161,13 @@ was considered and rejected: see `docs/diff-position-anchoring-threat-model.md` 
 genuinely cannot be widened, the deployment still boots and posts comments exactly as before; anchoring
 just silently never activates (`GET /metrics`'s `diffRefsUnavailable` counter climbs, `positionsAnchored`
 stays at 0) — set `POSITION_ANCHORING_ENABLED=false` to make that an explicit, documented choice instead
-of an accidental one.
+of an accidental one. **Reading that signal (F-DP-02):** `diffRefsUnavailable` is shared by three causes —
+an under-scoped token, a network/timeout failure, and a benign stale-MR `diff_refs.head_sha` mismatch — so
+a climbing counter is a prompt to look, not a diagnosis on its own. Enable `DEBUG` on
+`com.review.gateway.service.GitLabPublisher` to separate them: each branch logs its own distinct reason
+(and never echoes the SHA or path it is complaining about). Sustained `diffRefsUnavailable` with
+`positionsAnchored` at 0 across *every* Review is the token-scope signature; an intermittent one alongside
+a healthy non-zero `positionsAnchored` is the stale-MR race and needs no action.
 
 **How the Worker gets the `WORKER_TOKEN` value.** There is no token-exchange mechanism — the Worker's own
 `GATEWAY_API_KEY` environment variable must simply be set to the **exact same value** as the Gateway's
