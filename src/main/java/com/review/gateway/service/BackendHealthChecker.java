@@ -135,6 +135,17 @@ public class BackendHealthChecker {
         } catch (RuntimeException unexpected) {
             log.warn("Backend '{}' probe raised an unexpected exception, treating as unhealthy", backend.getName(), unexpected);
             return false;
+        } catch (Throwable fatal) {
+            // A bare Throwable here (i.e. an Error, since RuntimeException is already caught above) is
+            // exactly the class of failure that silently and permanently killed this schedule in
+            // production (2026-08 incident): a Throwable escaping a @Scheduled tick de-schedules all
+            // future runs of that task with zero log output. Logged at ERROR since this is genuinely
+            // exceptional -- the prior total silence on this path is itself part of what let that
+            // incident go unnoticed for 11+ minutes -- then treated as an unhealthy probe so the rest of
+            // this pass's backends still get probed rather than being abandoned mid-loop.
+            log.error("Backend '{}' probe raised a fatal error; treating as unhealthy so the health-check "
+                    + "schedule survives", backend.getName(), fatal);
+            return false;
         }
     }
 

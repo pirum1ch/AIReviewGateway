@@ -1,5 +1,6 @@
 package com.review.gateway.config;
 
+import com.review.gateway.service.ProbeClient;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.http.HttpHeaders;
@@ -97,9 +98,17 @@ public class RestClientConfig {
      * practice — trading connection reuse for immunity to this whole class of staleness is a clear win here,
      * unlike {@code gitLabRestClient}/{@code gitLabPromptRestClient} which stay pooled since GitLab's own
      * process lifecycle isn't the Gateway's problem to defend against.
+     *
+     * <p>Returns a {@link ProbeClient} rather than a bare {@code RestClient} so {@code BackendProberImpl}
+     * can deterministically {@code close()} the {@code HttpClient} the moment each probe completes (JDK 21
+     * made {@code HttpClient} {@code AutoCloseable} for exactly this): a bare {@code RestClient} doesn't
+     * expose the {@code HttpClient} underneath it, so without this wrapper every probe leaked its
+     * {@code HttpClient}'s {@code SelectorManager} thread until GC/Cleaner eventually noticed — confirmed
+     * live via a thread dump showing 100+ leaked threads over 46 minutes, which was the resource-pressure
+     * trigger for the backend-health-check {@code @Scheduled} task going silently, permanently dead.
      */
     @Bean
-    public Supplier<RestClient> backendProbeRestClientFactory() {
+    public Supplier<ProbeClient> backendProbeRestClientFactory() {
         return () -> {
             HttpClient httpClient = HttpClient.newBuilder()
                     .connectTimeout(properties.getBackend().getConnectTimeout())
@@ -110,9 +119,10 @@ public class RestClientConfig {
             JdkClientHttpRequestFactory requestFactory = new JdkClientHttpRequestFactory(httpClient);
             requestFactory.setReadTimeout(properties.getBackend().getReadTimeout());
 
-            return RestClient.builder()
+            RestClient restClient = RestClient.builder()
                     .requestFactory(requestFactory)
                     .build();
+            return new ProbeClient(restClient, httpClient);
         };
     }
 }

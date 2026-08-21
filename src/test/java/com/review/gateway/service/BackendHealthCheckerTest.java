@@ -200,6 +200,24 @@ class BackendHealthCheckerTest extends AbstractPostgresIntegrationTest {
         assertThat(reloaded.getStatus()).isEqualTo(BackendStatus.SUSPECT);
     }
 
+    // Regression test for the incident this fix addresses: an HttpClient leak eventually surfaced as an
+    // Error (not a RuntimeException) escaping BackendProber.probe(). safeProbe() must treat that the same
+    // as a failed probe -- not let it propagate out of the pass -- so probeAll() completes normally and
+    // the backend is (correctly) not demoted from a single failure.
+    @Test
+    void probeThrowingAnErrorIsTreatedAsUnhealthyAndDoesNotPropagate() {
+        Backend backend = persistBackend("mac-error", BackendStatus.ACTIVE, 1);
+        BackendProber prober = mock(BackendProber.class);
+        doThrow(new Error("simulated fatal error")).when(prober).probe(Mockito.any());
+
+        int flips = newChecker(prober, defaultProperties()).probeAll();
+
+        assertThat(flips).isZero();
+        Backend reloaded = backendRepository.findById(backend.getId()).orElseThrow();
+        assertThat(reloaded.getStatus()).isEqualTo(BackendStatus.ACTIVE);
+        assertThat(reloaded.getProbeFailedSince()).isNotNull();
+    }
+
     // T-2.7: last_seen advances only on success.
     @Test
     void lastSeenAdvancesOnlyOnSuccess() {

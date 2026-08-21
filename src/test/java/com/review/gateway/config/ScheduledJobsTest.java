@@ -78,6 +78,20 @@ class ScheduledJobsTest {
     }
 
     @Test
+    void probeBackendsSurvivesAnErrorNotJustAnException() {
+        // Regression test for the incident this class's own javadoc promise was violated by: an
+        // HttpClient leak deep in the backend-probe call chain eventually threw an Error (not a
+        // RuntimeException), which a catch(Exception) here would let escape and silently, permanently
+        // de-schedule this @Scheduled task with zero log output. Must survive a bare Throwable, not just
+        // Exception/RuntimeException.
+        when(backendHealthChecker.probeAll()).thenThrow(new Error("simulated fatal error"));
+
+        assertThatCode(() -> scheduledJobs.probeBackends()).doesNotThrowAnyException();
+
+        verify(backendHealthChecker).probeAll();
+    }
+
+    @Test
     void retryPublicationsDelegatesToPublishRetryService() {
         scheduledJobs.retryPublications();
 

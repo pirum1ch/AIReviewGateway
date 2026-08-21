@@ -60,12 +60,21 @@ public class ScheduledJobs {
         }
     }
 
-    /** {@code BackendHealthChecker.probe} (architecture §8), {@code gateway.scheduler.backend-health-interval}. */
+    /**
+     * {@code BackendHealthChecker.probe} (architecture §8), {@code gateway.scheduler.backend-health-interval}.
+     *
+     * <p>Catches {@code Throwable}, not just {@code Exception}, as a last line of defense: a bare
+     * {@code java.net.http.HttpClient} leak once let an {@code Error} escape this tick, which silently
+     * and permanently cancelled all future runs of this specific {@code @Scheduled} task with zero log
+     * output (the classic {@code ScheduledExecutorService} gotcha — see {@code BackendProberImpl}/
+     * {@code BackendHealthChecker} for the corresponding leak fix and per-backend {@code Error} handling).
+     * This outer catch is the backstop for anything not already caught closer to its source.
+     */
     @Scheduled(fixedRateString = "#{@gatewayProperties.scheduler.backendHealthInterval.toMillis()}")
     public void probeBackends() {
         try {
             backendHealthChecker.probeAll();
-        } catch (Exception e) {
+        } catch (Throwable e) {
             log.error("Backend health probe tick failed; will retry on the next scheduled run", e);
         }
     }

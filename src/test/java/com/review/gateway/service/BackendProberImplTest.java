@@ -29,7 +29,7 @@ class BackendProberImplTest {
         mockServer = MockRestServiceServer.bindTo(builder).build();
         properties = new GatewayProperties();
         RestClient mockBoundClient = builder.build();
-        prober = new BackendProberImpl(() -> mockBoundClient, properties);
+        prober = new BackendProberImpl(() -> new ProbeClient(mockBoundClient, () -> { }), properties);
     }
 
     private Backend backendWithUrl(String url) {
@@ -84,7 +84,7 @@ class BackendProberImplTest {
         AtomicInteger factoryCalls = new AtomicInteger();
         BackendProberImpl countingProber = new BackendProberImpl(() -> {
             factoryCalls.incrementAndGet();
-            return client;
+            return new ProbeClient(client, () -> { });
         }, properties);
         Backend backend = backendWithUrl("http://192.168.1.62:8080");
         countingMockServer.expect(requestTo("http://192.168.1.62:8080/health")).andRespond(withSuccess());
@@ -94,5 +94,37 @@ class BackendProberImplTest {
         countingProber.probe(backend);
 
         assertThat(factoryCalls.get()).isEqualTo(2);
+    }
+
+    @Test
+    void probeClientResourceIsClosedAfterASuccessfulProbe() {
+        RestClient.Builder builder = RestClient.builder();
+        MockRestServiceServer server = MockRestServiceServer.bindTo(builder).build();
+        RestClient client = builder.build();
+        AtomicInteger closeCalls = new AtomicInteger();
+        BackendProberImpl closeTrackingProber = new BackendProberImpl(
+                () -> new ProbeClient(client, closeCalls::incrementAndGet), properties);
+        Backend backend = backendWithUrl("http://192.168.1.63:8080");
+        server.expect(requestTo("http://192.168.1.63:8080/health")).andRespond(withSuccess());
+
+        closeTrackingProber.probe(backend);
+
+        assertThat(closeCalls.get()).isEqualTo(1);
+    }
+
+    @Test
+    void probeClientResourceIsClosedEvenWhenTheProbeFails() {
+        RestClient.Builder builder = RestClient.builder();
+        MockRestServiceServer server = MockRestServiceServer.bindTo(builder).build();
+        RestClient client = builder.build();
+        AtomicInteger closeCalls = new AtomicInteger();
+        BackendProberImpl closeTrackingProber = new BackendProberImpl(
+                () -> new ProbeClient(client, closeCalls::incrementAndGet), properties);
+        Backend backend = backendWithUrl("http://192.168.1.64:8080");
+        server.expect(requestTo("http://192.168.1.64:8080/health")).andRespond(withServerError());
+
+        assertThatThrownBy(() -> closeTrackingProber.probe(backend)).isInstanceOf(BackendUnavailableException.class);
+
+        assertThat(closeCalls.get()).isEqualTo(1);
     }
 }
