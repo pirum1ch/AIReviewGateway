@@ -674,8 +674,9 @@ curl -s http://localhost:8080/metrics -H "Authorization: Bearer $ADMIN_TOKEN"
 `ownershipMismatches` (broken down by endpoint), `workerFailureReportsIgnored` (Worker Observability &
 Claim Latency, WOR-03), and the four Diff Position Anchoring counters — `positionsAnchored` (a comment was
 successfully anchored to a diff position), `positionsUnresolved` (a comment had a `file`/`line` but no
-matching diff line was found), `diffRefsUnavailable` (`fetchDiffRefs` came back empty — network, stale MR
-state, or an insufficiently-scoped token), `positionRejectedByGitLab` (GitLab 400'd a positioned POST and
+matching diff line was found — including every comment in a Review where *nothing* resolved, F-DP-02),
+`diffRefsUnavailable` (`fetchDiffRefs` came back empty — network or an insufficiently-scoped token — **or**
+GitLab's `diff_refs.head_sha` didn't match `review.headSha`, i.e. stale MR state, F-DP-02), `positionRejectedByGitLab` (GitLab 400'd a positioned POST and
 the position-less fallback ran) — are all process-local, in-memory counters that reset on a Gateway
 restart, unlike every other field on this endpoint, which is derived from PostgreSQL. This is deliberate
 for the same reason in both cases: writing a `review_events` row for every one of these would turn the

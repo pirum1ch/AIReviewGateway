@@ -82,10 +82,16 @@ class GitLabPublisherTest extends AbstractPostgresIntegrationTest {
     /** Diff Position Anchoring tests: lets a test supply its own flag state and/or a stubbed resolver. */
     private GitLabPublisher newPublisher(GitLabClient gitLabClient, GatewayProperties properties,
                                           DiffPositionResolver diffPositionResolver) {
+        return newPublisher(gitLabClient, properties, diffPositionResolver, new MetricsCounters());
+    }
+
+    /** F-DP-02: lets a test supply its own {@link MetricsCounters} instance so it can assert on it afterward. */
+    private GitLabPublisher newPublisher(GitLabClient gitLabClient, GatewayProperties properties,
+                                          DiffPositionResolver diffPositionResolver, MetricsCounters metricsCounters) {
         EventService eventService = new EventService(reviewEventRepository, new TextSanitizer());
         StateMachine stateMachine = new StateMachine(eventService);
         return new GitLabPublisher(reviewRepository, reviewCommentRepository, reviewInputRepository, stateMachine,
-                gitLabClient, diffPositionResolver, properties, new MetricsCounters(), transactionManager);
+                gitLabClient, diffPositionResolver, properties, metricsCounters, transactionManager);
     }
 
     private Review persistReview(String headSha, ReviewStatus status) {
@@ -297,12 +303,51 @@ class GitLabPublisherTest extends AbstractPostgresIntegrationTest {
         when(gitLabClient.fetchDiffRefs(any(), any())).thenReturn(Optional.of(new DiffRefs(SHA_A, SHA_C, SHA_B)));
         when(gitLabClient.postDiscussion(any(), any(), any(), any())).thenReturn("discussion-1");
 
-        GitLabPublisher publisher = newPublisher(gitLabClient, new GatewayProperties(), new DiffPositionResolver());
+        // F-DP-02: the head_sha-mismatch branch must move a counter -- pre-fix it was indistinguishable
+        // on GET /metrics from the healthy "nothing needed anchoring" steady state.
+        MetricsCounters metricsCounters = new MetricsCounters();
+        GitLabPublisher publisher =
+                newPublisher(gitLabClient, new GatewayProperties(), new DiffPositionResolver(), metricsCounters);
         PublishOutcome outcome = publisher.publishReview(review.getId());
 
         assertThat(outcome).isEqualTo(PublishOutcome.PUBLISHED);
         verify(gitLabClient).fetchDiffRefs(review.getProjectId(), review.getMergeRequestId());
         verify(gitLabClient).postDiscussion(any(), any(), eq("finding one"), org.mockito.ArgumentMatchers.isNull());
+        assertThat(metricsCounters.diffRefsUnavailableCount()).isEqualTo(1);
+        assertThat(metricsCounters.positionsUnresolvedCount()).isZero();
+        assertThat(metricsCounters.positionsAnchoredCount()).isZero();
+    }
+
+    @Test
+    void totalResolutionMissMovesPositionsUnresolvedNotJustAPartialMiss() {
+        // F-DP-02: previously, buildPositionContext returned null (no counter at all) whenever the
+        // resolver resolved *nothing* for the Review, which is byte-identical on GET /metrics to "no
+        // comment had a line number" -- undermining DPR-12's own stated purpose. A diff that matches
+        // head_sha but shares no (file, line) with the comment must now still increment
+        // positionsUnresolved for that comment.
+        Review review = persistReview(SHA_A, ReviewStatus.COMPLETED);
+        persistComment(review, "finding one"); // filePath="A.java", lineNumber=1
+        String diff = "diff --git a/Other.java b/Other.java\n"
+                + "--- a/Other.java\n"
+                + "+++ b/Other.java\n"
+                + "@@ -1,1 +1,1 @@\n"
+                + "+unrelated line\n";
+        reviewInputRepository.saveAndFlush(new ReviewInput(review.getId(), diff, "v1", SHA_A, "base", 10));
+
+        GitLabClient gitLabClient = Mockito.mock(GitLabClient.class);
+        when(gitLabClient.fetchDiffRefs(any(), any())).thenReturn(Optional.of(new DiffRefs(SHA_B, SHA_C, SHA_A)));
+        when(gitLabClient.postDiscussion(any(), any(), any(), any())).thenReturn("discussion-1");
+
+        MetricsCounters metricsCounters = new MetricsCounters();
+        GitLabPublisher publisher =
+                newPublisher(gitLabClient, new GatewayProperties(), new DiffPositionResolver(), metricsCounters);
+        PublishOutcome outcome = publisher.publishReview(review.getId());
+
+        assertThat(outcome).isEqualTo(PublishOutcome.PUBLISHED);
+        verify(gitLabClient).postDiscussion(any(), any(), eq("finding one"), org.mockito.ArgumentMatchers.isNull());
+        assertThat(metricsCounters.positionsUnresolvedCount()).isEqualTo(1);
+        assertThat(metricsCounters.positionsAnchoredCount()).isZero();
+        assertThat(metricsCounters.diffRefsUnavailableCount()).isZero();
     }
 
     @Test

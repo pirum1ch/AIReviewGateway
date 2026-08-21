@@ -179,6 +179,10 @@ public class GitLabPublisher {
         }
         DiffRefs refs = diffRefs.get();
         if (!normalizedReviewHeadSha.equals(normalizeFullSha(refs.headSha()))) {
+            // F-DP-02: a stale-MR head_sha mismatch is functionally the same "anchoring did not happen"
+            // outcome as fetchDiffRefs() coming back empty just above -- reuse the same counter so it is
+            // no longer indistinguishable, on GET /metrics, from the healthy "nothing to anchor" case.
+            metricsCounters.incrementDiffRefsUnavailable();
             log.debug("Skipping position anchoring for reviewId={}: diff_refs.head_sha does not match "
                     + "review.headSha (stale MR state)", review.getId());
             return null;
@@ -189,10 +193,11 @@ public class GitLabPublisher {
             return null;
         }
 
+        // F-DP-02: no early return on an empty resolution -- a PositionContext with an empty `resolved`
+        // map still flows into resolvePositionFor for every unpublished comment, so each miss increments
+        // positionsUnresolved instead of the whole Review going silently uncounted (previously
+        // byte-identical, on /metrics, to "nothing in this Review needed anchoring").
         Map<PathLine, ResolvedLine> resolved = diffPositionResolver.resolve(reviewInput.get().getDiff(), wanted);
-        if (resolved.isEmpty()) {
-            return null;
-        }
         return new PositionContext(refs, resolved);
     }
 
