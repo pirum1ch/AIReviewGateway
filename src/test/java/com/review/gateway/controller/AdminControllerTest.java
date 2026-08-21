@@ -74,6 +74,26 @@ class AdminControllerTest {
     }
 
     @Test
+    void metricsExposesDiffPositionAnchoringCounters() throws Exception {
+        // DPR-12: independently confirm StatisticsService/MetricsCounters -> MetricsResponse actually
+        // reaches the wire -- the developer's own metricsRequiresAdmin only re-verified the constructor
+        // arity after these fields were added, never asserted their JSON path/value.
+        Map<ReviewStatus, Long> byStatus = new EnumMap<>(ReviewStatus.class);
+        when(statisticsService.computeMetrics())
+                .thenReturn(new MetricsSnapshot(0, byStatus, 0.0, 0.0, 0, 0, 0, 0, Map.of(), 0, 7, 3, 2, 1));
+
+        mockMvc.perform(get("/metrics").header("Authorization", "Bearer " + SecurityTestTokens.ADMIN_TOKEN))
+                .andExpect(status().isOk())
+                // DPR-10: the flag surfaced here comes live from GatewayProperties, not the (unrelated)
+                // MetricsSnapshot mock above -- default true, no override in the shared test application.yml.
+                .andExpect(jsonPath("$.positionAnchoringEnabled").value(true))
+                .andExpect(jsonPath("$.positionsAnchored").value(7))
+                .andExpect(jsonPath("$.positionsUnresolved").value(3))
+                .andExpect(jsonPath("$.diffRefsUnavailable").value(2))
+                .andExpect(jsonPath("$.positionRejectedByGitLab").value(1));
+    }
+
+    @Test
     void metricsRejectsCiToken() throws Exception {
         mockMvc.perform(get("/metrics").header("Authorization", "Bearer " + SecurityTestTokens.CI_TOKEN))
                 .andExpect(status().isForbidden());
