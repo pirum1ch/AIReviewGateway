@@ -325,8 +325,21 @@ Testable assertions for `backend-developer`; AppSec re-verifies each in the SAST
   key; `HtmlUtils.htmlUnescape` is applied to the LLM key **exactly once** and its result is used only for map
   equality, never transmitted or logged; if two distinct diff entries normalize to the same key, **both** are
   dropped from the index (ambiguous ⇒ unresolvable). Exact match only — no suffix, prefix, basename or
-  case-insensitive fallback (§4.5). *Test:* a diff containing both `x.java` and `a/x.java`; an LLM `file` of
-  `a/x.java` resolves to **nothing**, not to `x.java`'s line numbers.
+  case-insensitive fallback (§4.5). *Test:* a diff containing **both** a top-level `x.java` (git header
+  `--- a/x.java`, normalizing to `x.java`) and a nested `a/x.java` (git header `--- a/a/x.java`,
+  normalizing — **one** strip only — to `a/x.java`); an LLM `file` of `a/x.java` resolves to **the nested
+  file's own line numbers, never to `x.java`'s**. Plus a second case for the ambiguity arm: two diff
+  entries that genuinely *do* collide on one key (e.g. a `--- a/x.java` header and a `--- ./x.java` header
+  in the same diff, both normalizing to `x.java`) ⇒ **both** dropped, so an LLM `file` of `x.java` resolves
+  to nothing.
+
+  > **Wording correction (SAST round, `F-DP-`).** An earlier draft of this bullet said the LLM key
+  > `a/x.java` "resolves to **nothing**". That sentence describes the outcome of the **rejected**
+  > strip-both-sides design, not the asymmetric one §6 point 3 actually mandates, and it is not a spec
+  > deviation for the implementation to resolve `a/x.java` to the nested file. The asymmetric single strip
+  > is precisely what keeps the two keys distinct; the ambiguity-drop is the belt-and-braces backstop for
+  > the shapes where they still collide. Both arms are verified implemented and tested — see
+  > `docs/security/feature-diff-position-anchoring-sast-report.md`, DPR-05.
 - **DPR-06 (MUST, DPT-05).** The freshness check is exact-equality on normalized full SHAs: both sides are
   trimmed and lowercased, and `review.headSha` must itself match `^[0-9a-f]{40}$` (case-insensitively) or the
   Review is treated as "freshness unverifiable" ⇒ no position, DEBUG log naming that specific reason (so the
