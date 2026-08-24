@@ -284,7 +284,8 @@ class WorkerObservabilityLoggingContentTest {
                 "diff content containing " + marker,
                 "v1",
                 "chunk context",
-                List.of("system section one containing " + marker, "system section two"));
+                List.of("system section one containing " + marker, "system section two"),
+                null, null);
         ClaimResponse claimed = new ClaimResponse(1L, 7L, payload);
         when(gatewayClient.claim(anyString(), anyString()))
                 .thenReturn(Optional.of(claimed))

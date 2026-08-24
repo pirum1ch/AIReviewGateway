@@ -251,7 +251,7 @@ public class QueueManager {
         log.info("Job claimed: jobId={} reviewId={} chunkIndex={} backend={} workerId={}",
                 job.getId(), job.getReviewId(), job.getChunkIndex(), backendName, workerId);
         ClaimedJob claimedJob = new ClaimedJob(job.getId(), job.getReviewId(), chunk.getDiff(),
-                review.getPromptVersion(), chunkContext, systemMessages);
+                review.getPromptVersion(), chunkContext, systemMessages, null, null);
         return ClaimAttempt.claimed(claimedJob);
     }
 

@@ -74,7 +74,7 @@ class WorkerLoopReportFailureCrashGuardTest {
         HeartbeatScheduler heartbeatScheduler = mock(HeartbeatScheduler.class);
         WorkerMetrics metrics = mock(WorkerMetrics.class);
 
-        ClaimResponse claimed = new ClaimResponse(1L, 1L, new JobPayload("diff", "v1", "context", List.of("sys")));
+        ClaimResponse claimed = new ClaimResponse(1L, 1L, new JobPayload("diff", "v1", "context", List.of("sys"), null, null));
         when(gatewayClient.claim(anyString(), anyString()))
                 .thenReturn(Optional.of(claimed))
                 .thenReturn(Optional.empty()); // subsequent polls: idle, so the loop just keeps ticking
