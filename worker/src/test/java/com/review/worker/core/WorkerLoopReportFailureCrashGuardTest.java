@@ -86,7 +86,7 @@ class WorkerLoopReportFailureCrashGuardTest {
         // catch (AbandonJobException | LlamaException) triggers reportFailureBestEffort.
         CompletableFuture<HttpResponse<java.io.InputStream>> failedFuture = new CompletableFuture<>();
         failedFuture.completeExceptionally(new RuntimeException("simulated llama-server failure"));
-        when(llamaClient.startChatCompletion(any(), anyString(), anyDouble(), anyInt()))
+        when(llamaClient.startChatCompletion(any(), anyString(), anyDouble(), anyInt(), any()))
                 .thenReturn(new LlamaClient.AsyncCompletion(failedFuture, System.currentTimeMillis()));
 
         // The defect under test: reportFailure throws something reportFailureBestEffort's OLD, narrow
@@ -94,8 +94,10 @@ class WorkerLoopReportFailureCrashGuardTest {
         org.mockito.Mockito.doThrow(new IllegalStateException("simulated unmapped Gateway client failure"))
                 .when(gatewayClient).reportFailure(anyLong(), any());
 
+        WorkerProperties workerProperties = newProperties();
         WorkerLoop loop = new WorkerLoop(gatewayClient, llamaClient, promptTemplateService,
-                heartbeatScheduler, metrics, newProperties());
+                new com.review.worker.llama.DecoderConstraintResolver(new com.fasterxml.jackson.databind.ObjectMapper(), workerProperties),
+                heartbeatScheduler, metrics, workerProperties);
         loopsToStop.add(loop);
         loop.start();
 

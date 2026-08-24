@@ -133,8 +133,9 @@ class GracefulShutdownIntegrationTest {
         HeartbeatScheduler heartbeatScheduler = new HeartbeatScheduler(gatewayClient, properties);
         WorkerMetrics metrics = new WorkerMetrics(new SimpleMeterRegistry());
 
-        WorkerLoop workerLoop = new WorkerLoop(gatewayClient, llamaClient, promptTemplateService, heartbeatScheduler,
-                metrics, properties);
+        WorkerLoop workerLoop = new WorkerLoop(gatewayClient, llamaClient, promptTemplateService,
+                new com.review.worker.llama.DecoderConstraintResolver(new com.fasterxml.jackson.databind.ObjectMapper(), properties),
+                heartbeatScheduler, metrics, properties);
         loopsToStop.add(workerLoop);
         return workerLoop;
     }

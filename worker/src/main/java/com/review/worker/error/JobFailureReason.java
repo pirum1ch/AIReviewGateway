@@ -14,5 +14,12 @@ public enum JobFailureReason {
     LLM_TIMEOUT,
     LLM_RESPONSE_TOO_LARGE,
     PROMPT_INVALID,
-    WORKER_ERROR
+    WORKER_ERROR,
+    /**
+     * Structured Review Output (SRO-13): the Gateway-supplied {@code responseFormat}/{@code jsonSchema}
+     * failed this Worker's own defensive re-check — both fields set, oversized (before {@code readTree},
+     * SOR-06), not valid JSON, or not a JSON object. A defensive bound against a misbehaving/compromised
+     * Gateway, exactly like {@code worker.limits.max-diff-bytes} (WSR-03).
+     */
+    CONSTRAINT_INVALID
 }

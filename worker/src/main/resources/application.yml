@@ -51,6 +51,12 @@ worker:
     # Prompt Manager (V3, WSR-03 sibling): independent of gateway.prompt.limits.max-sections.
     # Prompt Manager (V3, соседний параметр к WSR-03): не связан с gateway.prompt.limits.max-sections.
     max-system-messages: ${WORKER_MAX_SYSTEM_MESSAGES:8}   # максимальное число system-сообщений, которые Worker готов передать модели за один запрос
+    # Structured Review Output (SRO-13, threat model SOR-06): независимая от Gateway граница на
+    # присланный Gateway'ем responseFormat/jsonSchema, измеряется в UTF-8 байтах ДО readTree.
+    # Намеренно больше gateway.structured.max-schema-bytes (65536) на размер самого большого
+    # wire-обёртки (~70 байт для RESPONSE_FORMAT_JSON_SCHEMA) -- см. DEPLOYMENT.md про связку двух
+    # параметров.
+    max-constraint-bytes: ${WORKER_MAX_CONSTRAINT_BYTES:69632}   # максимальный размер (в байтах, UTF-8, до парсинга) декодер-констрейнта (responseFormat/jsonSchema), присланного Gateway'ем
   log:
     # Worker Observability & Claim Latency (WOC-04): at most one idle-liveness INFO line per this many
     # seconds while no job is available; 0 disables it.

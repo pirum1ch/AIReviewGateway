@@ -239,8 +239,9 @@ class WorkerLoopIntegrationTest {
         SimpleMeterRegistry registry = new SimpleMeterRegistry();
         WorkerMetrics metrics = new WorkerMetrics(registry);
 
-        WorkerLoop workerLoop = new WorkerLoop(gatewayClient, llamaClient, promptTemplateService, heartbeatScheduler,
-                metrics, properties);
+        WorkerLoop workerLoop = new WorkerLoop(gatewayClient, llamaClient, promptTemplateService,
+                new com.review.worker.llama.DecoderConstraintResolver(new com.fasterxml.jackson.databind.ObjectMapper(), properties),
+                heartbeatScheduler, metrics, properties);
         loopsToStop.add(workerLoop);
         return new Harness(properties, metrics, registry, workerLoop, gatewayDispatcher);
     }

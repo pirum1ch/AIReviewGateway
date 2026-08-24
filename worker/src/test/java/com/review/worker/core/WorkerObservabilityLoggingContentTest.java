@@ -237,7 +237,7 @@ class WorkerObservabilityLoggingContentTest {
         workerLoopLogger.addAppender(idleLogAppender);
 
         WorkerLoop loop = new WorkerLoop(idleGatewayClient, llamaClient, promptTemplateService,
-                idleHeartbeatScheduler, metrics, properties);
+                new com.review.worker.llama.DecoderConstraintResolver(new com.fasterxml.jackson.databind.ObjectMapper(), properties), idleHeartbeatScheduler, metrics, properties);
         try {
             loop.start();
             long deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
@@ -294,7 +294,7 @@ class WorkerObservabilityLoggingContentTest {
         LlamaClient llamaClient = mock(LlamaClient.class);
         CompletableFuture<java.net.http.HttpResponse<java.io.InputStream>> failedFuture = new CompletableFuture<>();
         failedFuture.completeExceptionally(new RuntimeException("simulated llama-server failure"));
-        when(llamaClient.startChatCompletion(any(), anyString(), anyDouble(), anyInt()))
+        when(llamaClient.startChatCompletion(any(), anyString(), anyDouble(), anyInt(), any()))
                 .thenReturn(new LlamaClient.AsyncCompletion(failedFuture, System.currentTimeMillis()));
 
         PromptTemplateService promptTemplateService = mock(PromptTemplateService.class);
@@ -320,7 +320,7 @@ class WorkerObservabilityLoggingContentTest {
         workerLoopLogger.addAppender(logAppender);
 
         WorkerLoop loop = new WorkerLoop(gatewayClient, llamaClient, promptTemplateService,
-                heartbeatScheduler, metrics, properties);
+                new com.review.worker.llama.DecoderConstraintResolver(new com.fasterxml.jackson.databind.ObjectMapper(), properties), heartbeatScheduler, metrics, properties);
         try {
             loop.start();
             long deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();

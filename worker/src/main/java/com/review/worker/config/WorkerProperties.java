@@ -139,6 +139,7 @@ public class WorkerProperties {
         requirePositive("worker.limits.maxDiffBytes", worker.getLimits().getMaxDiffBytes());
         requirePositive("worker.limits.maxResponseBytes", worker.getLimits().getMaxResponseBytes());
         requirePositive("worker.limits.maxSystemMessages", worker.getLimits().getMaxSystemMessages());
+        requirePositive("worker.limits.maxConstraintBytes", worker.getLimits().getMaxConstraintBytes());
         if (worker.getLog().getIdleSummaryIntervalSec() < 0) {
             throw new IllegalStateException("worker.log.idleSummaryIntervalSec must be >= 0 (0 disables it) — refusing to start");
         }
@@ -416,6 +417,18 @@ public class WorkerProperties {
              * {@link #maxDiffBytes} for the total-size check (diff + chunkContext + systemMessages).
              */
             private int maxSystemMessages = 8;
+            /**
+             * Structured Review Output (SRO-13, threat model SOR-06 CRITICAL): independent Worker-side
+             * bound on the Gateway-supplied {@code responseFormat}/{@code jsonSchema} text, measured on
+             * <b>UTF-8 bytes of the raw text before {@code readTree}</b> — never {@code String.length()},
+             * never post-parse. Deliberately set above {@code gateway.structured.max-schema-bytes}
+             * (65536) by at least the largest wire wrapper (~70 bytes for
+             * {@code RESPONSE_FORMAT_JSON_SCHEMA}'s {@code {"type":"json_schema","json_schema":{"name":
+             * "code_review","strict":true,"schema":...}}} envelope) — the two bounds measure different
+             * quantities, and setting them equal would produce a fleet-wide {@code CONSTRAINT_INVALID}
+             * loop at the top of the range.
+             */
+            private long maxConstraintBytes = 69_632L;
 
             public long getMaxDiffBytes() {
                 return maxDiffBytes;
@@ -439,6 +452,14 @@ public class WorkerProperties {
 
             public void setMaxSystemMessages(int maxSystemMessages) {
                 this.maxSystemMessages = maxSystemMessages;
+            }
+
+            public long getMaxConstraintBytes() {
+                return maxConstraintBytes;
+            }
+
+            public void setMaxConstraintBytes(long maxConstraintBytes) {
+                this.maxConstraintBytes = maxConstraintBytes;
             }
         }
     }

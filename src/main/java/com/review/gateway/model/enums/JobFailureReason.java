@@ -19,6 +19,8 @@ public enum JobFailureReason {
     LLM_RESPONSE_TOO_LARGE,
     PROMPT_INVALID,
     WORKER_ERROR,
+    /** Structured Review Output (SRO-13): the Worker's own defensive decoder-constraint re-check failed. */
+    CONSTRAINT_INVALID,
     /** Not a wire value — the safe fallback for anything unrecognized. */
     UNKNOWN;
 

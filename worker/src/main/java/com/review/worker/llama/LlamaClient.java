@@ -114,7 +114,21 @@ public class LlamaClient {
      */
     public AsyncCompletion startChatCompletion(List<ChatMessage> messages, String model, double temperature,
                                                 int maxTokens) {
-        ChatCompletionRequest requestBody = new ChatCompletionRequest(model, messages, temperature, maxTokens);
+        return startChatCompletion(messages, model, temperature, maxTokens, DecoderConstraint.NONE);
+    }
+
+    /**
+     * Structured Review Output (architecture §3.3): identical to the four-argument overload, except the
+     * Gateway-supplied decoder constraint (already parsed/defensively validated by {@link
+     * DecoderConstraintResolver}) is attached to the request's typed {@code responseFormat}/{@code
+     * jsonSchema} fields — {@link DecoderConstraint#NONE} (both {@code null}) reproduces today's
+     * four-field request body byte-for-byte (SRO-10/{@code ChatCompletionRequest}'s {@code
+     * @JsonInclude(NON_NULL)}).
+     */
+    public AsyncCompletion startChatCompletion(List<ChatMessage> messages, String model, double temperature,
+                                                int maxTokens, DecoderConstraint constraint) {
+        ChatCompletionRequest requestBody = new ChatCompletionRequest(model, messages, temperature, maxTokens,
+                constraint.responseFormat(), constraint.jsonSchema());
         byte[] payload;
         try {
             payload = objectMapper.writeValueAsBytes(requestBody);
