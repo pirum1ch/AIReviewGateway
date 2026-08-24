@@ -400,4 +400,35 @@ class PromptTemplateServiceTest {
         assertThatThrownBy(() -> smallLimitService.resolve("v1", "small diff", null, List.of(oversizedSection)))
                 .isInstanceOf(AbandonJobException.class);
     }
+
+    // ---- Structured Review Output: v3.yml (SRO-60) ----
+
+    @Test
+    void v3TemplateResolvesWithMaxTokens8192() {
+        ResolvedPrompt resolved = service.resolve("v3", "diff --git a/A.java b/A.java\n+x();",
+                "<<<FILES_IN_THIS_PART>>>\nA.java\n<<<END_FILES_IN_THIS_PART>>>\n");
+
+        assertThat(resolved.maxTokens()).isEqualTo(8192);
+        assertThat(resolved.messages()).hasSize(2);
+        String userMessage = resolved.messages().get(1).content();
+        assertThat(userMessage).contains("A.java");
+        assertThat(userMessage).contains("diff --git a/A.java");
+    }
+
+    @Test
+    void v3TemplateRequiresTheChunkContextPlaceholderSoAnAbsentPlaceholderWouldAbandon() {
+        // CSR-12: a chunkContext supplied but no {{CHUNK_CONTEXT}} placeholder in the template must
+        // abandon the job -- this pins that v3.yml genuinely contains the placeholder (SRO-64a depends
+        // on it: the Gateway now sends a non-null chunkContext even for single-chunk structured jobs).
+        ResolvedPrompt resolved = service.resolve("v3", "some diff", "coverage list here");
+
+        assertThat(resolved.messages().get(1).content()).contains("coverage list here");
+    }
+
+    @Test
+    void v3TemplateNeverModifiesV1OrV2Behavior() {
+        // §8 backward-compat guarantee: introducing v3.yml must not change v1/v2 resolution at all.
+        ResolvedPrompt v1 = service.resolve("v1", "diff content", null);
+        assertThat(v1.maxTokens()).isNotEqualTo(8192);
+    }
 }

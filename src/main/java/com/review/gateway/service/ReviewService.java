@@ -66,9 +66,10 @@ public class ReviewService {
      * CSR-12: Gateway-side allowlist of prompt versions known to contain the {@code {{CHUNK_CONTEXT}}}
      * placeholder. Only enforced when a Review needs more than one chunk — a single-chunk Review never
      * renders a chunk context, so any existing prompt version (e.g. {@code v1}) remains valid for it
-     * (backward compatibility, §8).
+     * (backward compatibility, §8). SRO-61: {@code v3} (Structured Review Output) is chunk-context-aware
+     * too — {@code v3.yml} requires the placeholder unconditionally (SRO-64a).
      */
-    private static final Set<String> CHUNK_AWARE_PROMPT_VERSIONS = Set.of("v2");
+    private static final Set<String> CHUNK_AWARE_PROMPT_VERSIONS = Set.of("v2", "v3");
 
     private final ReviewRepository reviewRepository;
     private final ReviewInputRepository reviewInputRepository;
