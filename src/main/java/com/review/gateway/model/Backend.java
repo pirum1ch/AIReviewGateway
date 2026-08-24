@@ -71,6 +71,19 @@ public class Backend {
     @Column(name = "prompt_message_format", length = 16)
     private String promptMessageFormat;
 
+    /**
+     * Structured Review Output (V5, SRO-05): per-backend override of the decoder-constraint wire shape
+     * ({@code OFF}/{@code RESPONSE_FORMAT_JSON_SCHEMA}/{@code RESPONSE_FORMAT_SCHEMA}/
+     * {@code TOP_LEVEL_JSON_SCHEMA}), or {@code null} to use {@code gateway.structured.default-mode}.
+     * Deliberately a plain {@code String}, not {@code @Enumerated} — {@code DecoderConstraintRenderer}
+     * parses it via {@code StructuredOutputMode.fromNullable}, never {@code Enum.valueOf}, so a value the
+     * DB {@code CHECK} constraint didn't catch degrades to the configured default with a {@code WARN}
+     * instead of throwing and taking the claim path down (same belt-and-braces split as
+     * {@link #promptMessageFormat}, PMR-22).
+     */
+    @Column(name = "structured_output_mode", length = 32)
+    private String structuredOutputMode;
+
     @Column(name = "created_at", nullable = false, updatable = false)
     private Instant createdAt;
 
@@ -163,6 +176,14 @@ public class Backend {
 
     public void setPromptMessageFormat(String promptMessageFormat) {
         this.promptMessageFormat = promptMessageFormat;
+    }
+
+    public String getStructuredOutputMode() {
+        return structuredOutputMode;
+    }
+
+    public void setStructuredOutputMode(String structuredOutputMode) {
+        this.structuredOutputMode = structuredOutputMode;
     }
 
     public Instant getCreatedAt() {

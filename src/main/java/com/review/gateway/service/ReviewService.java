@@ -1,8 +1,10 @@
 package com.review.gateway.service;
 
+import com.review.gateway.config.GatewayProperties;
 import com.review.gateway.exception.IncompatiblePromptVersionException;
 import com.review.gateway.exception.InvalidStateTransitionException;
 import com.review.gateway.exception.ReviewNotFoundException;
+import com.review.gateway.exception.StructuredOutputUnsupportedException;
 import com.review.gateway.model.Review;
 import com.review.gateway.model.ReviewChunk;
 import com.review.gateway.model.ReviewInput;
@@ -82,6 +84,8 @@ public class ReviewService {
     private final EventService eventService;
     private final StateMachine stateMachine;
     private final JobStateMachine jobStateMachine;
+    private final StructuredPathValidator structuredPathValidator;
+    private final GatewayProperties properties;
     private final EntityManager entityManager;
     private final TransactionTemplate requiresNewTransactionTemplate;
 
@@ -99,6 +103,8 @@ public class ReviewService {
                           EventService eventService,
                           StateMachine stateMachine,
                           JobStateMachine jobStateMachine,
+                          StructuredPathValidator structuredPathValidator,
+                          GatewayProperties properties,
                           EntityManager entityManager,
                           PlatformTransactionManager transactionManager) {
         this.reviewRepository = reviewRepository;
@@ -115,6 +121,8 @@ public class ReviewService {
         this.eventService = eventService;
         this.stateMachine = stateMachine;
         this.jobStateMachine = jobStateMachine;
+        this.structuredPathValidator = structuredPathValidator;
+        this.properties = properties;
         this.entityManager = entityManager;
         this.requiresNewTransactionTemplate = new TransactionTemplate(transactionManager);
         this.requiresNewTransactionTemplate.setPropagationBehavior(TransactionTemplate.PROPAGATION_REQUIRES_NEW);
@@ -131,6 +139,11 @@ public class ReviewService {
      * against concurrent creates).
      */
     public CreateReviewResult createReview(CreateReviewCommand command) {
+        // Threat model SOR-08 (CRITICAL): promptVersion is allowlisted at the very edge, before any
+        // other work -- 'v3' is deliberately absent from the shipped default allowlist until an operator
+        // adds it once every Worker in the fleet ships v3.yml (Workers-first deployment order, §11).
+        validatePromptVersionAllowlist(command.promptVersion());
+
         diffSizeValidator.rejectIfAbsurdlyLarge(command.diff());
 
         sweepObsolete(command.projectId(), command.mergeRequestId(), command.headSha());
@@ -148,9 +161,14 @@ public class ReviewService {
         PromptManager.PromptResolution promptResolution = promptManager.resolve(command.projectId());
         diffSizeValidator.assertPromptFits(promptResolution.estimatedTokens());
 
-        DiffChunker.ChunkPlan plan = diffChunker.split(command.diff(), promptResolution.estimatedTokens());
+        boolean structured = StructuredOutputSupport.isStructured(command.promptVersion());
+        int maxFilesPerChunk = structured ? properties.getStructured().getMaxFilesPerChunk() : 0;
+        DiffChunker.ChunkPlan plan = diffChunker.split(command.diff(), promptResolution.estimatedTokens(), maxFilesPerChunk);
         if (plan.chunks().size() > 1) {
             validatePromptVersionForChunking(command.promptVersion());
+        }
+        if (structured) {
+            validateStructuredOutputEligibility(command.promptVersion(), plan);
         }
 
         try {
@@ -176,6 +194,64 @@ public class ReviewService {
             throw new IncompatiblePromptVersionException(
                     "promptVersion '" + promptVersion + "' is not chunk-context-aware; this diff requires chunking. "
                             + "Use one of " + CHUNK_AWARE_PROMPT_VERSIONS + " or submit a smaller diff.");
+        }
+    }
+
+    /**
+     * Threat model SOR-08 (CRITICAL): {@code promptVersion} must be in {@code
+     * gateway.review.allowed-prompt-versions} — an old Worker fleet meeting a {@code v3} job before it
+     * ships {@code v3.yml} would abandon it and burn all three attempts in ~3 minutes (WOC's immediate
+     * {@code POST /jobs/{id}/fail}), failing the Review with the sibling cascade. Reuses {@code 422
+     * STRUCTURED_OUTPUT_UNSUPPORTED} (no new error code, architecture §4.3 preamble).
+     */
+    private void validatePromptVersionAllowlist(String promptVersion) {
+        if (!properties.getReview().getAllowedPromptVersions().contains(promptVersion)) {
+            throw new StructuredOutputUnsupportedException(
+                    "promptVersion '" + promptVersion + "' is not in gateway.review.allowed-prompt-versions; "
+                            + "an operator enables it only once every Worker in the fleet can serve it");
+        }
+    }
+
+    /**
+     * Structured Review Output (architecture §4.3, SRO-16/17/65; threat model SOT-02/07/15/22/24,
+     * SOR-01, BLOCKING). Fail-fast at the edge, before any Review/chunk/job is persisted — a structured
+     * Review whose coverage guarantee would otherwise be weaker than advertised is rejected wholesale,
+     * never silently degraded.
+     */
+    private void validateStructuredOutputEligibility(String promptVersion, DiffChunker.ChunkPlan plan) {
+        if (!plan.pathsTrusted()) {
+            // SRO-16: the CSR-11 fallback (no `diff --git` headers) extracts no paths at all -- a
+            // structured schema built from an empty set would have no coverage constraint whatsoever.
+            throw new StructuredOutputUnsupportedException(
+                    "promptVersion '" + promptVersion + "' requires git-style `diff --git` headers to derive "
+                            + "the per-file coverage list; submit a `git diff` or use promptVersion 'v2'.");
+        }
+        int maxPathChars = properties.getStructured().getMaxPathChars();
+        for (DiffChunker.DiffChunk chunk : plan.chunks()) {
+            List<String> sanitizedPaths = chunk.filePaths().stream()
+                    .map(chunkContextRenderer::sanitizePath)
+                    .filter(Objects::nonNull)
+                    .collect(Collectors.toList());
+            if (sanitizedPaths.size() != chunk.filePaths().size()) {
+                // SRO-17: sanitization dropped a path (control/format characters only) -- a dropped path
+                // is an uncovered file. Never echo the raw or sanitized path back to the caller.
+                throw new StructuredOutputUnsupportedException(
+                        "promptVersion '" + promptVersion + "' requires every changed file path to survive "
+                                + "sanitization; this diff contains at least one path that does not — use "
+                                + "promptVersion 'v2' or rename the affected file(s).");
+            }
+            for (String path : sanitizedPaths) {
+                if (!structuredPathValidator.isEligible(path, maxPathChars)) {
+                    // SRO-65: a conservative, constrained alphabet -- never echoes the offending path,
+                    // only the character class it violated.
+                    throw new StructuredOutputUnsupportedException(
+                            "promptVersion '" + promptVersion + "' requires file paths free of the characters "
+                                    + "{ } \" \\ ` [ ] | * and whitespace, with no '..' segment, no leading '/', "
+                                    + "and at most " + maxPathChars + " characters — use promptVersion 'v2' or "
+                                    + "rename the affected file(s). If this repository uses git's default "
+                                    + "core.quotePath, submit `git -c core.quotePath=false diff` instead.");
+                }
+            }
         }
     }
 

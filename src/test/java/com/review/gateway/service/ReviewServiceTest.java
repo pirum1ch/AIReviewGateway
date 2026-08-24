@@ -57,6 +57,8 @@ class ReviewServiceTest {
     private EventService eventService;
     private StateMachine stateMachine;
     private JobStateMachine jobStateMachine;
+    private StructuredPathValidator structuredPathValidator;
+    private com.review.gateway.config.GatewayProperties properties;
     private EntityManager entityManager;
     private PlatformTransactionManager transactionManager;
     private ReviewService reviewService;
@@ -77,6 +79,8 @@ class ReviewServiceTest {
         eventService = Mockito.mock(EventService.class);
         stateMachine = Mockito.mock(StateMachine.class);
         jobStateMachine = Mockito.mock(JobStateMachine.class);
+        structuredPathValidator = new StructuredPathValidator();
+        properties = new com.review.gateway.config.GatewayProperties();
         transactionManager = Mockito.mock(PlatformTransactionManager.class);
         entityManager = Mockito.mock(EntityManager.class);
         Query lockTimeoutQuery = Mockito.mock(Query.class);
@@ -85,8 +89,8 @@ class ReviewServiceTest {
         // Kill-switch off by default -- most tests don't care about Prompt Manager specifics.
         when(promptManager.resolve(any())).thenReturn(PromptManager.PromptResolution.none());
         // Single-chunk plan by default -- most tests don't care about chunking specifics.
-        when(diffChunker.split(anyString(), anyInt())).thenAnswer(inv -> new DiffChunker.ChunkPlan(
-                List.of(new DiffChunker.DiffChunk(0, inv.getArgument(0), 10, List.of())), 10));
+        when(diffChunker.split(anyString(), anyInt(), anyInt())).thenAnswer(inv -> new DiffChunker.ChunkPlan(
+                List.of(new DiffChunker.DiffChunk(0, inv.getArgument(0), 10, List.of())), 10, true));
         when(reviewJobRepository.findNonTerminalJobs(any())).thenReturn(List.of());
         when(reviewChunkRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
         when(reviewJobRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
@@ -100,7 +104,7 @@ class ReviewServiceTest {
         reviewService = new ReviewService(reviewRepository, reviewInputRepository, reviewChunkRepository,
                 reviewJobRepository, reviewCommentRepository, reviewPromptSectionRepository, deduplicationService,
                 diffSizeValidator, diffChunker, chunkContextRenderer, promptManager, eventService, stateMachine,
-                jobStateMachine, entityManager, transactionManager);
+                jobStateMachine, structuredPathValidator, properties, entityManager, transactionManager);
     }
 
     private CreateReviewCommand command(String headSha) {
@@ -257,5 +261,113 @@ class ReviewServiceTest {
         reviewService.cancel(1L);
 
         verify(stateMachine).transition(eq(review), eq(ReviewStatus.CANCELLED), eq(EventType.CANCELLED), any());
+    }
+
+    // ---- Structured Review Output: promptVersion allowlist (threat model SOR-08, CRITICAL) ----
+
+    @Test
+    void v1AndV2RemainAllowedByTheShippedDefaultAllowlist() {
+        assertThat(properties.getReview().getAllowedPromptVersions()).containsExactlyInAnyOrder("v1", "v2");
+    }
+
+    @Test
+    void aV1RequestIsNotRejectedByTheAllowlist() {
+        // "createsANewReviewWhenNoActiveDuplicateExists" already exercises the full v1 happy path end to
+        // end (including the allowlist check, since it is the very first thing createReview does); this
+        // test isolates that the allowlist itself does not throw for the default-allowed "v1".
+        when(reviewRepository.findByProjectIdAndMergeRequestIdAndHeadShaNotAndStatusInOrderByIdAsc(any(), any(), any(), any()))
+                .thenReturn(List.of());
+        when(deduplicationService.findActiveReview(1L, 2L, "sha-v1")).thenReturn(Optional.empty());
+        when(reviewRepository.saveAndFlush(any(Review.class)))
+                .thenAnswer(inv -> ReviewTestSupport.withId(inv.getArgument(0), 400L));
+
+        CreateReviewResult result = reviewService.createReview(command("sha-v1"));
+
+        assertThat(result.deduplicated()).isFalse();
+    }
+
+    @Test
+    void v3IsNotInTheShippedDefaultAllowlistAndIsRejectedAtTheEdge() {
+        CreateReviewCommand command = new CreateReviewCommand(1L, 2L, "sha-v3", "base-sha", "diff content", "v3", 10);
+
+        assertThatThrownBy(() -> reviewService.createReview(command))
+                .isInstanceOf(com.review.gateway.exception.StructuredOutputUnsupportedException.class);
+
+        verify(reviewRepository, never()).saveAndFlush(any());
+        verify(diffChunker, never()).split(any(), anyInt(), anyInt());
+    }
+
+    @Test
+    void anUnknownPromptVersionIsRejectedAtTheEdge() {
+        CreateReviewCommand command = new CreateReviewCommand(1L, 2L, "sha-v99", "base-sha", "diff content", "v99", 10);
+
+        assertThatThrownBy(() -> reviewService.createReview(command))
+                .isInstanceOf(com.review.gateway.exception.StructuredOutputUnsupportedException.class);
+
+        verify(reviewRepository, never()).saveAndFlush(any());
+    }
+
+    // ---- Structured Review Output: edge validation once v3 is allowlisted (SRO-16/17/65) ----
+
+    @Test
+    void structuredVersionWithUntrustedPathsIsRejected() {
+        properties.getReview().getAllowedPromptVersions().add("v3");
+        when(diffChunker.split(anyString(), anyInt(), anyInt())).thenAnswer(inv -> new DiffChunker.ChunkPlan(
+                List.of(new DiffChunker.DiffChunk(0, inv.getArgument(0), 10, List.of())), 10, false));
+        CreateReviewCommand command = new CreateReviewCommand(1L, 2L, "sha-untrusted", "base-sha", "diff content", "v3", 10);
+
+        assertThatThrownBy(() -> reviewService.createReview(command))
+                .isInstanceOf(com.review.gateway.exception.StructuredOutputUnsupportedException.class)
+                .hasMessageContaining("diff --git");
+
+        verify(reviewRepository, never()).saveAndFlush(any());
+    }
+
+    @Test
+    void structuredVersionWithAnIneligiblePathIsRejected() {
+        properties.getReview().getAllowedPromptVersions().add("v3");
+        when(diffChunker.split(anyString(), anyInt(), anyInt())).thenAnswer(inv -> new DiffChunker.ChunkPlan(
+                List.of(new DiffChunker.DiffChunk(0, inv.getArgument(0), 10, List.of("a`.java"))), 10, true));
+        when(chunkContextRenderer.sanitizePath("a`.java")).thenReturn("a`.java");
+        CreateReviewCommand command = new CreateReviewCommand(1L, 2L, "sha-ineligible", "base-sha", "diff content", "v3", 10);
+
+        assertThatThrownBy(() -> reviewService.createReview(command))
+                .isInstanceOf(com.review.gateway.exception.StructuredOutputUnsupportedException.class);
+
+        verify(reviewRepository, never()).saveAndFlush(any());
+    }
+
+    @Test
+    void structuredVersionWithADroppedPathIsRejected() {
+        properties.getReview().getAllowedPromptVersions().add("v3");
+        when(diffChunker.split(anyString(), anyInt(), anyInt())).thenAnswer(inv -> new DiffChunker.ChunkPlan(
+                List.of(new DiffChunker.DiffChunk(0, inv.getArgument(0), 10, List.of("A.java"))), 10, true));
+        // sanitizePath returns null -- the whole path was stripped away (control/format characters only).
+        when(chunkContextRenderer.sanitizePath("A.java")).thenReturn(null);
+        CreateReviewCommand command = new CreateReviewCommand(1L, 2L, "sha-dropped", "base-sha", "diff content", "v3", 10);
+
+        assertThatThrownBy(() -> reviewService.createReview(command))
+                .isInstanceOf(com.review.gateway.exception.StructuredOutputUnsupportedException.class);
+
+        verify(reviewRepository, never()).saveAndFlush(any());
+    }
+
+    @Test
+    void structuredVersionWithEligibleTrustedPathsPassesEdgeValidation() {
+        properties.getReview().getAllowedPromptVersions().add("v3");
+        when(diffChunker.split(anyString(), anyInt(), anyInt())).thenAnswer(inv -> new DiffChunker.ChunkPlan(
+                List.of(new DiffChunker.DiffChunk(0, inv.getArgument(0), 10, List.of("src/A.java"))), 10, true));
+        when(chunkContextRenderer.sanitizePath("src/A.java")).thenReturn("src/A.java");
+        when(reviewRepository.findByProjectIdAndMergeRequestIdAndHeadShaNotAndStatusInOrderByIdAsc(any(), any(), any(), any()))
+                .thenReturn(List.of());
+        when(deduplicationService.findActiveReview(1L, 2L, "sha-eligible")).thenReturn(Optional.empty());
+        when(reviewRepository.saveAndFlush(any(Review.class)))
+                .thenAnswer(inv -> ReviewTestSupport.withId(inv.getArgument(0), 401L));
+        CreateReviewCommand command = new CreateReviewCommand(1L, 2L, "sha-eligible", "base-sha", "diff content", "v3", 10);
+
+        CreateReviewResult result = reviewService.createReview(command);
+
+        assertThat(result.deduplicated()).isFalse();
+        verify(reviewRepository).saveAndFlush(any());
     }
 }

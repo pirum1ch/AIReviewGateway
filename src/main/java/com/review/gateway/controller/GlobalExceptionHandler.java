@@ -11,6 +11,7 @@ import com.review.gateway.exception.PromptSourceMissingException;
 import com.review.gateway.exception.PromptSourceUnavailableException;
 import com.review.gateway.exception.PromptTooLargeException;
 import com.review.gateway.exception.ReviewNotFoundException;
+import com.review.gateway.exception.StructuredOutputUnsupportedException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.dao.CannotAcquireLockException;
@@ -42,6 +43,17 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ErrorResponse> handleDiffTooLarge(DiffTooLargeException ex) {
         return ResponseEntity.status(HttpStatus.UNPROCESSABLE_ENTITY)
                 .body(new ErrorResponse("DIFF_TOO_LARGE", ex.getMessage()));
+    }
+
+    /**
+     * Structured Review Output (SRO-16/17/65, threat model SOR-08): the single new error code this
+     * feature adds. Never echoes a raw file path — the throwing code names only the offending property/
+     * character class (SRO-65's "never a silently degraded schema, never a claim-time discovery").
+     */
+    @ExceptionHandler(StructuredOutputUnsupportedException.class)
+    public ResponseEntity<ErrorResponse> handleStructuredOutputUnsupported(StructuredOutputUnsupportedException ex) {
+        return ResponseEntity.status(HttpStatus.UNPROCESSABLE_ENTITY)
+                .body(new ErrorResponse("STRUCTURED_OUTPUT_UNSUPPORTED", ex.getMessage()));
     }
 
     @ExceptionHandler(ReviewNotFoundException.class)

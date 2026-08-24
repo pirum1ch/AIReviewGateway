@@ -8,7 +8,10 @@ import org.springframework.stereotype.Component;
 
 import java.time.Duration;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.regex.Pattern;
 
 /**
@@ -58,6 +61,8 @@ public class GatewayProperties {
     private final Backend backend = new Backend();
     private final Scheduler scheduler = new Scheduler();
     private final Prompt prompt = new Prompt();
+    private final Structured structured = new Structured();
+    private final Review review = new Review();
 
     public Diff getDiff() {
         return diff;
@@ -97,6 +102,14 @@ public class GatewayProperties {
 
     public Prompt getPrompt() {
         return prompt;
+    }
+
+    public Structured getStructured() {
+        return structured;
+    }
+
+    public Review getReview() {
+        return review;
     }
 
     /** PMR-14: project reference = numeric id, or up to 10 {@code /}-separated path segments — never a scheme/host. */
@@ -454,6 +467,18 @@ public class GatewayProperties {
          */
         private int maxChunkContextChars = 1000;
         /**
+         * Structured Review Output (SRO-66a, threat model SOT-03/SOR-03, BLOCKING): unconditional
+         * memory-safety bound on how many file paths {@code DiffChunker.Section} accumulates while
+         * scanning a single section's header region — applies to <b>every</b> prompt version, not just
+         * structured ones, because it closes an F-DC-01-shaped amplification (a crafted section of many
+         * short {@code +++ } header lines) rather than gating a feature. Never fires on real {@code git
+         * diff} output (one file per section); a section that hits this bound stops accumulating paths
+         * into the (advisory, v1/v2) chunk-context file list but the true count is still tracked, so a
+         * structured (v3) Review can fail fast at the edge instead of silently narrowing its coverage set
+         * (SRO-66b).
+         */
+        private int maxPathsPerSection = 64;
+        /**
          * SR-11 hard edge cap (bytes) for the whole {@code POST /reviews} request body, enforced by
          * {@code RequestBodySizeLimitFilter} before Spring MVC/Jackson reads it.
          *
@@ -540,6 +565,14 @@ public class GatewayProperties {
 
         public void setMaxChunkContextChars(int maxChunkContextChars) {
             this.maxChunkContextChars = maxChunkContextChars;
+        }
+
+        public int getMaxPathsPerSection() {
+            return maxPathsPerSection;
+        }
+
+        public void setMaxPathsPerSection(int maxPathsPerSection) {
+            this.maxPathsPerSection = maxPathsPerSection;
         }
     }
 
@@ -1178,6 +1211,162 @@ public class GatewayProperties {
             public void setMaxConcurrentResolutions(int maxConcurrentResolutions) {
                 this.maxConcurrentResolutions = maxConcurrentResolutions;
             }
+        }
+    }
+
+    /** Structured Review Output (architecture §8, {@code gateway.structured.*}). */
+    public static class Structured {
+        /** SRO-39: global kill switch — {@code false} emits no constraint and legacy-parses v3. The SRO-64 coverage list is still rendered either way. */
+        private boolean enabled = true;
+        /** SRO-07: used when {@code backends.structured_output_mode IS NULL}. Parsed via {@code StructuredOutputMode.fromNullable}. */
+        private String defaultMode = "OFF";
+        /** SRO-14/SRO-66: bounds schema size, coverage-block size and per-response length; structured prompt versions only. */
+        private int maxFilesPerChunk = 40;
+        /** SRO-65: max length of a schema-eligible path (checked after sanitizePath); deliberately below {@code ChunkContextRenderer.MAX_PATH_LENGTH} (300). */
+        private int maxPathChars = 256;
+        /** SRO-15: backstop only — if this ever fires, the SRO-65/SRO-66 edge bounds have a bug. */
+        private int maxSchemaBytes = 65536;
+        /** SRO-27 -&gt; {@code maxItems} on the {@code findings} array. */
+        private int maxFindingsPerFile = 20;
+        /** SRO-27 -&gt; finding {@code comment} {@code maxLength}. */
+        private int maxCommentChars = 1200;
+        /** SRO-27 -&gt; finding {@code suggestion} {@code maxLength}. */
+        private int maxSuggestionChars = 2000;
+        /** SRO-25: token-budget lever — {@code false} omits the per-file {@code summary} property entirely. */
+        private boolean perFileSummary = true;
+        /** SRO-38/SRO-68: {@code RETRY_THEN_FAIL} (default) or {@code RETRY_THEN_FALLBACK}. */
+        private String onInvalidResponse = "RETRY_THEN_FAIL";
+        /** SRO-51: whether to extract and render a {@code ```diff} context block per finding. */
+        private boolean includeDiffContext = true;
+        /** SRO-51: lines of context on each side of the finding's line. */
+        private int diffContextLines = 3;
+        /** §10: replaces {@code gateway.diff.answer-reserve} in the budget computation for structured prompt versions only. */
+        private int answerReserve = 8000;
+
+        public boolean isEnabled() {
+            return enabled;
+        }
+
+        public void setEnabled(boolean enabled) {
+            this.enabled = enabled;
+        }
+
+        public String getDefaultMode() {
+            return defaultMode;
+        }
+
+        public void setDefaultMode(String defaultMode) {
+            this.defaultMode = defaultMode;
+        }
+
+        public int getMaxFilesPerChunk() {
+            return maxFilesPerChunk;
+        }
+
+        public void setMaxFilesPerChunk(int maxFilesPerChunk) {
+            this.maxFilesPerChunk = maxFilesPerChunk;
+        }
+
+        public int getMaxPathChars() {
+            return maxPathChars;
+        }
+
+        public void setMaxPathChars(int maxPathChars) {
+            this.maxPathChars = maxPathChars;
+        }
+
+        public int getMaxSchemaBytes() {
+            return maxSchemaBytes;
+        }
+
+        public void setMaxSchemaBytes(int maxSchemaBytes) {
+            this.maxSchemaBytes = maxSchemaBytes;
+        }
+
+        public int getMaxFindingsPerFile() {
+            return maxFindingsPerFile;
+        }
+
+        public void setMaxFindingsPerFile(int maxFindingsPerFile) {
+            this.maxFindingsPerFile = maxFindingsPerFile;
+        }
+
+        public int getMaxCommentChars() {
+            return maxCommentChars;
+        }
+
+        public void setMaxCommentChars(int maxCommentChars) {
+            this.maxCommentChars = maxCommentChars;
+        }
+
+        public int getMaxSuggestionChars() {
+            return maxSuggestionChars;
+        }
+
+        public void setMaxSuggestionChars(int maxSuggestionChars) {
+            this.maxSuggestionChars = maxSuggestionChars;
+        }
+
+        public boolean isPerFileSummary() {
+            return perFileSummary;
+        }
+
+        public void setPerFileSummary(boolean perFileSummary) {
+            this.perFileSummary = perFileSummary;
+        }
+
+        public String getOnInvalidResponse() {
+            return onInvalidResponse;
+        }
+
+        public void setOnInvalidResponse(String onInvalidResponse) {
+            this.onInvalidResponse = onInvalidResponse;
+        }
+
+        public boolean isIncludeDiffContext() {
+            return includeDiffContext;
+        }
+
+        public void setIncludeDiffContext(boolean includeDiffContext) {
+            this.includeDiffContext = includeDiffContext;
+        }
+
+        public int getDiffContextLines() {
+            return diffContextLines;
+        }
+
+        public void setDiffContextLines(int diffContextLines) {
+            this.diffContextLines = diffContextLines;
+        }
+
+        public int getAnswerReserve() {
+            return answerReserve;
+        }
+
+        public void setAnswerReserve(int answerReserve) {
+            this.answerReserve = answerReserve;
+        }
+    }
+
+    /**
+     * Review-creation edge config (architecture threat model SOR-08, CRITICAL — {@code
+     * gateway.review.*}).
+     */
+    public static class Review {
+        /**
+         * SOR-08: {@code promptVersion} allowlist enforced at {@code POST /reviews}. {@code v3} is
+         * deliberately <b>not</b> in the shipped default — an operator adds it only after every Worker in
+         * the fleet has {@code v3.yml} deployed (§11 rollout order, Workers-first).
+         */
+        private Set<String> allowedPromptVersions = new LinkedHashSet<>(List.of("v1", "v2"));
+
+        public Set<String> getAllowedPromptVersions() {
+            return allowedPromptVersions;
+        }
+
+        public void setAllowedPromptVersions(Set<String> allowedPromptVersions) {
+            this.allowedPromptVersions = allowedPromptVersions != null
+                    ? allowedPromptVersions : new LinkedHashSet<>();
         }
     }
 }
