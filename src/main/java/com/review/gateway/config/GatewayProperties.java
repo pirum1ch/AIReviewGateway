@@ -121,6 +121,14 @@ public class GatewayProperties {
     private static final Pattern SOURCE_PATH_PATTERN = Pattern.compile("^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$");
     private static final int MAX_SOURCE_PATH_LENGTH = 200;
     private static final int MAX_OVERRIDES = 500;
+    /**
+     * Structured Review Output (SRO-64d): fixed-text overhead of the coverage block (the
+     * {@code STRUCTURED_COVERAGE_INTRO} sentence, delimiter tokens, and the part-of-N intro) added to
+     * the per-path budget when computing {@code coverageReserveTokens} at startup. A generous constant
+     * rather than a literal shared with {@code ChunkContextRenderer} — deliberately conservative so a
+     * future wording change to that fixed text cannot silently invalidate this budget check.
+     */
+    private static final int COVERAGE_BLOCK_FIXED_CHARS = 400;
 
     @PostConstruct
     void validateOnStartup() {
@@ -152,6 +160,74 @@ public class GatewayProperties {
 
         validateRetryAndBackendHealthOnStartup();
         validatePromptOnStartup();
+        validateStructuredOnStartup();
+    }
+
+    /**
+     * Structured Review Output (architecture §8, five-point startup validation). Runs unconditionally
+     * (not gated on {@code gateway.structured.enabled}) — SRO-39's kill switch still renders the SRO-64
+     * coverage list, so the budget it needs must always be consistent, not only when a decoder
+     * constraint happens to be turned on.
+     *
+     * <p>Point 5 (threat model SOR-13, CRITICAL) is the one the pre-implementation draft omitted: without
+     * subtracting {@code gateway.prompt.limits.max-system-prompt-tokens} when Prompt Manager is enabled,
+     * every v3 Review in a {@code REPO}-mode deployment would fail at <em>runtime</em> with {@code 422
+     * PROMPT_TOO_LARGE} instead of the Gateway refusing to start with a precise, named-property message.
+     */
+    private void validateStructuredOnStartup() {
+        if (structured.getMaxFilesPerChunk() < 1) {
+            throw new IllegalStateException(
+                    "gateway.structured.max-files-per-chunk must be >= 1; got: " + structured.getMaxFilesPerChunk());
+        }
+        // Point 1: max-path-chars must stay below ChunkContextRenderer's own (more generous) cap, so a
+        // structured Review never silently relies on THAT truncation instead of this feature's own bound.
+        if (structured.getMaxPathChars() < 1 || structured.getMaxPathChars() > 300) {
+            throw new IllegalStateException(
+                    "gateway.structured.max-path-chars must be between 1 and 300 (ChunkContextRenderer's own "
+                            + "path-length cap); got: " + structured.getMaxPathChars());
+        }
+        // Point 2: a per-section bound tighter than the per-chunk bound would make SRO-66b unreachable
+        // for legitimate input (a single well-formed section could never satisfy both).
+        if (diff.getMaxPathsPerSection() < structured.getMaxFilesPerChunk()) {
+            throw new IllegalStateException(
+                    "gateway.diff.max-paths-per-section must be >= gateway.structured.max-files-per-chunk "
+                            + "(otherwise a single legitimate file section could never satisfy both bounds) — got "
+                            + "max-paths-per-section=" + diff.getMaxPathsPerSection() + ", max-files-per-chunk="
+                            + structured.getMaxFilesPerChunk());
+        }
+        // Point 3: a smaller structured reserve than the v1/v2 reserve is always a misconfiguration --
+        // the guaranteed-shape structured response is strictly more verbose than a bare JSON array.
+        if (structured.getAnswerReserve() < diff.getAnswerReserve()) {
+            throw new IllegalStateException(
+                    "gateway.structured.answer-reserve must be >= gateway.diff.answer-reserve; got "
+                            + "structured.answer-reserve=" + structured.getAnswerReserve() + ", diff.answer-reserve="
+                            + diff.getAnswerReserve());
+        }
+
+        // Point 4 (SRO-64d): the coverage block must fit the budget. Sized for the worst case -- every
+        // path at max-path-chars -- because a budget that only works for typical inputs is not a budget.
+        int charsPerToken = Math.max(1, diff.getCharsPerToken());
+        long coverageReserveTokens = (long) Math.ceil(
+                ((double) structured.getMaxFilesPerChunk() * (structured.getMaxPathChars() + 1)
+                        + COVERAGE_BLOCK_FIXED_CHARS) / charsPerToken);
+
+        // Point 5 (threat model SOR-13, CRITICAL): include the Prompt Manager term when it is enabled.
+        long promptManagerTerm = prompt.isEnabled() ? prompt.getLimits().getMaxSystemPromptTokens() : 0;
+
+        long remainingDiffBudget = diff.getContextWindow() - diff.getPromptReserve() - structured.getAnswerReserve()
+                - coverageReserveTokens - promptManagerTerm;
+        int minDiffBudgetTokens = prompt.getLimits().getMinDiffBudgetTokens();
+        if (remainingDiffBudget < minDiffBudgetTokens) {
+            throw new IllegalStateException(
+                    "gateway.structured budget is inconsistent: gateway.diff.context-window - "
+                            + "gateway.diff.prompt-reserve - gateway.structured.answer-reserve - "
+                            + "coverageReserveTokens(" + coverageReserveTokens + ", derived from "
+                            + "gateway.structured.max-files-per-chunk and gateway.structured.max-path-chars)"
+                            + (prompt.isEnabled() ? " - gateway.prompt.limits.max-system-prompt-tokens" : "")
+                            + " = " + remainingDiffBudget + ", which must be >= "
+                            + "gateway.prompt.limits.min-diff-budget-tokens (" + minDiffBudgetTokens
+                            + ") — refusing to start");
+        }
     }
 
     /**

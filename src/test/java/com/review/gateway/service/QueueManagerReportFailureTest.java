@@ -83,7 +83,8 @@ class QueueManagerReportFailureTest extends AbstractPostgresIntegrationTest {
         return new QueueManager(reviewRepository, reviewJobRepository, reviewChunkRepository,
                 reviewPromptSectionRepository, backendDispatcher, jobStateMachine, chunkCoordinator, eventService,
                 Mockito.mock(ResultProcessor.class), chunkContextRenderer, promptMessageFormatter, retryManager,
-                new TextSanitizer(), new MetricsCounters(), entityManager, transactionManager);
+                new TextSanitizer(), new MetricsCounters(), new ReviewSchemaBuilder(), new DecoderConstraintRenderer(),
+                properties, entityManager, transactionManager);
     }
 
     private Review persistRunningReview(String headSha) {

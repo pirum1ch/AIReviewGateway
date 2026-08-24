@@ -101,7 +101,8 @@ class QueueManagerIntegrationTest extends AbstractPostgresIntegrationTest {
         return new QueueManager(reviewRepository, reviewJobRepository, reviewChunkRepository,
                 reviewPromptSectionRepository, backendDispatcher, jobStateMachine, chunkCoordinator, eventService,
                 resultProcessor, chunkContextRenderer, promptMessageFormatter, retryManager, new TextSanitizer(),
-                new MetricsCounters(), entityManager, transactionManager);
+                new MetricsCounters(), new ReviewSchemaBuilder(), new DecoderConstraintRenderer(), properties,
+                entityManager, transactionManager);
     }
 
     private Review persistQueuedReview(long projectId, long mrId, String headSha, int priority) {
@@ -316,5 +317,85 @@ class QueueManagerIntegrationTest extends AbstractPostgresIntegrationTest {
 
         assertThat(outcome.outcome()).isEqualTo(ResultOutcome.ACCEPTED);
         assertThat(outcome.currentStatus()).isEqualTo(ReviewStatus.COMPLETED);
+    }
+
+    // ---- Structured Review Output: SRO-64/SRO-67b claim-time behavior ----
+
+    private Review persistQueuedStructuredReview(long projectId, long mrId, String headSha, String filePathsJson) {
+        Review review = new Review(projectId, mrId, headSha, "base", "v3", 10);
+        review.setStatus(ReviewStatus.QUEUED);
+        review = reviewRepository.saveAndFlush(review);
+        reviewInputRepository.saveAndFlush(new ReviewInput(review.getId(), "diff-" + headSha, "v3", headSha, "base", 10));
+        ReviewChunk chunk = reviewChunkRepository.saveAndFlush(
+                new ReviewChunk(review.getId(), 0, 1, "diff-" + headSha, 10, 1, filePathsJson));
+        reviewJobRepository.saveAndFlush(new ReviewJob(review.getId(), chunk.getId(), 0, 10, null, null));
+        return review;
+    }
+
+    @Test
+    void claimForStructuredJobRendersUntruncatedCoverageListAndBuildsSchemaWhenBackendModeSet() {
+        Backend backend = persistBackend("mac-mini-struct-a", BackendStatus.ACTIVE, 2);
+        backend.setStructuredOutputMode("TOP_LEVEL_JSON_SCHEMA");
+        backendRepository.saveAndFlush(backend);
+        persistQueuedStructuredReview(1L, 200L, "sha-struct-a", "[\"src/A.java\"]");
+
+        QueueManager queueManager = newQueueManager(Mockito.mock(ResultProcessor.class));
+        ClaimedJob claimed = queueManager.claim("mac-mini-struct-a", "worker-1").orElseThrow();
+
+        // SRO-64a: never null, even for a single-chunk Review.
+        assertThat(claimed.chunkContext()).isNotNull();
+        assertThat(claimed.chunkContext()).contains("src/A.java");
+        assertThat(claimed.jsonSchema()).isNotNull();
+        assertThat(claimed.jsonSchema()).contains("src/A.java");
+        assertThat(claimed.responseFormat()).isNull();
+    }
+
+    @Test
+    void claimForStructuredJobWithBackendModeOffRendersCoverageListButBuildsNoConstraint() {
+        persistBackend("mac-mini-struct-b", BackendStatus.ACTIVE, 2); // structuredOutputMode left null -> default OFF
+        persistQueuedStructuredReview(1L, 201L, "sha-struct-b", "[\"src/B.java\"]");
+
+        QueueManager queueManager = newQueueManager(Mockito.mock(ResultProcessor.class));
+        ClaimedJob claimed = queueManager.claim("mac-mini-struct-b", "worker-1").orElseThrow();
+
+        // SRO-64/SRO-07: the coverage list is rendered regardless of whether a constraint is built --
+        // this is the default (OFF) configuration, the one that runs first and longest.
+        assertThat(claimed.chunkContext()).contains("src/B.java");
+        assertThat(claimed.jsonSchema()).isNull();
+        assertThat(claimed.responseFormat()).isNull();
+    }
+
+    @Test
+    void claimForStructuredJobWithEmptyFilePathsFailsTheJobClosedWithoutDispatching() {
+        persistBackend("mac-mini-struct-c", BackendStatus.ACTIVE, 2);
+        persistQueuedStructuredReview(1L, 202L, "sha-struct-c", "[]");
+
+        QueueManager queueManager = newQueueManager(Mockito.mock(ResultProcessor.class));
+        Optional<ClaimedJob> claimed = queueManager.claim("mac-mini-struct-c", "worker-1");
+
+        // SRO-67b: never dispatched to the Worker, never retried (SOT-14) -- fails immediately.
+        assertThat(claimed).isEmpty();
+        ReviewJob job = reviewJobRepository.findAll().stream()
+                .filter(j -> "sha-struct-c".equals(reviewRepository.findById(j.getReviewId()).orElseThrow().getHeadSha()))
+                .findFirst().orElseThrow();
+        assertThat(job.getStatus()).isEqualTo(JobStatus.FAILED);
+        assertThat(job.getLastError()).startsWith("structured-output: COVERAGE_LIST_UNAVAILABLE");
+
+        Review review = reviewRepository.findById(job.getReviewId()).orElseThrow();
+        assertThat(review.getStatus()).isEqualTo(ReviewStatus.FAILED);
+    }
+
+    @Test
+    void claimForNonStructuredJobIsCompletelyUnaffectedByStructuredCoverageLogic() {
+        // v1/v2 byte-for-byte guarantee: an empty file_paths list on a NON-structured job must never
+        // be treated as a coverage failure -- it is today's ordinary "no paths extracted" case.
+        persistBackend("mac-mini-struct-d", BackendStatus.ACTIVE, 2);
+        persistQueuedReview(1L, 203L, "sha-struct-d", 10); // v1, file_paths="[]" by construction
+
+        QueueManager queueManager = newQueueManager(Mockito.mock(ResultProcessor.class));
+        Optional<ClaimedJob> claimed = queueManager.claim("mac-mini-struct-d", "worker-1");
+
+        assertThat(claimed).isPresent();
+        assertThat(claimed.get().chunkContext()).isNull(); // single chunk, non-structured -> no header at all
     }
 }

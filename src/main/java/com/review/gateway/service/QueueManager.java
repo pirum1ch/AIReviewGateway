@@ -1,5 +1,6 @@
 package com.review.gateway.service;
 
+import com.review.gateway.config.GatewayProperties;
 import com.review.gateway.exception.PromptSectionsMissingException;
 import com.review.gateway.model.Backend;
 import com.review.gateway.model.Review;
@@ -9,6 +10,7 @@ import com.review.gateway.model.ReviewPromptSection;
 import com.review.gateway.model.enums.EventType;
 import com.review.gateway.model.enums.JobStatus;
 import com.review.gateway.model.enums.ReviewStatus;
+import com.review.gateway.model.enums.StructuredOutputMode;
 import com.review.gateway.repository.ReviewChunkRepository;
 import com.review.gateway.repository.ReviewJobRepository;
 import com.review.gateway.repository.ReviewPromptSectionRepository;
@@ -30,6 +32,7 @@ import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionTemplate;
 
+import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
@@ -70,6 +73,9 @@ public class QueueManager {
     private final RetryManager retryManager;
     private final TextSanitizer textSanitizer;
     private final MetricsCounters metricsCounters;
+    private final ReviewSchemaBuilder reviewSchemaBuilder;
+    private final DecoderConstraintRenderer decoderConstraintRenderer;
+    private final GatewayProperties properties;
     private final EntityManager entityManager;
     private final TransactionTemplate requiresNewTransactionTemplate;
 
@@ -87,6 +93,9 @@ public class QueueManager {
                          RetryManager retryManager,
                          TextSanitizer textSanitizer,
                          MetricsCounters metricsCounters,
+                         ReviewSchemaBuilder reviewSchemaBuilder,
+                         DecoderConstraintRenderer decoderConstraintRenderer,
+                         GatewayProperties properties,
                          EntityManager entityManager,
                          PlatformTransactionManager transactionManager) {
         this.reviewRepository = reviewRepository;
@@ -103,6 +112,9 @@ public class QueueManager {
         this.retryManager = retryManager;
         this.textSanitizer = textSanitizer;
         this.metricsCounters = metricsCounters;
+        this.reviewSchemaBuilder = reviewSchemaBuilder;
+        this.decoderConstraintRenderer = decoderConstraintRenderer;
+        this.properties = properties;
         this.entityManager = entityManager;
         this.requiresNewTransactionTemplate = new TransactionTemplate(transactionManager);
         this.requiresNewTransactionTemplate.setPropagationBehavior(TransactionTemplate.PROPAGATION_REQUIRES_NEW);
@@ -140,10 +152,15 @@ public class QueueManager {
         // QUEUED -> RUNNING before the follow-up fail step below asks for the (legal) RUNNING -> FAILED.
         chunkCoordinator.recomputeAndApply(attempt.reviewIdTouched());
 
-        if (attempt.jobIdMissingPromptSections() != null) {
-            // PMR-09: fail the job now that the parent is (legally) RUNNING, then recompute once more so
-            // the parent (legally) follows RUNNING -> FAILED. Never dispatched to the Worker.
-            failJobForMissingPromptSections(attempt.jobIdMissingPromptSections());
+        if (attempt.failJobId() != null) {
+            // PMR-09 shape (also reused by SRO-67b/SRO-15): fail the job now that the parent is (legally)
+            // RUNNING, then recompute once more so the parent (legally) follows RUNNING -> FAILED. Never
+            // dispatched to the Worker.
+            switch (attempt.failReason()) {
+                case MISSING_PROMPT_SECTIONS -> failJobForMissingPromptSections(attempt.failJobId());
+                case EMPTY_COVERAGE_LIST -> failJobForEmptyCoverageList(attempt.failJobId());
+                case SCHEMA_TOO_LARGE -> failJobForSchemaTooLarge(attempt.failJobId());
+            }
             chunkCoordinator.recomputeAndApply(attempt.reviewIdTouched());
             return Optional.empty();
         }
@@ -160,26 +177,44 @@ public class QueueManager {
         return attempt.claimed();
     }
 
+    /** Why {@link #claim} must defer-fail a job rather than dispatch it (see {@link ClaimAttempt}). */
+    private enum ClaimFailReason {
+        /** PMR-09: {@code prompt_bundle_mode=REPO} but mandatory CORPORATE_* sections are missing. */
+        MISSING_PROMPT_SECTIONS,
+        /** SRO-67b: a structured job whose parsed {@code file_paths} is empty. */
+        EMPTY_COVERAGE_LIST,
+        /** SRO-15: backstop — a rendered schema exceeded {@code gateway.structured.max-schema-bytes}. */
+        SCHEMA_TOO_LARGE
+    }
+
     /**
      * Outcome of {@link #claimJobRow}: {@code reviewIdTouched} is set whenever a job row's status
      * actually changed, so {@link #claim} knows to recompute the parent's derived status;
-     * {@code jobIdMissingPromptSections} is set instead of {@code claimed} on the PMR-09 fail-closed
-     * path (the job is RUNNING at this point — see {@link #claimJobRow}'s javadoc for why it is not
-     * marked FAILED there directly). {@code null} {@code reviewIdTouched} means nothing was touched at
-     * all (no claimable backend, empty queue).
+     * {@code failJobId}/{@code failReason} are set instead of {@code claimed} on a fail-closed path (the
+     * job is RUNNING at this point — see {@link #claimJobRow}'s javadoc for why it is not marked FAILED
+     * there directly). {@code null} {@code reviewIdTouched} means nothing was touched at all (no
+     * claimable backend, empty queue).
      */
-    private record ClaimAttempt(Optional<ClaimedJob> claimed, Long reviewIdTouched, Long jobIdMissingPromptSections) {
+    private record ClaimAttempt(Optional<ClaimedJob> claimed, Long reviewIdTouched, Long failJobId, ClaimFailReason failReason) {
 
         static ClaimAttempt none() {
-            return new ClaimAttempt(Optional.empty(), null, null);
+            return new ClaimAttempt(Optional.empty(), null, null, null);
         }
 
         static ClaimAttempt claimed(ClaimedJob job) {
-            return new ClaimAttempt(Optional.of(job), job.reviewId(), null);
+            return new ClaimAttempt(Optional.of(job), job.reviewId(), null, null);
         }
 
         static ClaimAttempt missingPromptSections(Long jobId, Long reviewId) {
-            return new ClaimAttempt(Optional.empty(), reviewId, jobId);
+            return new ClaimAttempt(Optional.empty(), reviewId, jobId, ClaimFailReason.MISSING_PROMPT_SECTIONS);
+        }
+
+        static ClaimAttempt emptyCoverageList(Long jobId, Long reviewId) {
+            return new ClaimAttempt(Optional.empty(), reviewId, jobId, ClaimFailReason.EMPTY_COVERAGE_LIST);
+        }
+
+        static ClaimAttempt schemaTooLarge(Long jobId, Long reviewId) {
+            return new ClaimAttempt(Optional.empty(), reviewId, jobId, ClaimFailReason.SCHEMA_TOO_LARGE);
         }
     }
 
@@ -223,10 +258,25 @@ public class QueueManager {
                         "Job " + jobId + " references missing review_chunks row (reviewId=" + job.getReviewId()
                                 + ", chunkIndex=" + job.getChunkIndex() + ")"));
 
-        String chunkContext = buildChunkContext(job.getReviewId(), chunk);
-
         Review review = reviewRepository.findById(job.getReviewId())
                 .orElseThrow(() -> new IllegalStateException("Review " + job.getReviewId() + " vanished mid-claim"));
+
+        boolean structuredVersion = StructuredOutputSupport.isStructured(review.getPromptVersion());
+
+        // SRO-64c: ONE parse, ONE List<String> instance, fed to both the prompt renderer and the schema
+        // builder below -- divergence between the two must be impossible by construction.
+        List<String> thisChunkPaths = parseFilePaths(chunk.getFilePaths());
+
+        if (structuredVersion && thisChunkPaths.isEmpty()) {
+            // SRO-67b: fail closed immediately -- never dispatch a structured job whose own coverage list
+            // is unreadable; no number of retries changes what a chunk row's file_paths column holds, so
+            // this is NOT routed through RetryManager (SOT-14: retrying would only burn LLM compute).
+            log.warn("Claim-time COVERAGE_LIST_UNAVAILABLE: jobId={} reviewId={} chunkIndex={}: parsed "
+                    + "file_paths is empty/unreadable", job.getId(), job.getReviewId(), job.getChunkIndex());
+            return ClaimAttempt.emptyCoverageList(job.getId(), job.getReviewId());
+        }
+
+        String chunkContext = buildChunkContext(review.getId(), chunk, thisChunkPaths, structuredVersion);
 
         List<String> systemMessages;
         try {
@@ -248,11 +298,43 @@ public class QueueManager {
             return ClaimAttempt.missingPromptSections(job.getId(), job.getReviewId());
         }
 
+        // Structured Review Output (architecture §4.4): the coverage list is rendered into the prompt
+        // (above) whether or not a constraint is built here -- SRO-64 is keyed on the prompt VERSION,
+        // this block's mode gate only decides whether a decoder-level CONSTRAINT is additionally built.
+        String responseFormat = null;
+        String jsonSchema = null;
+        if (structuredVersion && properties.getStructured().isEnabled()) {
+            StructuredOutputMode mode = decoderConstraintRenderer.resolveMode(
+                    backend.getStructuredOutputMode(), properties.getStructured().getDefaultMode());
+            if (mode != StructuredOutputMode.OFF) {
+                String schema = reviewSchemaBuilder.build(thisChunkPaths, structuredSchemaOptions());
+                int schemaBytes = schema.getBytes(StandardCharsets.UTF_8).length;
+                int maxSchemaBytes = properties.getStructured().getMaxSchemaBytes();
+                if (schemaBytes > maxSchemaBytes) {
+                    // SRO-15: backstop only -- with SRO-65/SRO-66 in force this is unreachable; if it
+                    // fires, that is a bug in the edge validation, and last_error says so verbatim.
+                    log.error("Claim-time SCHEMA_TOO_LARGE (edge bound did not fire -- bug): jobId={} "
+                                    + "reviewId={} chunkIndex={} schemaBytes={} max={}",
+                            job.getId(), job.getReviewId(), job.getChunkIndex(), schemaBytes, maxSchemaBytes);
+                    return ClaimAttempt.schemaTooLarge(job.getId(), job.getReviewId());
+                }
+                DecoderConstraintRenderer.DecoderConstraint constraint = decoderConstraintRenderer.render(schema, mode);
+                responseFormat = constraint.responseFormat();
+                jsonSchema = constraint.jsonSchema();
+            }
+        }
+
         log.info("Job claimed: jobId={} reviewId={} chunkIndex={} backend={} workerId={}",
                 job.getId(), job.getReviewId(), job.getChunkIndex(), backendName, workerId);
         ClaimedJob claimedJob = new ClaimedJob(job.getId(), job.getReviewId(), chunk.getDiff(),
-                review.getPromptVersion(), chunkContext, systemMessages, null, null);
+                review.getPromptVersion(), chunkContext, systemMessages, responseFormat, jsonSchema);
         return ClaimAttempt.claimed(claimedJob);
+    }
+
+    private ReviewSchemaBuilder.SchemaOptions structuredSchemaOptions() {
+        GatewayProperties.Structured cfg = properties.getStructured();
+        return new ReviewSchemaBuilder.SchemaOptions(cfg.getMaxFindingsPerFile(), cfg.getMaxCommentChars(),
+                cfg.getMaxSuggestionChars(), cfg.isPerFileSummary());
     }
 
     /**
@@ -276,24 +358,94 @@ public class QueueManager {
         });
     }
 
+    /** SRO-40/SRO-67b: no new {@code EventType} — the origin lives in this Gateway-constant prefix. */
+    private static final String COVERAGE_LIST_UNAVAILABLE_ERROR = "structured-output: COVERAGE_LIST_UNAVAILABLE";
+    /** SRO-15/SRO-40: ditto — the backstop firing is itself the diagnosis. */
+    private static final String SCHEMA_TOO_LARGE_ERROR =
+            "structured-output: SCHEMA_TOO_LARGE (edge bound did not fire -- bug)";
+
     /**
-     * Renders the cross-chunk context header (§3) only when this Review has more than one chunk;
-     * {@code null} otherwise (single-chunk equivalence, §8).
+     * SRO-67b follow-up fail step, structurally identical to {@link #failJobForMissingPromptSections}
+     * (own {@code REQUIRES_NEW} transaction, job-row lock only, called from {@link #claim} only after
+     * the parent has already been recomputed to {@code RUNNING}) — the two deliberate differences from
+     * PMR-09 are the reused {@code EventType.FAILED} (SRO-40: no new event type) and the origin living in
+     * {@code last_error}/{@code details}' Gateway-constant prefix instead. Never requeued: a chunk row
+     * that cannot yield its own file list will not yield one on attempt 2 either (SOT-14).
      */
-    private String buildChunkContext(Long reviewId, ReviewChunk chunk) {
+    private void failJobForEmptyCoverageList(Long jobId) {
+        requiresNewTransactionTemplate.executeWithoutResult(status -> {
+            applyLockTimeout();
+            ReviewJob job = reviewJobRepository.findByIdForUpdate(jobId).orElse(null);
+            if (job == null || job.getStatus() != JobStatus.RUNNING) {
+                return;
+            }
+            job.setLastError(COVERAGE_LIST_UNAVAILABLE_ERROR);
+            jobStateMachine.transition(job, JobStatus.FAILED, EventType.FAILED, job.getWorkerId(),
+                    job.getBackendId(), COVERAGE_LIST_UNAVAILABLE_ERROR);
+            reviewJobRepository.save(job);
+            log.info("Job {} FAILED at claim time: structured-output coverage list unavailable (reviewId={})",
+                    jobId, job.getReviewId());
+        });
+    }
+
+    /**
+     * SRO-15 backstop follow-up fail step — same shape as {@link #failJobForEmptyCoverageList}. Should be
+     * unreachable given the SRO-65/SRO-66 edge bounds; if it ever fires, that is a bug in those bounds,
+     * not a legitimate per-Review outcome, hence the {@code ERROR}-level log.
+     */
+    private void failJobForSchemaTooLarge(Long jobId) {
+        requiresNewTransactionTemplate.executeWithoutResult(status -> {
+            applyLockTimeout();
+            ReviewJob job = reviewJobRepository.findByIdForUpdate(jobId).orElse(null);
+            if (job == null || job.getStatus() != JobStatus.RUNNING) {
+                return;
+            }
+            job.setLastError(SCHEMA_TOO_LARGE_ERROR);
+            jobStateMachine.transition(job, JobStatus.FAILED, EventType.FAILED, job.getWorkerId(),
+                    job.getBackendId(), SCHEMA_TOO_LARGE_ERROR);
+            reviewJobRepository.save(job);
+            log.error("Job {} FAILED at claim time: rendered schema exceeded gateway.structured.max-schema-bytes "
+                    + "(reviewId={}) -- indicates a bug in the SRO-65/SRO-66 edge validation, not a per-Review issue",
+                    jobId, job.getReviewId());
+        });
+    }
+
+    /**
+     * Renders the cross-chunk context header (§3). For a non-structured version, {@code null} whenever
+     * this Review has only one chunk (single-chunk equivalence, §8) — unchanged. For a structured
+     * version (SRO-64a), <b>never</b> {@code null}, regardless of chunk count: the schema built from the
+     * same {@code thisChunkPaths} instance always demands this exact key set, so the model must always be
+     * shown it, even when the decoder constraint itself is not applied.
+     *
+     * @param thisChunkPaths the SRO-64c single parsed instance for this chunk — never re-parsed here
+     */
+    private String buildChunkContext(Long reviewId, ReviewChunk chunk, List<String> thisChunkPaths, boolean structuredVersion) {
         Integer chunkCount = chunk.getChunkCount();
-        if (chunkCount == null || chunkCount <= 1) {
+        int effectiveChunkCount = chunkCount == null ? 1 : chunkCount;
+
+        if (!structuredVersion && effectiveChunkCount <= 1) {
             return null;
         }
+
+        List<String> otherPaths = effectiveChunkCount > 1
+                ? collectOtherChunkPaths(reviewId, chunk.getChunkIndex())
+                : List.of();
+
+        if (structuredVersion) {
+            return chunkContextRenderer.renderStructured(chunk.getChunkIndex(), effectiveChunkCount, thisChunkPaths, otherPaths);
+        }
+        return chunkContextRenderer.render(chunk.getChunkIndex(), effectiveChunkCount, thisChunkPaths, otherPaths);
+    }
+
+    private List<String> collectOtherChunkPaths(Long reviewId, Integer excludeChunkIndex) {
         List<ReviewChunk> allChunks = reviewChunkRepository.findByReviewIdOrderByChunkIndexAsc(reviewId);
-        List<String> thisChunkPaths = parseFilePaths(chunk.getFilePaths());
         List<String> otherPaths = new ArrayList<>();
         for (ReviewChunk other : allChunks) {
-            if (!other.getChunkIndex().equals(chunk.getChunkIndex())) {
+            if (!other.getChunkIndex().equals(excludeChunkIndex)) {
                 otherPaths.addAll(parseFilePaths(other.getFilePaths()));
             }
         }
-        return chunkContextRenderer.render(chunk.getChunkIndex(), chunkCount, thisChunkPaths, otherPaths);
+        return otherPaths;
     }
 
     private List<String> parseFilePaths(String json) {
