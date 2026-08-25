@@ -133,6 +133,57 @@ class CommentRendererTest {
         assertThat(innerContent).doesNotContain("```");
     }
 
+    // ---- F-SRO-06: an altered/truncated code block is marked, never presented as verbatim ----
+
+    @Test
+    void unalteredSuggestionCarriesNoAlteredMarker() {
+        CommentRenderer renderer = newRenderer();
+
+        String rendered = renderer.render("A.java", null, Severity.MINOR, "comment", "int x = 1;", null);
+
+        assertThat(rendered).doesNotContain("normalized for display");
+    }
+
+    @Test
+    void aSuggestionWithAStrippedQuickActionLineCarriesTheAlteredMarker() {
+        CommentRenderer renderer = newRenderer();
+        String suggestion = "int x = 1;\n/close\nint y = 2;";
+
+        String rendered = renderer.render("A.java", null, Severity.MINOR, "comment", suggestion, null);
+
+        assertThat(rendered)
+                .as("sanitizeCodeBlock stripped the /close quick-action line -- the reader must be told "
+                        + "this block was altered")
+                .contains("normalized for display; not a verbatim quotation");
+    }
+
+    @Test
+    void aTruncatedSuggestionCarriesTheAlteredMarker() {
+        GatewayProperties properties = new GatewayProperties();
+        properties.getStructured().setMaxSuggestionChars(10);
+        CommentRenderer renderer = new CommentRenderer(new CommentParser(properties, new MetricsCounters()), new TextSanitizer(), properties);
+        String suggestion = "x".repeat(50);
+
+        String rendered = renderer.render("A.java", null, Severity.MINOR, "comment", suggestion, null);
+
+        assertThat(rendered).contains("normalized for display");
+    }
+
+    @Test
+    void aDiffContextBlockWithAStrippedQuickActionLineCarriesTheAlteredMarker() {
+        // F-SRO-06: SRO-56 strips a quick-action-shaped line even from a diff-context excerpt (a context
+        // line carries a single leading space, so " /close" still matches) -- real source content can
+        // vanish mid-excerpt, so the reader must be told the block was altered.
+        CommentRenderer renderer = newRenderer();
+        String diff = gitSection("A.java", "@@ -1,3 +1,3 @@", " /close", "+target", " line3");
+
+        String rendered = renderer.render("A.java", 2, Severity.MAJOR, "issue", "", diff);
+
+        assertThat(rendered).contains("Context (excerpt from the reviewed diff):");
+        assertThat(rendered).doesNotContain("/close");
+        assertThat(rendered).contains("normalized for display");
+    }
+
     // ---- diff-context block (SRO-51, SOR-12) ----
 
     @Test
@@ -144,6 +195,19 @@ class CommentRendererTest {
 
         assertThat(rendered).contains("```diff");
         assertThat(rendered).contains("+line3");
+    }
+
+    @Test
+    void diffContextBlockIsAlwaysLabelledAsAnExcerptEvenWhenUnaltered() {
+        // F-SRO-06: the diff-context block is by definition an excerpt (±N lines around the finding),
+        // never the whole file -- labelled unconditionally, whether or not sanitizeCodeBlock changed
+        // anything.
+        CommentRenderer renderer = newRenderer();
+        String diff = gitSection("src/A.java", "@@ -1,5 +1,5 @@", " line1", " line2", "+line3", " line4", " line5");
+
+        String rendered = renderer.render("src/A.java", 3, Severity.MAJOR, "issue here", "", diff);
+
+        assertThat(rendered).contains("Context (excerpt from the reviewed diff):");
     }
 
     @Test

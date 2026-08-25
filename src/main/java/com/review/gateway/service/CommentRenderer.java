@@ -44,6 +44,16 @@ public class CommentRenderer {
     /** SRO-52: a hard rule, never the fence language "suggestion" (GitLab's native apply-syntax). */
     private static final String SUGGESTED_FIX_LABEL = "Suggested fix:";
 
+    /**
+     * F-SRO-06 (appsec SAST fix round): appended after a code block whose content {@link
+     * #sanitizeCodeBlock} altered or truncated — a reviewer must never mistake a normalized block for a
+     * verbatim quotation of the file. A Gateway constant, never derived from model output (WOR-04/SRO-41
+     * discipline).
+     */
+    private static final String ALTERED_CODE_MARKER = "_(normalized for display; not a verbatim quotation)_";
+    /** F-SRO-06: labels the diff-context block unconditionally — it is by definition an excerpt (±N lines), never the whole file. */
+    private static final String DIFF_CONTEXT_LABEL = "Context (excerpt from the reviewed diff):";
+
     private static final Pattern BACKTICK_RUN = Pattern.compile("`{3,}");
     /** SRO-56: a leading '/' not followed by '/' or '*' -- preserves ordinary comment-opening code lines. */
     private static final Pattern QUICK_ACTION_LINE = Pattern.compile("^\\s*/(?![/*]).*$");
@@ -171,11 +181,16 @@ public class CommentRenderer {
         if (rawSuggestion == null || rawSuggestion.isBlank()) {
             return Optional.empty();
         }
-        String sanitized = sanitizeCodeBlock(rawSuggestion, properties.getStructured().getMaxSuggestionChars());
-        if (sanitized.isBlank()) {
+        SanitizedCode sanitized = sanitizeCodeBlock(rawSuggestion, properties.getStructured().getMaxSuggestionChars());
+        if (sanitized.text().isBlank()) {
             return Optional.empty();
         }
-        return Optional.of(SUGGESTED_FIX_LABEL + "\n" + CODE_FENCE + "\n" + sanitized + "\n" + CODE_FENCE);
+        StringBuilder block = new StringBuilder(SUGGESTED_FIX_LABEL).append('\n').append(CODE_FENCE).append('\n')
+                .append(sanitized.text()).append('\n').append(CODE_FENCE);
+        if (sanitized.altered()) {
+            block.append('\n').append(ALTERED_CODE_MARKER);
+        }
+        return Optional.of(block.toString());
     }
 
     // ---- diff-context block (SRO-51, SOR-12) ----
@@ -191,8 +206,14 @@ public class CommentRenderer {
                     + "file section of the chunk diff (line={})", lineNumber);
             return Optional.empty();
         }
-        String sanitized = sanitizeCodeBlock(raw.get(), properties.getPublish().getMaxCommentLength());
-        return Optional.of(CODE_FENCE + DIFF_FENCE_LANGUAGE + "\n" + sanitized + "\n" + CODE_FENCE);
+        SanitizedCode sanitized = sanitizeCodeBlock(raw.get(), properties.getPublish().getMaxCommentLength());
+        StringBuilder block = new StringBuilder(DIFF_CONTEXT_LABEL).append('\n')
+                .append(CODE_FENCE).append(DIFF_FENCE_LANGUAGE).append('\n')
+                .append(sanitized.text()).append('\n').append(CODE_FENCE);
+        if (sanitized.altered()) {
+            block.append('\n').append(ALTERED_CODE_MARKER);
+        }
+        return Optional.of(block.toString());
     }
 
     /**
@@ -332,18 +353,25 @@ public class CommentRenderer {
 
     // ---- code sanitization (SRO-55/56/57) ----
 
+    /** F-SRO-06: {@code altered} is {@code true} iff {@link #sanitizeCodeBlock} changed anything relative to {@code raw} (any of the four transformations, including the length cap). */
+    private record SanitizedCode(String text, boolean altered) {
+    }
+
     /**
      * MUST NOT HTML-escape (entities are not decoded inside a CommonMark fence, so escaping there
      * corrupts code and protects nothing). Strips Cc(except {@code \n}/{@code \t})/Cf/Zl/Zp (reusing
      * {@link TextSanitizer}, not a second implementation of the F-DC-02 character-class lesson), strips
      * SRO-56 quick-action-shaped lines, collapses every run of 3+ backticks <em>before</em> capping
-     * length (SOR-09), then caps.
+     * length (SOR-09), then caps. F-SRO-06: also reports whether any of that changed the text, so the
+     * caller can label a genuinely-altered block rather than let it pass as a verbatim quotation.
      */
-    private String sanitizeCodeBlock(String raw, int maxLength) {
+    private SanitizedCode sanitizeCodeBlock(String raw, int maxLength) {
         String controlStripped = textSanitizer.sanitizeSectionText(raw);
         String withoutQuickActions = stripQuickActionLines(controlStripped == null ? "" : controlStripped);
         String backtickCollapsed = collapseBacktickRuns(withoutQuickActions);
-        return capLength(backtickCollapsed, maxLength);
+        String capped = capLength(backtickCollapsed, maxLength);
+        boolean altered = raw == null || !capped.equals(raw);
+        return new SanitizedCode(capped, altered);
     }
 
     private String collapseBacktickRuns(String text) {
