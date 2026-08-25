@@ -497,4 +497,59 @@ class DiffChunkerTest {
         assertThat(untrusted.pathsTrusted()).isFalse();
         assertThat(noDelimiters.pathsTrusted()).isFalse();
     }
+
+    // ---- QA round: T-6.1 corpus regression -- SRO-66a's new unconditional per-section extraction bound
+    // must not move v1/v2 chunk boundaries by even one byte ----
+
+    /**
+     * A small corpus of real-diff-shaped inputs spanning the cases that matter for chunk-boundary
+     * stability: a single small file (single-chunk shortcut), several files forced into separate chunks
+     * by a tight budget (bin-packing), a file whose own section alone exceeds the per-chunk budget
+     * (oversized-section splitting), and a path containing characters real git output can produce
+     * (spaces, dots, nested directories).
+     */
+    private List<String> realShapedDiffCorpus() {
+        String smallSingleFile = gitSection("README.md", oneHunk("+one line change"));
+
+        StringBuilder threeFiles = new StringBuilder();
+        threeFiles.append(gitSection("src/main/java/com/example/Foo.java", oneHunk("+" + "a".repeat(200))));
+        threeFiles.append(gitSection("src/main/java/com/example/Bar.java", oneHunk("+" + "b".repeat(200))));
+        threeFiles.append(gitSection("src/test/java/com/example/FooTest.java", oneHunk("+" + "c".repeat(200))));
+
+        StringBuilder oneOversizedFile = new StringBuilder();
+        oneOversizedFile.append(gitSection("src/main/resources/generated.sql",
+                oneHunk("+" + "x".repeat(2000)), "@@ -100,1 +100,1 @@", "+" + "y".repeat(2000)));
+
+        String pathWithSpaceAndDots = gitSection("docs/release notes v1.2.3.md", oneHunk("+changelog entry"));
+
+        return List.of(smallSingleFile, threeFiles.toString(), oneOversizedFile.toString(), pathWithSpaceAndDots);
+    }
+
+    @Test
+    void theSRO66aPerSectionExtractionBoundNeverChangesV1V2ChunkBoundariesAcrossARealDiffCorpus() {
+        // Two DiffChunker instances differing ONLY in gateway.diff.max-paths-per-section -- a tiny bound
+        // that would visibly truncate the advisory file list for a pathological many-header-lines-in-one-
+        // section input (SRO-66a), vs. an effectively unbounded one. For maxFilesPerChunk=0 (v1/v2), SRO-66b's
+        // whole edge-bound check short-circuits, so the corpus's ChunkPlan output must be byte-identical
+        // (same chunk count, same chunk text, same file paths, same estimatedTokens, same pathsTrusted)
+        // regardless of this bound -- proving the §8 backward-compat guarantee holds even after SRO-66a
+        // was added, not just for the pathological inputs the other tests in this class already cover.
+        GatewayProperties tightSectionBound = propertiesWithBudget(4_000, 128, 10);
+        tightSectionBound.getDiff().setMaxPathsPerSection(2);
+        GatewayProperties looseSectionBound = propertiesWithBudget(4_000, 128, 10);
+        looseSectionBound.getDiff().setMaxPathsPerSection(10_000);
+
+        DiffChunker tightChunker = newChunker(tightSectionBound);
+        DiffChunker looseChunker = newChunker(looseSectionBound);
+
+        for (String diff : realShapedDiffCorpus()) {
+            DiffChunker.ChunkPlan tightPlan = tightChunker.split(diff, 0, 0);
+            DiffChunker.ChunkPlan loosePlan = looseChunker.split(diff, 0, 0);
+
+            assertThat(tightPlan)
+                    .as("maxFilesPerChunk=0 (v1/v2) must be completely unaffected by "
+                            + "gateway.diff.max-paths-per-section for diff: " + diff.substring(0, Math.min(60, diff.length())))
+                    .isEqualTo(loosePlan);
+        }
+    }
 }
