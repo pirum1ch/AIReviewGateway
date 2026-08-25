@@ -88,6 +88,25 @@ class StructuredResponseParserTest {
     }
 
     @Test
+    void aDuplicateEntryInExpectedPathsNeverDoublesPublishedComments() {
+        // F-SRO-02 belt-and-braces: the primary defense against a duplicate expectedPaths entry is
+        // ReviewService's SRO-17 collision check (ReviewServiceTest), but this class must independently
+        // never process the same file twice even if a duplicate ever reached it -- it iterates the
+        // deduped expectedSet, not the raw expectedPaths list.
+        String raw = """
+                {"files":{"A.java":{"findings":[{"line":3,"severity":"major","comment":"Bug here","suggestion":""}],"summary":"ok"}},"summary":"overall"}
+                """;
+
+        ValidationResult result = validate(raw, List.of("A.java", "A.java"));
+
+        assertThat(result.isSuccess()).isTrue();
+        assertThat(result.success().comments())
+                .as("a duplicate entry in expectedPaths must never cause a file's findings to be collected/"
+                        + "rendered twice")
+                .hasSize(1);
+    }
+
+    @Test
     void perFileSummaryDisabledDoesNotRequireTheSummaryField() {
         String raw = """
                 {"files":{"A.java":{"findings":[]}},"summary":"overall"}
@@ -322,51 +341,36 @@ class StructuredResponseParserTest {
         assertThat(second.isSuccess()).isTrue();
     }
 
-    // ---- Known gap for the SAST round: threat model SOR-14 (TRACKED) / SOT-12(b) --
-    // STRICT_DUPLICATE_DETECTION is NOT enabled on this parser's ObjectMapper (deliberate developer
-    // deviation -- see StructuredResponseParser's constructor: only StreamReadConstraints is configured).
-    // These tests pin down and document the *actual* runtime behavior today, so the SAST round verifies
-    // an observed fact rather than re-deriving it from reading the code.
+    // ---- F-SRO-01 (appsec SAST fix round): STRICT_DUPLICATE_DETECTION is now enabled on this parser's
+    // ObjectMapper. These two fixtures used to pin down a silent last-write-wins data-loss bug (see git
+    // history for the pre-fix versions of these tests); they are now inverted to assert that a duplicate
+    // key is rejected outright as FailureKind.NOT_JSON, never silently resolved.
 
     @Test
-    void duplicateTopLevelFilesKeyIsNotRejectedAndTheLastOccurrenceSilentlyWins() {
-        // Jackson's default readTree() behavior for a duplicate object key is "last value wins, first is
-        // discarded" -- there is exactly one "files" field left in the parsed tree, so
-        // validateTopLevelShape's {files, summary} key-set check does not even see the duplication.
-        // Two distinct claims this test pins down: (1) no NOT_JSON/SCHEMA_MISMATCH is raised for the
-        // duplicate key itself -- it is not detected as malformed at all; (2) coverage validation is run
-        // against the SECOND occurrence's key set only, silently discarding the first object entirely
-        // (a genuine data-loss/silent-override behavior, not a "both objects merge" or "first wins" one).
+    void duplicateTopLevelFilesKeyIsRejectedAsNotJson() {
+        // Jackson's DEFAULT readTree() behavior for a duplicate object key is "last value wins, first is
+        // silently discarded". With STRICT_DUPLICATE_DETECTION enabled, the duplicate key throws a
+        // JsonParseException instead -- classified NOT_JSON, exactly like any other malformed response.
         String raw = """
                 {"files":{"a.java":{"findings":[],"summary":"first"}},\
                 "files":{"a.java":{"findings":[],"summary":"second"},"b.java":{"findings":[],"summary":"second-b"}},\
                 "summary":"overall"}
                 """;
 
-        // Expected set matches only the SECOND object's keys (a.java + b.java) -- if the first object's
-        // key set (a.java alone) were the one actually validated, this would spuriously fail as
-        // COVERAGE_SHORTFALL (unexpected=b.java). It does not: the second occurrence wins outright.
-        ValidationResult resultAgainstSecondObjectKeys = validate(raw, List.of("a.java", "b.java"));
-        assertThat(resultAgainstSecondObjectKeys.isSuccess())
-                .as("the duplicate 'files' key is not flagged as malformed; the parser silently validates "
-                        + "against the LAST occurrence's key set only")
-                .isTrue();
-        assertThat(resultAgainstSecondObjectKeys.success().comments()).isEmpty();
+        ValidationResult result = validate(raw, List.of("a.java", "b.java"));
 
-        // Conversely, if the FIRST object's key set were expected instead, coverage now spuriously fails
-        // -- confirming the first "files" object's content is not merged in and not visible to validation
-        // at all, i.e. it is not "safety net" data, it is simply gone.
-        ValidationResult resultAgainstFirstObjectKeys = validate(raw, List.of("a.java"));
-        assertThat(resultAgainstFirstObjectKeys.isSuccess()).isFalse();
-        assertThat(resultAgainstFirstObjectKeys.failure().kind()).isEqualTo(FailureKind.COVERAGE_SHORTFALL);
-        assertThat(resultAgainstFirstObjectKeys.failure().detail()).contains("b.java");
+        assertThat(result.isSuccess())
+                .as("a duplicate top-level 'files' key must never validate successfully -- it must never "
+                        + "silently discard the first object's content")
+                .isFalse();
+        assertThat(result.failure().kind()).isEqualTo(FailureKind.NOT_JSON);
     }
 
     @Test
-    void duplicateNestedFileKeyWithinASingleFilesObjectAlsoSilentlyLastWriteWins() {
-        // Same mechanism one level down: two entries for "A.java" inside the same "files" object. The
-        // first entry's findings (which would have produced a comment) are silently discarded in favor
-        // of the second entry's (empty) findings -- content can vanish without any validation failure.
+    void duplicateNestedFileKeyWithinASingleFilesObjectIsRejectedAsNotJson() {
+        // Same mechanism one level down: two entries for "A.java" inside the same "files" object. Before
+        // the fix, the first entry's real finding was silently discarded in favor of the second (empty)
+        // entry with no error and no signal. Now the duplicate key itself is rejected.
         String raw = """
                 {"files":{"A.java":{"findings":[{"line":1,"severity":"major","comment":"first entry finding","suggestion":""}],"summary":"first"},\
                 "A.java":{"findings":[],"summary":"second"}},"summary":"overall"}
@@ -374,11 +378,22 @@ class StructuredResponseParserTest {
 
         ValidationResult result = validate(raw, List.of("A.java"));
 
+        assertThat(result.isSuccess())
+                .as("a duplicate nested file key must never validate successfully -- content must never be "
+                        + "silently discarded")
+                .isFalse();
+        assertThat(result.failure().kind()).isEqualTo(FailureKind.NOT_JSON);
+    }
+
+    @Test
+    void nonDuplicateResponseStillParsesSuccessfullyWithStrictDuplicateDetectionEnabled() {
+        // Regression guard: STRICT_DUPLICATE_DETECTION must not reject ordinary, non-duplicated responses.
+        String raw = """
+                {"files":{"a.java":{"findings":[],"summary":"ok"},"b.java":{"findings":[],"summary":"ok"}},"summary":"overall"}
+                """;
+
+        ValidationResult result = validate(raw, List.of("a.java", "b.java"));
+
         assertThat(result.isSuccess()).isTrue();
-        assertThat(result.success().comments())
-                .as("the first A.java entry's finding ('first entry finding') is silently dropped -- only "
-                        + "the second (duplicate) entry's empty findings survive, with no error and no signal "
-                        + "that content was discarded")
-                .isEmpty();
     }
 }

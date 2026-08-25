@@ -3,6 +3,7 @@ package com.review.gateway.service;
 import com.fasterxml.jackson.core.JsonFactory;
 import com.fasterxml.jackson.core.JsonParseException;
 import com.fasterxml.jackson.core.StreamReadConstraints;
+import com.fasterxml.jackson.core.StreamReadFeature;
 import com.fasterxml.jackson.core.io.JsonEOFException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -37,6 +38,12 @@ import java.util.stream.Collectors;
  * from a constrained backend, and an empty expected path set is never treated as a satisfiable
  * condition (that case is a caller bug, {@link IllegalStateException}, never reported as a pass or as
  * {@code COVERAGE_SHORTFALL} — SRO-67c).
+ *
+ * <p><b>F-SRO-01 (appsec SAST):</b> the dedicated {@link ObjectMapper} enables {@code
+ * StreamReadFeature.STRICT_DUPLICATE_DETECTION}, so a duplicate {@code files} key or a duplicate
+ * per-file key is reported as {@link FailureKind#NOT_JSON} (via a plain {@code JsonParseException} —
+ * Jackson has no dedicated duplicate-key exception subtype), never silently resolved by keeping only
+ * the last occurrence.
  */
 @Service
 public class StructuredResponseParser {
@@ -91,12 +98,27 @@ public class StructuredResponseParser {
         // Threat model SOR-14 (TRACKED): a dedicated ObjectMapper with explicit StreamReadConstraints,
         // turning inherited Jackson defaults into a stated contract on the one parser that eats
         // adversarial input by design.
+        //
+        // F-SRO-01 (appsec SAST): STRICT_DUPLICATE_DETECTION is enabled deliberately. Without it, a
+        // duplicate "files" key (or a duplicate key inside one file's object) makes Jackson silently
+        // keep only the *last* occurrence and discard the first object's content outright -- validation
+        // then runs against the survivor and can pass, producing a COMPLETED job that silently dropped
+        // real findings with no error, no FailureKind, no counter. With the flag on, a duplicate key
+        // throws a plain JsonParseException (there is no dedicated "duplicate key" exception subtype --
+        // JsonReadContext._checkDup throws JsonParseException itself), which the catch block below
+        // already classifies as FailureKind.NOT_JSON using only getClass().getSimpleName() -- never the
+        // exception message (F02-03/SR-14). A duplicate key is therefore reported as NOT_JSON, not
+        // SCHEMA_MISMATCH; that is an intentional, acceptable classification (SOR-14's property is
+        // "never last-wins", not "classified as SCHEMA_MISMATCH") and needs no message inspection.
         StreamReadConstraints constraints = StreamReadConstraints.builder()
                 .maxNestingDepth(64)
                 .maxNameLength(1024)
                 .maxStringLength(Math.max(20_000, properties.getPublish().getMaxRawResponseLength()))
                 .build();
-        JsonFactory jsonFactory = JsonFactory.builder().streamReadConstraints(constraints).build();
+        JsonFactory jsonFactory = JsonFactory.builder()
+                .streamReadConstraints(constraints)
+                .enable(StreamReadFeature.STRICT_DUPLICATE_DETECTION)
+                .build();
         this.objectMapper = JsonMapper.builder(jsonFactory).build();
     }
 
@@ -165,7 +187,11 @@ public class StructuredResponseParser {
         }
 
         List<RawFinding> findings = new ArrayList<>();
-        for (String path : expectedPaths) {
+        // F-SRO-02 belt-and-braces: iterate the deduped expectedSet, not the raw expectedPaths list --
+        // if a caller-side sanitization collision ever slipped a duplicate value into expectedPaths
+        // (ReviewService's SRO-17 check is the primary defense against that), this class must still
+        // never process the same file twice.
+        for (String path : expectedSet) {
             ValidationResult fileShapeFailure = validateFileEntryAndCollect(filesNode.get(path), path, options, findings);
             if (fileShapeFailure != null) {
                 return fileShapeFailure;
