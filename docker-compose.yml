@@ -88,6 +88,13 @@ services:
       PROMPT_CORPORATE_BASE_PROMPT_PATH: ${PROMPT_CORPORATE_BASE_PROMPT_PATH:-prompts/base-system-prompt.md}
       PROMPT_CORPORATE_REVIEW_RULES_PATH: ${PROMPT_CORPORATE_REVIEW_RULES_PATH:-prompts/review-rules.md}
       PROMPT_ON_ERROR: ${PROMPT_ON_ERROR:-FAIL}
+      # Structured Review Output (docs/structured-review-output-architecture.md) -- same rule as the
+      # Prompt Manager block above: Compose only forwards variables listed here. Left at their
+      # off-by-default-risk values (v3 not allowlisted, no backend constrained) unless the operator
+      # explicitly exports the corresponding host env var (see README.md's promptVersion v3 section).
+      ALLOWED_PROMPT_VERSIONS: ${ALLOWED_PROMPT_VERSIONS:-v1,v2}
+      STRUCTURED_OUTPUT_ENABLED: ${STRUCTURED_OUTPUT_ENABLED:-true}
+      STRUCTURED_OUTPUT_DEFAULT_MODE: ${STRUCTURED_OUTPUT_DEFAULT_MODE:-OFF}
     ports:
       - "8080:8080"
     # GITLAB_BASE_URL uses the gitlab.local hostname (its self-signed cert's SAN is issued for
