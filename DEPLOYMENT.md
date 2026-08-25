@@ -30,6 +30,7 @@ illustrative hostnames chosen for this runbook, not values baked into the code.
 8. [Step 6: End-to-end smoke test](#8-step-6-end-to-end-smoke-test)
    - [8a. Upgrading to V2 (diff chunking)](#8a-upgrading-to-v2-diff-chunking)
    - [8b. Upgrading to V4 (Worker Observability & Claim Latency)](#8b-upgrading-to-v4-worker-observability--claim-latency)
+   - [8c. Upgrading to V5 (Structured Review Output)](#8c-upgrading-to-v5-structured-review-output)
 9. [Operations quick reference](#9-operations-quick-reference)
 10. [Config file appendix](#10-config-file-appendix)
 11. [Docker deployment (verified, both images)](#11-docker-deployment-verified-both-images)
@@ -190,6 +191,75 @@ To opt in, set `PROMPT_MANAGER_ENABLED=true` and provision:
 With the kill-switch at its default (`false`), `GatewayProperties.validateOnStartup()` skips all
 `gateway.prompt.*` validation, including `GITLAB_PROMPT_TOKEN`'s presence check, and behavior is
 byte-identical to pre-V3.
+
+**Structured Review Output (V5): no new secret, but a hard deployment-order prerequisite.** `v3` support
+adds no credential of its own — it reuses the existing `CI_TOKEN`/`WORKER_TOKEN` and three optional,
+purely additive env vars (`ALLOWED_PROMPT_VERSIONS`, `STRUCTURED_OUTPUT_ENABLED`,
+`STRUCTURED_OUTPUT_DEFAULT_MODE`, all with working defaults — see [§10](#10-config-file-appendix)). What
+it does add is an ordering requirement: **every Worker in the fleet must already be running a build that
+ships `worker/src/main/resources/prompts/v3.yml` before `v3` is ever added to
+`gateway.review.allowed-prompt-versions`** (Workers first, Gateway second — the same precedent as
+Prompt Manager's own template rollout). An old Worker that claims a `v3` job it doesn't recognize
+abandons it immediately (`POST /jobs/{id}/fail`, `PROMPT_INVALID`) and the Review burns its retry budget
+for nothing — allowlisting `v3` before the fleet is ready turns every `v3` submission into a guaranteed,
+avoidable failure. See [§8c](#8c-upgrading-to-v5-structured-review-output) for the full upgrade
+procedure and the rollout ladder.
+
+**Capability verification: does a given `llama-server` build actually honor a JSON Schema constraint?**
+Before setting a backend's `structured_output_mode` to anything but `OFF`
+([§8c](#8c-upgrading-to-v5-structured-review-output)), verify it directly against **that** backend — this
+repository pins no `llama.cpp`/`llama-server` version, and structured-output support (and, worse, silent
+*fail-open* on an unparseable grammar — a documented `llama.cpp` behavior, not a bug in this codebase) is
+a per-build capability, not something safe to assume from a version number. The recipe needs **two**
+calls, not one — a schema the model conforms to easily proves nothing about a fail-open backend, which
+passes that call by luck:
+
+```bash
+# 1. Positive check: a trivial schema most models satisfy even unprompted. A conforming response alone
+#    does NOT prove the constraint is enforced -- see the negative check below.
+curl -sS "http://192.168.1.101:8000/v1/chat/completions" \
+  -H "Content-Type: application/json" \
+  -d '{
+        "model": "qwen2.5-coder",
+        "messages": [{"role": "user", "content": "Reply with a JSON object."}],
+        "response_format": {
+          "type": "json_schema",
+          "json_schema": { "name": "toy", "schema": {
+            "type": "object", "additionalProperties": false,
+            "required": ["ok"], "properties": { "ok": { "type": "boolean" } }
+          }}
+        }
+      }' | jq '.choices[0].message.content'
+
+# 2. Negative control (the one most guides skip): a schema the model would NOT satisfy unprompted --
+#    an enum of nonsense values it has no reason to pick on its own. If the response still "conforms"
+#    (picks one of the listed nonsense values), the constraint is genuinely enforced. If it answers with
+#    something else entirely (ignores the schema) or the call errors out, the backend is failing open or
+#    rejecting the schema -- do NOT enable structured_output_mode for it.
+curl -sS "http://192.168.1.101:8000/v1/chat/completions" \
+  -H "Content-Type: application/json" \
+  -d '{
+        "model": "qwen2.5-coder",
+        "messages": [{"role": "user", "content": "Reply with a JSON object."}],
+        "response_format": {
+          "type": "json_schema",
+          "json_schema": { "name": "negative_control", "schema": {
+            "type": "object", "additionalProperties": false,
+            "required": ["verdict"], "properties": {
+              "verdict": { "type": "string", "enum": ["xqzplorf", "zbrknarv", "qwyzfelt"] }
+            }
+          }}
+        }
+      }' | jq '.choices[0].message.content'
+```
+
+Also check the `llama-server` process's own log output for `failed to parse grammar` (or similar) around
+the time of either call — this is the only client-visible symptom of the fail-open bug on some builds,
+and it can appear even when the HTTP response still looks superficially fine. If either check fails, or
+the log line appears, leave that backend's `structured_output_mode` at `OFF` (or `NULL`, which uses
+`gateway.structured.default-mode`, itself `OFF` by default) — the feature still works for that backend,
+just without a decoder-level guarantee (the coverage list in the prompt and the Gateway's own strict
+response validation are unaffected either way).
 
 ## 3. Step 1: PostgreSQL
 
@@ -753,6 +823,96 @@ to today's (pre-V4) behavior.
 - Do not manually edit `review_jobs.not_before`/`backends.probe_failed_since` outside the application —
   both are written exclusively by `RetryManager`/`BackendHealthChecker` under their own lock discipline.
 
+## 8c. Upgrading to V5 (Structured Review Output)
+
+`V5__structured_review_output.sql` adds two additive, nullable columns — `backends.structured_output_mode`
+and `review_results.finish_reason` — plus one `CHECK` constraint on the new `backends` column. Like V4
+(and unlike V2), this migration is **rollback-tolerant**: an older Gateway JAR simply ignores both new
+columns and degrades to today's (pre-V5) behavior — it never reads or writes either one, so the `CHECK`
+can never be violated by old code, and `v3` traffic is impossible before this migration anyway (the
+allowlist gate is application-level, not a schema constraint).
+
+### Rollback tolerance
+
+- An older Gateway JAR ignoring `backends.structured_output_mode` never attaches a decoder constraint —
+  exactly today's (pre-V5) behavior, safe.
+- An older Gateway JAR ignoring `review_results.finish_reason` never classifies a `TRUNCATED` structured
+  failure from it — moot, since an old JAR also has no `StructuredResponseParser` to classify anything
+  for in the first place.
+- Rolling back **does not** un-allowlist `v3` by itself — `gateway.review.allowed-prompt-versions` is a
+  Gateway config value, not a DB row. If you roll back the JAR, also remove `v3` from that allowlist (or
+  set `ALLOWED_PROMPT_VERSIONS` back to `v1,v2`), or `POST /reviews` with `promptVersion: v3` will 500 on
+  the old JAR (it has no code path for that value at all) instead of failing cleanly.
+
+### Deployment notes
+
+- `ALTER TABLE review_results ADD COLUMN finish_reason ...` takes an `ACCESS EXCLUSIVE` lock on
+  `review_results` — the largest table in the schema — for the (metadata-only, sub-second) duration of the
+  `ALTER`. The migration sets an explicit `lock_timeout = '5s'` so a stuck `ALTER` fails fast instead of
+  silently blocking every result submission behind it. As with V4, this runs at Gateway startup while it
+  is the only writer and is momentarily down; the Worker fleet is not affected (`RUNNING` jobs survive
+  Gateway restarts) and simply sees `204`/retries until the new Gateway is up.
+- **`ck_backends_structured_output_mode` and a future fifth mode.** The `CHECK` constraint enumerates the
+  four `StructuredOutputMode` values (`OFF`, `RESPONSE_FORMAT_JSON_SCHEMA`, `RESPONSE_FORMAT_SCHEMA`,
+  `TOP_LEVEL_JSON_SCHEMA`). If a future release adds a fifth wire mode, the constraint **must be relaxed
+  first**, in its own migration, before any row can be set to the new value:
+  ```sql
+  ALTER TABLE backends DROP CONSTRAINT ck_backends_structured_output_mode;
+  ALTER TABLE backends ADD CONSTRAINT ck_backends_structured_output_mode
+      CHECK (structured_output_mode IS NULL OR structured_output_mode IN
+          ('OFF', 'RESPONSE_FORMAT_JSON_SCHEMA', 'RESPONSE_FORMAT_SCHEMA', 'TOP_LEVEL_JSON_SCHEMA', '<NEW_MODE>'));
+  ```
+- **Enabling a backend, once its capability is verified** ([§2](#2-prerequisites)'s `curl` recipe):
+  ```sql
+  UPDATE backends SET structured_output_mode = 'RESPONSE_FORMAT_JSON_SCHEMA' WHERE name = 'mac-mini-01';
+  -- Rollback for one backend:
+  UPDATE backends SET structured_output_mode = 'OFF' WHERE name = 'mac-mini-01';
+  ```
+  A single `UPDATE`, no restart — this is deliberately a data change, not a config/redeploy, so a canary
+  rollout (see the rollout ladder below) never needs a Gateway restart between stages.
+- **Cross-module coupling, both silent on mismatch (no startup check spans both processes):**
+  - `gateway.structured.answer-reserve` (Gateway, default `8000`) must stay `≥` `v3.yml`'s `maxTokens`
+    minus some margin, ideally equal to it (shipped: both `8000`/`8192`, close enough by design) — a
+    mismatch doesn't fail startup on either side; it just risks a truncated completion under a large chunk
+    if the Gateway's budget assumption is smaller than what the Worker actually requests.
+  - `gateway.structured.max-schema-bytes` (Gateway, default `65536`) must stay **below**
+    `worker.limits.max-constraint-bytes` (Worker, default `69632`) by at least the largest wire-wrapper
+    overhead — the shipped defaults already satisfy this (69632 = 65536 + 4096 headroom). If you change
+    one, recompute the other; a mismatch here doesn't fail startup on either process, it produces a
+    fleet-wide `CONSTRAINT_INVALID` abandonment loop the first time a schema near the Gateway's own limit
+    is claimed.
+- **Workers-first is a hard prerequisite, not a suggestion** ([§2](#2-prerequisites)) — deploy every Worker
+  with `v3.yml` before adding `v3` to `gateway.review.allowed-prompt-versions`, never the other way round.
+- No new grant is needed (§3) — the existing `review_gateway` role already has `UPDATE` on `backends` and
+  `INSERT` on `review_results`.
+
+### Monitored residual: LLM-compute amplification on validation failure
+
+`gateway.structured.max-validation-attempts` (a per-Review override for the retry-attempt budget on
+structured-validation failures specifically) is **not implemented** — a structured job whose response
+fails validation reuses the same `gateway.retry.max-attempts` (default 3) as any infrastructure failure,
+and each retry re-runs LLM inference at full compute cost. Because the trigger (any of the
+`STRUCTURED_OUTPUT_UNSUPPORTED` conditions in [§6.1](README.md#61-post-reviews--create-a-review) is
+already closed at `POST /reviews`; what's left is genuine model non-conformance) is not attacker-forceable
+in the same way the pre-fix edge gaps were, and because a permanently-failing chunk cascades `CANCELLED`
+to its successful sibling chunks (`ChunkCoordinator`), this is accepted as a monitored residual
+(`SOR-INH-1`) rather than built out further. **The one available lever today is
+`gateway.structured.enabled=false`** (the kill switch, [§4.5](README.md#45-structured-review-output-v5-optional))
+— it disables the feature wholesale (falls back to `CommentParser` parsing for all `v3` traffic) rather
+than tuning the attempt budget for structured failures alone. Watch `structuredValidationFailures` (`GET
+/metrics`) for a sustained rate as the early signal; if a specific project/MR is triggering it
+repeatedly, ask that project to resubmit with `promptVersion: v2` while investigating.
+
+### What NOT to do
+
+- Do not add `v3` to `gateway.review.allowed-prompt-versions` before every Worker in the fleet ships
+  `v3.yml` — see [§2](#2-prerequisites).
+- Do not set a backend's `structured_output_mode` to anything but `OFF`/`NULL` without first running the
+  capability-verification recipe ([§2](#2-prerequisites)) against **that specific** backend — a
+  fail-open `llama-server` build looks identical to a working one on a single happy-path request.
+- Do not relax `ck_backends_structured_output_mode` casually — only when actually adding a fifth mode,
+  in its own migration.
+
 ## 9. Operations quick reference
 
 | Task | How |
@@ -787,6 +947,12 @@ BACKEND_ALLOWED_HOST_PATTERN=^192\.168\.1\.101$
 # PROMPT_MANAGER_ENABLED=true
 # GITLAB_PROMPT_TOKEN=<separate, read-only GitLab project/group access token, read_api/read_repository scope>
 # PROMPT_CORPORATE_PROJECT=<numeric project id or "group/project" path -- never a URL>
+
+# Structured Review Output (V5, optional -- all three have working defaults, uncomment only to change
+# them; adding "v3" here is a hard no-op until every Worker in the fleet ships v3.yml, see §2/§8c)
+# ALLOWED_PROMPT_VERSIONS=v1,v2,v3
+# STRUCTURED_OUTPUT_ENABLED=true
+# STRUCTURED_OUTPUT_DEFAULT_MODE=OFF
 ```
 
 ### 10.2 Gateway systemd unit (`/etc/systemd/system/review-gateway.service`)
