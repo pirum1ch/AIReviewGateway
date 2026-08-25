@@ -204,14 +204,27 @@ public class CommentParser {
         // at all -- it only bounds the pre-escape length, defeating the SR-09 guarantee on the value
         // that actually reaches the DB/GitLab. Same class of defect as the filePath VARCHAR(1024)
         // overflow this fix's sibling method (sanitizeFilePath) also had (F02-04/KD-2).
-        String mentionsNeutralized = neutralizeMentions(trimmed);
-        String escaped = HtmlUtils.htmlEscape(mentionsNeutralized);
-        String capped = capLength(escaped, properties.getPublish().getMaxCommentLength());
+        String capped = sanitizeProseText(trimmed);
 
         String sanitizedFilePath = sanitizeFilePath(candidate.filePath());
         Integer normalizedLine = normalizeLineNumber(candidate.lineNumber());
 
         return new ParsedComment(sanitizedFilePath, normalizedLine, candidate.severity(), capped);
+    }
+
+    /**
+     * Structured Review Output (SRO-54): exposes the identical prose-sanitization pipeline v1/v2
+     * comments already go through (mention-neutralization, HTML-escaping, then length-capping last per
+     * F02-08) so {@code CommentRenderer}'s prose part runs through the <em>same code</em>, not a
+     * re-implementation — no regression to SR-08/SR-09/F02-08. Callers are expected to have already
+     * decided the text is non-blank (unlike {@link #sanitize}, this never returns {@code null} — an
+     * already-trimmed empty input simply sanitizes to an empty string).
+     */
+    public String sanitizeProseText(String text) {
+        String trimmed = text == null ? "" : text.trim();
+        String mentionsNeutralized = neutralizeMentions(trimmed);
+        String escaped = HtmlUtils.htmlEscape(mentionsNeutralized);
+        return capLength(escaped, properties.getPublish().getMaxCommentLength());
     }
 
     /**
@@ -228,7 +241,9 @@ public class CommentParser {
      *
      * @return the sanitized file path, or {@code null} if nothing remains after sanitation
      */
-    private String sanitizeFilePath(String filePath) {
+    // Package-private (not private): CommentRenderer (SOR-10) reuses this exact method for the v3
+    // published-comment file_path column, so both versions store the same shape (escape then cap).
+    String sanitizeFilePath(String filePath) {
         if (filePath == null) {
             return null;
         }
@@ -247,7 +262,9 @@ public class CommentParser {
      * {@link JsonNode#isInt()} values or values that parse cleanly as {@code int}). Normalizes any
      * invalid value to {@code null} rather than persisting/publishing a misleading line reference.
      */
-    private Integer normalizeLineNumber(Integer lineNumber) {
+    // Package-private (not private): StructuredResponseParser (SRO-23) reuses this exact normalization
+    // for the schema's "line: 0 = file-level" sentinel -- deliberately no second implementation.
+    Integer normalizeLineNumber(Integer lineNumber) {
         return (lineNumber != null && lineNumber > 0) ? lineNumber : null;
     }
 
