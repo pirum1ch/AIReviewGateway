@@ -150,8 +150,25 @@ public class ResultProcessor {
         return result != null ? result : currentReviewStatus(reviewId);
     }
 
+    /**
+     * QA round (structured-review-output): {@code process()} has no {@code @Transactional} of its own,
+     * so when it is invoked from within an ambient caller transaction that has <em>already</em> loaded
+     * this same {@code Review} row into its persistence context earlier in the same request (as
+     * {@code QueueManager.submitResult} does, one line before calling {@link #process}) — a plain {@code
+     * reviewRepository.findById(reviewId)} here returns Hibernate's already-managed, now-STALE instance
+     * from the first-level cache rather than re-reading it, even though {@link RetryManager#requeueOrFail}
+     * (validation-failure branch, SRO-36) or {@code ChunkCoordinator} committed a newer status moments
+     * earlier in their own separate {@code REQUIRES_NEW} transaction. The DB itself is never wrong — only
+     * this synchronous return value (and therefore the {@code POST /jobs/{id}/result} HTTP response body
+     * a caller/Worker reads) was: a v3 validation failure that got requeued to {@code QUEUED} was reported
+     * back as the job's pre-retry {@code RUNNING} status. Running this read in its own fresh {@code
+     * REQUIRES_NEW} transaction (reusing the template already used for phase 1) gives it a brand-new
+     * persistence context with no stale entry for this id, forcing a genuine re-read.
+     */
     private ReviewStatus currentReviewStatus(Long reviewId) {
-        return reviewRepository.findById(reviewId).map(Review::getStatus).orElse(ReviewStatus.FAILED);
+        ReviewStatus status = requiresNewTransactionTemplate.execute(txStatus ->
+                reviewRepository.findById(reviewId).map(Review::getStatus).orElse(null));
+        return status != null ? status : ReviewStatus.FAILED;
     }
 
     /**
