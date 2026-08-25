@@ -148,6 +148,38 @@ class ReviewControllerTest {
     }
 
     @Test
+    void createReviewReturns400OnOverlongPromptVersion() throws Exception {
+        // F-SRO-09: promptVersion now has an edge-level @Size(max=32) -- previously @NotBlank only, so
+        // an arbitrarily long value could reach ReviewService's rejection-message machinery.
+        String invalidJson = """
+                {"projectId": 1, "mergeRequestId": 2, "headSha": "abc", "baseSha": "def", "diff": "x", "promptVersion": "%s"}
+                """.formatted("v".repeat(33));
+
+        mockMvc.perform(post("/reviews")
+                        .header("Authorization", "Bearer " + SecurityTestTokens.CI_TOKEN)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(invalidJson))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"));
+    }
+
+    @Test
+    void createReviewReturns400OnPromptVersionOutsideTheAllowedCharacterAlphabet() throws Exception {
+        // F-SRO-09: a value containing e.g. '<'/'>' must never even reach ReviewService -- it should be
+        // rejected by the DTO-level @Pattern, not by echoing it back in a 422 message.
+        String invalidJson = """
+                {"projectId": 1, "mergeRequestId": 2, "headSha": "abc", "baseSha": "def", "diff": "x", "promptVersion": "<script>"}
+                """;
+
+        mockMvc.perform(post("/reviews")
+                        .header("Authorization", "Bearer " + SecurityTestTokens.CI_TOKEN)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(invalidJson))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("VALIDATION_ERROR"));
+    }
+
+    @Test
     void createReviewReturns401WithoutAToken() throws Exception {
         mockMvc.perform(post("/reviews")
                         .contentType(MediaType.APPLICATION_JSON)

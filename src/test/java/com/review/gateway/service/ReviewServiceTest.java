@@ -307,6 +307,26 @@ class ReviewServiceTest {
         verify(reviewRepository, never()).saveAndFlush(any());
     }
 
+    @Test
+    void anUnknownPromptVersionNeverEchoesTheRawValueButNamesTheAllowlist() {
+        // F-SRO-09: the 422 STRUCTURED_OUTPUT_UNSUPPORTED body must never reflect caller-controlled text
+        // back into the response -- this exercises the ReviewService throw site directly (bypassing the
+        // CreateReviewRequest DTO's edge-level @Pattern, exactly like a future caller of this service
+        // method that isn't the REST controller would), so the discipline must hold here too, not only
+        // via the DTO-level validation.
+        String maliciousMarker = "INJECTED-MARKER-<script>alert(1)</script>";
+        CreateReviewCommand command = new CreateReviewCommand(1L, 2L, "sha-injection", "base-sha", "diff content",
+                maliciousMarker, 10);
+
+        assertThatThrownBy(() -> reviewService.createReview(command))
+                .isInstanceOf(com.review.gateway.exception.StructuredOutputUnsupportedException.class)
+                .hasMessageNotContaining(maliciousMarker)
+                .hasMessageNotContaining("INJECTED-MARKER")
+                .hasMessageContaining("gateway.review.allowed-prompt-versions");
+
+        verify(reviewRepository, never()).saveAndFlush(any());
+    }
+
     // ---- Structured Review Output: edge validation once v3 is allowlisted (SRO-16/17/65) ----
 
     @Test

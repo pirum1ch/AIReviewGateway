@@ -214,12 +214,19 @@ public class ReviewService {
      * ships {@code v3.yml} would abandon it and burn all three attempts in ~3 minutes (WOC's immediate
      * {@code POST /jobs/{id}/fail}), failing the Review with the sibling cascade. Reuses {@code 422
      * STRUCTURED_OUTPUT_UNSUPPORTED} (no new error code, architecture §4.3 preamble).
+     *
+     * <p><b>F-SRO-09 (appsec SAST fix round):</b> never echoes the caller-supplied {@code promptVersion}
+     * back into the response body — {@code CreateReviewRequest.promptVersion} now has an edge-level
+     * {@code @Size}/{@code @Pattern} bound, but this throw site itself still names only the allowed set
+     * (a Gateway-config value, not attacker-controlled), matching the discipline the SRO-16/17/65 throw
+     * sites in {@link #validateStructuredOutputEligibility} already follow.
      */
     private void validatePromptVersionAllowlist(String promptVersion) {
         if (!properties.getReview().getAllowedPromptVersions().contains(promptVersion)) {
             throw new StructuredOutputUnsupportedException(
-                    "promptVersion '" + promptVersion + "' is not in gateway.review.allowed-prompt-versions; "
-                            + "an operator enables it only once every Worker in the fleet can serve it");
+                    "promptVersion is not in the allowlist gateway.review.allowed-prompt-versions="
+                            + properties.getReview().getAllowedPromptVersions()
+                            + "; an operator enables a new version only once every Worker in the fleet can serve it");
         }
     }
 
