@@ -254,4 +254,43 @@ class CommentRendererTest {
         }
         return count;
     }
+
+    // ---- F-SRO-04: ChunkDiffIndex / renderIndexed must be behaviorally identical to the String overload ----
+
+    @Test
+    void renderIndexedProducesTheExactSameOutputAsTheStringOverload() {
+        CommentRenderer renderer = newRenderer();
+        String diff = gitSection("src/A.java", "@@ -1,3 +1,3 @@", " line1", "+line2", " line3");
+
+        String viaString = renderer.render("src/A.java", 2, Severity.MAJOR, "Something is wrong", "sug", diff);
+        String viaIndex = renderer.renderIndexed("src/A.java", 2, Severity.MAJOR, "Something is wrong", "sug",
+                renderer.prepareChunkDiffIndex(diff));
+
+        assertThat(viaIndex).isEqualTo(viaString);
+    }
+
+    @Test
+    void oneChunkDiffIndexCanBeReusedAcrossMultipleFilesInTheSameChunk() {
+        // F-SRO-04: the whole point of the index is to be built ONCE per chunk and reused across every
+        // finding's render call, including findings for DIFFERENT files within the same chunk diff.
+        CommentRenderer renderer = newRenderer();
+        String diff = gitSection("A.java", "@@ -1,1 +1,1 @@", "+aaa") + gitSection("B.java", "@@ -1,1 +1,1 @@", "+bbb");
+        CommentRenderer.ChunkDiffIndex index = renderer.prepareChunkDiffIndex(diff);
+
+        String renderedA = renderer.renderIndexed("A.java", 1, Severity.MAJOR, "issue in A", "", index);
+        String renderedB = renderer.renderIndexed("B.java", 1, Severity.MAJOR, "issue in B", "", index);
+
+        assertThat(renderedA).contains("issue in A").contains("+aaa");
+        assertThat(renderedB).contains("issue in B").contains("+bbb");
+    }
+
+    @Test
+    void prepareChunkDiffIndexOnANullChunkDiffYieldsNoDiffContextBlockJustLikeTheOldNullShortCircuit() {
+        CommentRenderer renderer = newRenderer();
+
+        String rendered = renderer.renderIndexed("A.java", 1, Severity.MAJOR, "comment", "",
+                renderer.prepareChunkDiffIndex(null));
+
+        assertThat(rendered).doesNotContain("````diff");
+    }
 }

@@ -134,11 +134,21 @@ public class StructuredResponseParser {
      *                              wire value for this completion, or {@code null}
      * @param chunkDiff             {@code review_chunks.diff} for this job's own (reviewId, chunkIndex) —
      *                              forwarded to {@link CommentRenderer} verbatim (SOR-12)
+     * @param commentCap            F-SRO-04 (appsec SAST fix round): the caller's fair-share comment cap
+     *                              for this chunk (the same value the legacy path passes to {@code
+     *                              CommentParser.parse}, {@code max(1, floor(maxCommentCount /
+     *                              chunkCount))}) — bounds only how many of the <em>validated</em>
+     *                              findings are actually rendered, never which findings are validated:
+     *                              coverage/shape/length checks below still run against every finding in
+     *                              the response, exactly as before. Capping happens strictly before
+     *                              rendering so the expensive per-finding diff-context extraction never
+     *                              runs for a finding that could never be published anyway.
      * @throws IllegalStateException if {@code expectedPaths} is null/empty (SRO-67c) — an internal
      *                                 invariant violation, never a validation outcome
      */
     public ValidationResult validate(String rawResponse, List<String> expectedPaths, boolean rawResponseTruncated,
-                                      String finishReason, String chunkDiff, ReviewSchemaBuilder.SchemaOptions options) {
+                                      String finishReason, String chunkDiff, ReviewSchemaBuilder.SchemaOptions options,
+                                      int commentCap) {
         if (expectedPaths == null || expectedPaths.isEmpty()) {
             // SRO-67c: the more rigorously SRO-04 is implemented, the more confidently an empty expected
             // set would otherwise pass -- this is OUR bug (SRO-67b should have failed the job closed
@@ -198,12 +208,30 @@ public class StructuredResponseParser {
             }
         }
 
+        // F-SRO-04: cap RENDERING (never validation, which is already complete above) to the caller's
+        // fair-share limit -- the schema's hard bound alone allows up to 40 files x 20 findings = 800
+        // RawFinding entries, and rendering every one of them before any cap let a single chunk consume
+        // the entire review-wide comment budget (SRO-33's fairShareCommentCap was never applied on this
+        // path) while also running the expensive per-finding diff-context extraction for findings that
+        // could never survive the cap anyway.
+        int effectiveCap = Math.max(0, commentCap);
+        List<RawFinding> findingsToRender = findings.size() > effectiveCap ? findings.subList(0, effectiveCap) : findings;
+        if (findings.size() > effectiveCap) {
+            log.debug("Structured response yielded {} finding(s), rendering only the first {} under the "
+                    + "fair-share comment cap", findings.size(), effectiveCap);
+        }
+
+        // F-SRO-04: the chunk diff is split/indexed exactly ONCE here, then reused across every finding's
+        // render() call -- previously every single render() call re-split and re-scanned the whole chunk
+        // diff from scratch.
+        CommentRenderer.ChunkDiffIndex diffIndex = commentRenderer.prepareChunkDiffIndex(chunkDiff);
+
         List<ParsedComment> comments = new ArrayList<>();
-        for (RawFinding finding : findings) {
+        for (RawFinding finding : findingsToRender) {
             // SRO-34: a file whose findings is empty simply contributes no entries to `findings` above.
             Integer normalizedLine = commentParser.normalizeLineNumber(finding.line());
-            String renderedText = commentRenderer.render(finding.filePath(), normalizedLine, finding.severity(),
-                    finding.comment(), finding.suggestion(), chunkDiff);
+            String renderedText = commentRenderer.renderIndexed(finding.filePath(), normalizedLine, finding.severity(),
+                    finding.comment(), finding.suggestion(), diffIndex);
             String sanitizedFilePath = commentParser.sanitizeFilePath(finding.filePath());
             comments.add(new ParsedComment(sanitizedFilePath, normalizedLine, finding.severity(), renderedText));
         }

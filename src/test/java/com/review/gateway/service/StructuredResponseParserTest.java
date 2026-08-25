@@ -29,8 +29,11 @@ class StructuredResponseParserTest {
         return new ReviewSchemaBuilder.SchemaOptions(20, 1200, 2000, true);
     }
 
+    /** F-SRO-04: a generous cap so pre-existing tests (which assert exact comment counts well under this) are unaffected. */
+    private static final int NO_EFFECTIVE_CAP = 1_000;
+
     private ValidationResult validate(String raw, List<String> expectedPaths) {
-        return newParser().validate(raw, expectedPaths, false, null, null, defaultOptions());
+        return newParser().validate(raw, expectedPaths, false, null, null, defaultOptions(), NO_EFFECTIVE_CAP);
     }
 
     // ---- SRO-67c: the empty-expected-set invariant ----
@@ -39,9 +42,9 @@ class StructuredResponseParserTest {
     void emptyExpectedPathsThrowsRatherThanValidating() {
         StructuredResponseParser parser = newParser();
 
-        assertThatThrownBy(() -> parser.validate("{}", List.of(), false, null, null, defaultOptions()))
+        assertThatThrownBy(() -> parser.validate("{}", List.of(), false, null, null, defaultOptions(), NO_EFFECTIVE_CAP))
                 .isInstanceOf(IllegalStateException.class);
-        assertThatThrownBy(() -> parser.validate("{}", null, false, null, null, defaultOptions()))
+        assertThatThrownBy(() -> parser.validate("{}", null, false, null, null, defaultOptions(), NO_EFFECTIVE_CAP))
                 .isInstanceOf(IllegalStateException.class);
     }
 
@@ -114,7 +117,7 @@ class StructuredResponseParserTest {
         StructuredResponseParser parser = newParser();
         ReviewSchemaBuilder.SchemaOptions options = new ReviewSchemaBuilder.SchemaOptions(20, 1200, 2000, false);
 
-        ValidationResult result = parser.validate(raw, List.of("A.java"), false, null, null, options);
+        ValidationResult result = parser.validate(raw, List.of("A.java"), false, null, null, options, NO_EFFECTIVE_CAP);
 
         assertThat(result.isSuccess()).isTrue();
     }
@@ -152,7 +155,7 @@ class StructuredResponseParserTest {
     void finishReasonLengthIsClassifiedTruncatedRegardlessOfContent() {
         StructuredResponseParser parser = newParser();
 
-        ValidationResult result = parser.validate("{}", List.of("A.java"), false, "length", null, defaultOptions());
+        ValidationResult result = parser.validate("{}", List.of("A.java"), false, "length", null, defaultOptions(), NO_EFFECTIVE_CAP);
 
         assertThat(result.failure().kind()).isEqualTo(FailureKind.TRUNCATED);
     }
@@ -161,7 +164,7 @@ class StructuredResponseParserTest {
     void rawResponseTruncatedFlagIsClassifiedTruncated() {
         StructuredResponseParser parser = newParser();
 
-        ValidationResult result = parser.validate("{}", List.of("A.java"), true, null, null, defaultOptions());
+        ValidationResult result = parser.validate("{}", List.of("A.java"), true, null, null, defaultOptions(), NO_EFFECTIVE_CAP);
 
         assertThat(result.failure().kind()).isEqualTo(FailureKind.TRUNCATED);
     }
@@ -257,7 +260,7 @@ class StructuredResponseParserTest {
         StructuredResponseParser parser = newParser();
         ReviewSchemaBuilder.SchemaOptions tightOptions = new ReviewSchemaBuilder.SchemaOptions(2, 1200, 2000, true);
 
-        ValidationResult result = parser.validate(raw, List.of("A.java"), false, null, null, tightOptions);
+        ValidationResult result = parser.validate(raw, List.of("A.java"), false, null, null, tightOptions, NO_EFFECTIVE_CAP);
 
         assertThat(result.failure().kind()).isEqualTo(FailureKind.SCHEMA_MISMATCH);
     }
@@ -271,7 +274,7 @@ class StructuredResponseParserTest {
         StructuredResponseParser parser = newParser();
         ReviewSchemaBuilder.SchemaOptions tightOptions = new ReviewSchemaBuilder.SchemaOptions(20, 10, 2000, true);
 
-        ValidationResult result = parser.validate(raw, List.of("A.java"), false, null, null, tightOptions);
+        ValidationResult result = parser.validate(raw, List.of("A.java"), false, null, null, tightOptions, NO_EFFECTIVE_CAP);
 
         assertThat(result.failure().kind()).isEqualTo(FailureKind.SCHEMA_MISMATCH);
     }

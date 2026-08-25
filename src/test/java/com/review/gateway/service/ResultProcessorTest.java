@@ -475,4 +475,104 @@ class ResultProcessorTest extends AbstractPostgresIntegrationTest {
         assertThat(comments.get(0).getComment()).contains("issue found");
         assertThat(comments.get(0).getComment()).contains("**MAJOR**");
     }
+
+    // ---- F-SRO-04: fairShareCommentCap must apply on the structured path too ----
+
+    private ReviewJob persistStructuredJobForChunk(Review review, Long chunkId, int chunkIndex, int attempts) {
+        Backend backend = backendRepository.saveAndFlush(
+                new Backend("backend-struct-" + review.getId() + "-" + chunkIndex, "https://backend-struct.local", "model", 1));
+        ReviewJob job = new ReviewJob(review.getId(), chunkId, chunkIndex, 10, "worker-1", backend.getId());
+        job.setStatus(JobStatus.RUNNING);
+        job.setStartedAt(Instant.now());
+        job.setAttempts(attempts);
+        return reviewJobRepository.saveAndFlush(job);
+    }
+
+    private com.review.gateway.model.ReviewChunk persistChunkAt(Long reviewId, int chunkIndex, int chunkCount,
+                                                                   String diff, List<String> filePaths) {
+        StringBuilder json = new StringBuilder("[");
+        for (int i = 0; i < filePaths.size(); i++) {
+            if (i > 0) {
+                json.append(',');
+            }
+            json.append('"').append(filePaths.get(i)).append('"');
+        }
+        json.append(']');
+        com.review.gateway.model.ReviewChunk chunk = new com.review.gateway.model.ReviewChunk(
+                reviewId, chunkIndex, chunkCount, diff, 10, filePaths.size(), json.toString());
+        return reviewChunkRepository.saveAndFlush(chunk);
+    }
+
+    private String structuredFindingsRaw(String filePath, int findingCount) {
+        StringBuilder findings = new StringBuilder();
+        for (int i = 0; i < findingCount; i++) {
+            if (i > 0) {
+                findings.append(',');
+            }
+            findings.append("{\"line\":1,\"severity\":\"major\",\"comment\":\"finding-")
+                    .append(filePath).append('-').append(i).append("\",\"suggestion\":\"\"}");
+        }
+        return "{\"files\":{\"" + filePath + "\":{\"findings\":[" + findings + "],\"summary\":\"s\"}},\"summary\":\"overall\"}";
+    }
+
+    @Test
+    void fairShareCommentCapAppliesOnTheStructuredPathAcrossMultipleChunks() {
+        // F-SRO-04(a): before this fix, processStructuredJobPhase never called fairShareCommentCap --
+        // only the review-level cap (persistCappedComments, first-come-first-served) applied. With a
+        // 2-chunk review and a review-wide cap of 3, chunk 0 alone (5 candidate findings) would have
+        // consumed the entire budget, leaving chunk 1's own genuine finding published nowhere. With the
+        // fair-share cap applied (max(1, 3/2) = 1 per chunk), both chunks must contribute.
+        GatewayProperties properties = new GatewayProperties();
+        properties.getPublish().setMaxCommentCount(3);
+        Review review = persistRunningStructuredReview("sha-struct-fairshare");
+
+        var chunk0 = persistChunkAt(review.getId(), 0, 2, SINGLE_FILE_DIFF, List.of("A.java"));
+        String diffB = "diff --git a/B.java b/B.java\nindex 111..222 100644\n--- a/B.java\n+++ b/B.java\n@@ -1,1 +1,1 @@\n+y\n";
+        var chunk1 = persistChunkAt(review.getId(), 1, 2, diffB, List.of("B.java"));
+        ReviewJob job0 = persistStructuredJobForChunk(review, chunk0.getId(), 0, 1);
+        ReviewJob job1 = persistStructuredJobForChunk(review, chunk1.getId(), 1, 1);
+
+        CommentParser commentParser = new CommentParser(properties, new MetricsCounters());
+        ResultProcessor processor = newResultProcessor(commentParser, properties);
+
+        // Chunk 0's response offers 5 candidate findings for A.java -- far more than its fair share.
+        processor.process(review.getId(), job0.getId(), "worker-1", job0.getBackendId(),
+                new SubmitResultCommand(structuredFindingsRaw("A.java", 5), 10, 5, 1000L, "model-x", null));
+        // Chunk 1's response offers a single genuine finding for B.java.
+        processor.process(review.getId(), job1.getId(), "worker-1", job1.getBackendId(),
+                new SubmitResultCommand(structuredFindingsRaw("B.java", 1), 10, 5, 1000L, "model-x", null));
+
+        var comments = reviewCommentRepository.findByReviewId(review.getId());
+        assertThat(comments.size()).isLessThanOrEqualTo(3);
+        assertThat(comments)
+                .as("chunk 0 must not have consumed the entire review-wide comment budget -- chunk 1's "
+                        + "genuine finding must still have been published")
+                .anySatisfy(c -> assertThat(c.getFilePath()).isEqualTo("B.java"));
+        assertThat(comments)
+                .anySatisfy(c -> assertThat(c.getFilePath()).isEqualTo("A.java"));
+    }
+
+    @Test
+    void structuredCommentCapNeverAffectsCoverageValidationOnlyRendering() {
+        // F-SRO-04: the fair-share cap must bound RENDERING only -- coverage validation (every expected
+        // file must be present) still runs against the full, uncapped response.
+        GatewayProperties properties = new GatewayProperties();
+        properties.getPublish().setMaxCommentCount(1); // fair-share cap = 1 for this single-chunk review
+        Review review = persistRunningStructuredReview("sha-struct-cap-vs-coverage");
+        persistChunk(review.getId(), SINGLE_FILE_DIFF, List.of("A.java", "B.java"));
+        ReviewJob job = persistStructuredJob(review, 1);
+
+        CommentParser commentParser = new CommentParser(properties, new MetricsCounters());
+        ResultProcessor processor = newResultProcessor(commentParser, properties);
+        // B.java is missing entirely -- must still be reported as COVERAGE_SHORTFALL, cap notwithstanding.
+        String raw = "{\"files\":{\"A.java\":{\"findings\":[],\"summary\":\"s\"}},\"summary\":\"y\"}";
+
+        processor.process(review.getId(), job.getId(), "worker-1", job.getBackendId(),
+                new SubmitResultCommand(raw, 10, 5, 1000L, "model-x", null));
+
+        ReviewJob reloaded = reviewJobRepository.findById(job.getId()).orElseThrow();
+        assertThat(reloaded.getStatus()).isEqualTo(JobStatus.QUEUED);
+        assertThat(reloaded.getLastError()).startsWith("structured-output: COVERAGE_SHORTFALL");
+        assertThat(reloaded.getLastError()).contains("B.java");
+    }
 }

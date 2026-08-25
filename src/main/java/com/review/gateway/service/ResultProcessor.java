@@ -253,8 +253,11 @@ public class ResultProcessor {
 
         StructuredResponseParser.ValidationResult result;
         try {
+            // F-SRO-04: the structured path must apply the same per-chunk fair-share comment cap the
+            // legacy path already applies (processLegacyJobPhase, below) -- previously this call had no
+            // cap at all, letting one chunk's response consume the entire review-wide comment budget.
             result = structuredResponseParser.validate(command.rawResponse(), expectedPaths, capped.truncated(),
-                    command.finishReason(), chunk.getDiff(), options);
+                    command.finishReason(), chunk.getDiff(), options, fairShareCommentCap(reviewId));
         } catch (IllegalStateException invariantViolation) {
             // SRO-67c: an empty expected path set is OUR bug (SRO-67b should already have failed this
             // job closed at claim time) -- never retried, never reported as a validation kind.

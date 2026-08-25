@@ -70,11 +70,26 @@ public class CommentRenderer {
      */
     public String render(String filePath, Integer lineNumber, Severity severity, String rawComment,
                           String rawSuggestion, String chunkDiff) {
+        return renderIndexed(filePath, lineNumber, severity, rawComment, rawSuggestion, prepareChunkDiffIndex(chunkDiff));
+    }
+
+    /**
+     * F-SRO-04 (appsec SAST fix round): takes a pre-built {@link ChunkDiffIndex} instead of the raw
+     * {@code chunkDiff} string, so a caller rendering many findings for the SAME chunk (the
+     * structured-output path, up to 800 findings per result) builds the index exactly once via {@link
+     * #prepareChunkDiffIndex} rather than re-splitting/re-scanning the whole chunk diff inside every
+     * single render call. Behavior is identical to {@link #render(String, Integer, Severity, String,
+     * String, String)} above, which now just delegates here. A distinct method name (rather than an
+     * overload on parameter type) deliberately avoids an ambiguous-overload compile error at any call
+     * site that passes a literal {@code null} for the last argument.
+     */
+    public String renderIndexed(String filePath, Integer lineNumber, Severity severity, String rawComment,
+                                 String rawSuggestion, ChunkDiffIndex diffIndex) {
         String sanitizedPath = safeHeaderPath(commentParser.sanitizeFilePath(filePath));
         String header = renderHeader(severity, sanitizedPath, lineNumber);
         String prose = commentParser.sanitizeProseText(rawComment);
 
-        Optional<String> diffBlock = renderDiffContextBlock(chunkDiff, filePath, lineNumber);
+        Optional<String> diffBlock = renderDiffContextBlock(diffIndex, filePath, lineNumber);
         Optional<String> suggestionBlock = renderSuggestionBlock(rawSuggestion);
 
         int maxLength = Math.max(0, properties.getPublish().getMaxCommentLength());
@@ -147,11 +162,12 @@ public class CommentRenderer {
 
     // ---- diff-context block (SRO-51, SOR-12) ----
 
-    private Optional<String> renderDiffContextBlock(String chunkDiff, String filePath, Integer lineNumber) {
-        if (!properties.getStructured().isIncludeDiffContext() || lineNumber == null || chunkDiff == null) {
+    private Optional<String> renderDiffContextBlock(ChunkDiffIndex diffIndex, String filePath, Integer lineNumber) {
+        if (!properties.getStructured().isIncludeDiffContext() || lineNumber == null
+                || diffIndex == null || !diffIndex.present()) {
             return Optional.empty();
         }
-        Optional<String> raw = extractDiffContext(chunkDiff, filePath, lineNumber, properties.getStructured().getDiffContextLines());
+        Optional<String> raw = extractDiffContext(diffIndex, filePath, lineNumber, properties.getStructured().getDiffContextLines());
         if (raw.isEmpty()) {
             log.debug("Diff-context block omitted: could not locate the finding's line within its own "
                     + "file section of the chunk diff (line={})", lineNumber);
@@ -162,22 +178,72 @@ public class CommentRenderer {
     }
 
     /**
+     * F-SRO-04 (appsec SAST fix round): a pre-split, pre-indexed view of a chunk diff — the line split
+     * and the scan for {@code diff --git} section-header line positions each happen exactly once, in
+     * {@link #prepareChunkDiffIndex}, rather than inside every single {@link #extractDiffContext} call.
+     * Before this existed, rendering N findings for the same chunk (up to 800 per structured-output
+     * result) re-split and re-scanned the <em>entire</em> chunk diff (up to ~150KB+) N times over, inside
+     * a transaction holding a {@code FOR UPDATE} row lock. Carries no state beyond what {@code
+     * extractDiffContext} already derived from {@code chunkDiff} before this class existed.
+     */
+    public static final class ChunkDiffIndex {
+        private static final ChunkDiffIndex ABSENT = new ChunkDiffIndex(false, List.of(), List.of());
+
+        private final boolean present;
+        private final List<String> lines;
+        /** Indices into {@link #lines} of every line starting with {@code "diff --git "}, in order. */
+        private final List<Integer> sectionHeaderLineIndices;
+
+        private ChunkDiffIndex(boolean present, List<String> lines, List<Integer> sectionHeaderLineIndices) {
+            this.present = present;
+            this.lines = lines;
+            this.sectionHeaderLineIndices = sectionHeaderLineIndices;
+        }
+
+        private boolean present() {
+            return present;
+        }
+    }
+
+    /**
+     * Builds a {@link ChunkDiffIndex} for {@code chunkDiff} — call this ONCE per chunk (e.g. once per
+     * {@code POST /jobs/{id}/result} submission), then reuse the returned index across every {@link
+     * #render(String, Integer, Severity, String, String, ChunkDiffIndex)} call for that same chunk. A
+     * {@code null} {@code chunkDiff} produces an index whose diff-context lookups always miss, exactly
+     * like the pre-F-SRO-04 {@code chunkDiff == null} short-circuit.
+     */
+    public ChunkDiffIndex prepareChunkDiffIndex(String chunkDiff) {
+        if (chunkDiff == null) {
+            return ChunkDiffIndex.ABSENT;
+        }
+        List<String> lines = splitLines(chunkDiff);
+        List<Integer> sectionHeaderLineIndices = new ArrayList<>();
+        for (int i = 0; i < lines.size(); i++) {
+            if (lines.get(i).startsWith("diff --git ")) {
+                sectionHeaderLineIndices.add(i);
+            }
+        }
+        return new ChunkDiffIndex(true, lines, sectionHeaderLineIndices);
+    }
+
+    /**
      * SOR-12 (CRITICAL): locates the file's {@code diff --git} section for the exact validated key,
      * walks only <em>that</em> section's {@code @@} hunks tracking new-file line numbers, and stops at
-     * the next section header — never a positional guess over the whole chunk text. {@code chunkDiff} is
-     * the caller's {@code review_chunks.diff} for the locked job row's own {@code (reviewId,
-     * chunkIndex)}; this method never receives or infers anything from the model's response.
+     * the next section header — never a positional guess over the whole chunk text. {@code diffIndex} is
+     * built once (per {@link #prepareChunkDiffIndex}) from the caller's {@code review_chunks.diff} for
+     * the locked job row's own {@code (reviewId, chunkIndex)}; this method never receives or infers
+     * anything from the model's response.
      *
      * @return the context window (±{@code contextLines}), original {@code +}/{@code -}/space prefixes
      *         intact, or empty if the file section or the exact line could not be located
      */
-    private Optional<String> extractDiffContext(String chunkDiff, String filePath, int lineNumber, int contextLines) {
-        List<String> lines = splitLines(chunkDiff);
-        int sectionStart = locateSectionStart(lines, filePath);
+    private Optional<String> extractDiffContext(ChunkDiffIndex diffIndex, String filePath, int lineNumber, int contextLines) {
+        List<String> lines = diffIndex.lines;
+        int sectionStart = locateSectionStart(diffIndex, filePath);
         if (sectionStart < 0) {
             return Optional.empty();
         }
-        int sectionEnd = locateNextSectionStart(lines, sectionStart + 1);
+        int sectionEnd = locateNextSectionStart(diffIndex, sectionStart);
 
         int i = sectionStart;
         while (i < sectionEnd) {
@@ -222,24 +288,28 @@ public class CommentRenderer {
         return List.of(text.split("\n", -1));
     }
 
-    private int locateSectionStart(List<String> lines, String filePath) {
+    /**
+     * F-SRO-04: scans only the pre-collected {@link ChunkDiffIndex#sectionHeaderLineIndices} — a list
+     * bounded by the chunk's file count (typically dozens) — rather than every line of the chunk diff
+     * (up to ~150KB+).
+     */
+    private int locateSectionStart(ChunkDiffIndex diffIndex, String filePath) {
         String suffix = " b/" + filePath;
-        for (int i = 0; i < lines.size(); i++) {
-            String line = lines.get(i);
-            if (line.startsWith("diff --git ") && line.endsWith(suffix)) {
-                return i;
+        for (int headerIndex : diffIndex.sectionHeaderLineIndices) {
+            if (diffIndex.lines.get(headerIndex).endsWith(suffix)) {
+                return headerIndex;
             }
         }
         return -1;
     }
 
-    private int locateNextSectionStart(List<String> lines, int from) {
-        for (int i = from; i < lines.size(); i++) {
-            if (lines.get(i).startsWith("diff --git ")) {
-                return i;
+    private int locateNextSectionStart(ChunkDiffIndex diffIndex, int sectionStart) {
+        for (int headerIndex : diffIndex.sectionHeaderLineIndices) {
+            if (headerIndex > sectionStart) {
+                return headerIndex;
             }
         }
-        return lines.size();
+        return diffIndex.lines.size();
     }
 
     // ---- code sanitization (SRO-55/56/57) ----
