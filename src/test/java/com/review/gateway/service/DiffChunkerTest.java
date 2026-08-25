@@ -68,6 +68,28 @@ class DiffChunkerTest {
     }
 
     @Test
+    void diffGitHeaderPathIsTrimmedForParityWithTheOtherHeaderBranches() {
+        // F-SRO-02: the "diff --git " branch of extractPathFromHeaderLine did not trim(), unlike the
+        // "+++ "/"--- " branches, so it could diverge from them on a header carrying an incidental
+        // leading space right after " b/" (e.g. "diff --git a/A.java b/ A.java"). Pre-fix, the diff --git
+        // branch contributed the untrimmed " A.java" while the "+++ b/A.java" line (canonical, no space)
+        // contributed "A.java" -- two DIFFERENT strings for what a caller would read as the same file, so
+        // Section.addPath's dedup-by-equality never collapsed them and both ended up in filePaths. Post-fix
+        // both branches agree on the trimmed "A.java" and dedupe to a single entry.
+        GatewayProperties properties = propertiesWithBudget(10_000, 256, 5);
+        DiffChunker chunker = newChunker(properties);
+        String diff = "diff --git a/A.java b/ A.java\n"
+                + "index 1111111..2222222 100644\n"
+                + "--- a/A.java\n"
+                + "+++ b/A.java\n"
+                + "@@ -1,1 +1,1 @@\n+x\n";
+
+        DiffChunker.ChunkPlan plan = chunker.split(diff);
+
+        assertThat(plan.chunks().get(0).filePaths()).containsExactly("A.java");
+    }
+
+    @Test
     void nullDiffIsTreatedAsASingleEmptyChunk() {
         DiffChunker chunker = newChunker(propertiesWithBudget(10_000, 256, 5));
 

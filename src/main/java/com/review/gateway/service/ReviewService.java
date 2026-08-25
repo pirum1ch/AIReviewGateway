@@ -34,6 +34,7 @@ import org.springframework.transaction.support.TransactionTemplate;
 
 import java.util.ArrayList;
 import java.util.EnumSet;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Objects;
 import java.util.Set;
@@ -233,13 +234,22 @@ public class ReviewService {
                     .map(chunkContextRenderer::sanitizePath)
                     .filter(Objects::nonNull)
                     .collect(Collectors.toList());
-            if (sanitizedPaths.size() != chunk.filePaths().size()) {
-                // SRO-17: sanitization dropped a path (control/format characters only) -- a dropped path
-                // is an uncovered file. Never echo the raw or sanitized path back to the caller.
+            // F-SRO-02: compare DISTINCT sanitized values against the raw count, not just the size.
+            // sanitizePath is not injective (it strips control/format chars and '<'/'>' and trim()s), so
+            // two different raw paths can sanitize to the same string while both remain non-null -- a
+            // plain size comparison misses that collision entirely. A collision must trip the same
+            // fail-closed path as a dropped path: either way, one file silently loses its coverage
+            // guarantee.
+            if (sanitizedPaths.size() != chunk.filePaths().size()
+                    || new LinkedHashSet<>(sanitizedPaths).size() != sanitizedPaths.size()) {
+                // SRO-17: sanitization dropped a path (control/format characters only), or two distinct
+                // paths collided onto the same sanitized value -- either way a file is left uncovered.
+                // Never echo the raw or sanitized path back to the caller.
                 throw new StructuredOutputUnsupportedException(
                         "promptVersion '" + promptVersion + "' requires every changed file path to survive "
-                                + "sanitization; this diff contains at least one path that does not — use "
-                                + "promptVersion 'v2' or rename the affected file(s).");
+                                + "sanitization and remain distinct from every other path; this diff contains "
+                                + "at least one path that does not — use promptVersion 'v2' or rename the "
+                                + "affected file(s).");
             }
             for (String path : sanitizedPaths) {
                 if (!structuredPathValidator.isEligible(path, maxPathChars)) {

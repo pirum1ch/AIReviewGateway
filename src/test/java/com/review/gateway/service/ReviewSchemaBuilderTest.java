@@ -33,6 +33,14 @@ class ReviewSchemaBuilderTest {
     }
 
     @Test
+    void throwsOnADuplicatePathEntry() {
+        // F-SRO-02: an unconditional builder invariant -- a duplicate would otherwise emit a schema whose
+        // "required" array names the same key twice against a single "properties" entry.
+        assertThatThrownBy(() -> builder.build(List.of("src/A.java", "src/A.java"), defaultOptions()))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
     void filesKeySetIsExactlyTheGivenPathsAllRequiredNoAdditional() throws Exception {
         String schema = builder.build(List.of("src/A.java", "src/B.java"), defaultOptions());
         JsonNode root = mapper.readTree(schema);

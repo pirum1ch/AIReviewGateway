@@ -5,8 +5,10 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.springframework.stereotype.Service;
 
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Set;
 
 /**
  * Structured Review Output (architecture §4.1/§4.2, SRO-18/20-28): renders the per-chunk JSON Schema
@@ -61,13 +63,24 @@ public class ReviewSchemaBuilder {
      * @param filePaths the chunk's exact, already-sanitized, already-alphabet-checked (SRO-65) file
      *                   paths — becomes the {@code files} object's key set, verbatim and in order
      * @return the fully-inlined JSON Schema document (SRO-02), never {@code null}/blank
-     * @throws IllegalArgumentException if {@code filePaths} is {@code null} or empty (SRO-67a)
+     * @throws IllegalArgumentException if {@code filePaths} is {@code null} or empty (SRO-67a), or
+     *                                    contains a duplicate entry (F-SRO-02: an unconditional invariant
+     *                                    of the builder itself, never a caller obligation — a duplicate
+     *                                    would otherwise produce a schema whose {@code required} array
+     *                                    names the same key twice against a single {@code properties}
+     *                                    entry, handed verbatim to the decoder-constraint compiler)
      */
     public String build(List<String> filePaths, SchemaOptions options) {
         if (filePaths == null || filePaths.isEmpty()) {
             throw new IllegalArgumentException(
                     "ReviewSchemaBuilder.build requires a non-empty file path list (SRO-67a: an empty "
                             + "coverage set must be impossible to build)");
+        }
+        Set<String> distinct = new LinkedHashSet<>(filePaths);
+        if (distinct.size() != filePaths.size()) {
+            throw new IllegalArgumentException(
+                    "ReviewSchemaBuilder.build requires distinct file paths (F-SRO-02: a duplicate would "
+                            + "produce a schema with a duplicated 'required' entry)");
         }
 
         ObjectNode root = objectMapper.createObjectNode();

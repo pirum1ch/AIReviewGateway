@@ -536,7 +536,11 @@ public class DiffChunker {
                 String rest = line.substring("diff --git ".length());
                 int bIdx = rest.lastIndexOf(" b/");
                 if (bIdx >= 0) {
-                    addPath(rest.substring(bIdx + 3));
+                    // F-SRO-02: trim() for parity with the "+++ "/"--- " branches below -- without it, a
+                    // path with incidental leading/trailing whitespace survives into filePaths as a
+                    // distinct raw entry, and TextSanitizer.sanitizePath's own trim() then collapses it
+                    // with the untrimmed sibling, producing a post-sanitization duplicate.
+                    addPath(rest.substring(bIdx + 3).trim());
                     return;
                 }
             }

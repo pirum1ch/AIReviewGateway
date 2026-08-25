@@ -353,6 +353,26 @@ class ReviewServiceTest {
     }
 
     @Test
+    void structuredVersionWithTwoPathsThatCollideAfterSanitizationIsRejected() {
+        // F-SRO-02: "src/A.java" and "src/A<>.java" are two distinct raw paths, but sanitizePath strips
+        // '<'/'>' so both map to "src/A.java". The pre-fix check only compared list SIZES (2 raw -> 2
+        // sanitized), which is unchanged here and would have let this slip through as a silent duplicate
+        // key in review_chunks.file_paths.
+        properties.getReview().getAllowedPromptVersions().add("v3");
+        when(diffChunker.split(anyString(), anyInt(), anyInt())).thenAnswer(inv -> new DiffChunker.ChunkPlan(
+                List.of(new DiffChunker.DiffChunk(0, inv.getArgument(0), 10, List.of("src/A.java", "src/A<>.java"))),
+                10, true));
+        when(chunkContextRenderer.sanitizePath("src/A.java")).thenReturn("src/A.java");
+        when(chunkContextRenderer.sanitizePath("src/A<>.java")).thenReturn("src/A.java");
+        CreateReviewCommand command = new CreateReviewCommand(1L, 2L, "sha-collision", "base-sha", "diff content", "v3", 10);
+
+        assertThatThrownBy(() -> reviewService.createReview(command))
+                .isInstanceOf(com.review.gateway.exception.StructuredOutputUnsupportedException.class);
+
+        verify(reviewRepository, never()).saveAndFlush(any());
+    }
+
+    @Test
     void structuredVersionWithEligibleTrustedPathsPassesEdgeValidation() {
         properties.getReview().getAllowedPromptVersions().add("v3");
         when(diffChunker.split(anyString(), anyInt(), anyInt())).thenAnswer(inv -> new DiffChunker.ChunkPlan(
