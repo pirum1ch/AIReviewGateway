@@ -20,7 +20,7 @@ class StructuredResponseParserTest {
     private final GatewayProperties properties = new GatewayProperties();
 
     private StructuredResponseParser newParser() {
-        CommentParser commentParser = new CommentParser(properties);
+        CommentParser commentParser = new CommentParser(properties, new MetricsCounters());
         CommentRenderer commentRenderer = new CommentRenderer(commentParser, new TextSanitizer(), properties);
         return new StructuredResponseParser(commentParser, commentRenderer, new TextSanitizer(), properties);
     }

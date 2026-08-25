@@ -34,7 +34,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 class CommentParserSanitationGapsTest {
 
     private CommentParser parser() {
-        return new CommentParser(new GatewayProperties());
+        return new CommentParser(new GatewayProperties(), new MetricsCounters());
     }
 
     @Test

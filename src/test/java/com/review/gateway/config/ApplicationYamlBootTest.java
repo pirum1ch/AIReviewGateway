@@ -63,7 +63,17 @@ class ApplicationYamlBootTest {
         runner.withPropertyValues(
                         "PROMPT_MANAGER_ENABLED=true",
                         "GITLAB_PROMPT_TOKEN=glpat-yyyyyyyyyyyyyyyyyyyy",
-                        "PROMPT_CORPORATE_PROJECT=group/ai-review-prompts")
+                        "PROMPT_CORPORATE_PROJECT=group/ai-review-prompts",
+                        // Structured Review Output (threat model SOR-13): the shipped
+                        // gateway.structured.answer-reserve (8000) does not fit alongside the shipped
+                        // gateway.prompt.limits.max-system-prompt-tokens (6000) at the shipped
+                        // context-window -- that is the intended SOR-13 startup-refusal scenario (see
+                        // GatewayPropertiesStructuredValidationTest). This test boots Prompt Manager
+                        // specifically, so it pins structured.answer-reserve at its minimum legal value
+                        // (equal to diff.answer-reserve) to stay budget-consistent without that being the
+                        // thing under test here -- exactly the same fix applied to
+                        // GatewayPropertiesPromptValidationTest's shared fixture.
+                        "gateway.structured.answer-reserve=4000")
                 .run(context -> {
                     assertThat(context).hasNotFailed();
                     GatewayProperties properties = context.getBean(GatewayProperties.class);

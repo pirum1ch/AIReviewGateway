@@ -50,9 +50,11 @@ public class CommentParser {
 
     private final ObjectMapper objectMapper = new ObjectMapper();
     private final GatewayProperties properties;
+    private final MetricsCounters metricsCounters;
 
-    public CommentParser(GatewayProperties properties) {
+    public CommentParser(GatewayProperties properties, MetricsCounters metricsCounters) {
         this.properties = properties;
+        this.metricsCounters = metricsCounters;
     }
 
     public List<ParsedComment> parse(String rawResponse) {
@@ -72,9 +74,15 @@ public class CommentParser {
         }
 
         List<RawComment> jsonComments = tryParseJsonArray(rawResponse);
-        List<RawComment> candidates = (jsonComments != null && !jsonComments.isEmpty())
-                ? jsonComments
-                : List.of(new RawComment(null, null, Severity.INFO, rawResponse));
+        boolean fellBackToWholeResponse = jsonComments == null || jsonComments.isEmpty();
+        if (fellBackToWholeResponse) {
+            // SRO-45: the single cheapest instrument for symptom 2 -- measures today's v1/v2 traffic too,
+            // giving a genuine "before" baseline that costs nothing (architecture §11 stage 0).
+            metricsCounters.incrementLegacyParseFallback();
+        }
+        List<RawComment> candidates = fellBackToWholeResponse
+                ? List.of(new RawComment(null, null, Severity.INFO, rawResponse))
+                : jsonComments;
 
         int maxCount = Math.max(0, maxCountOverride);
         List<ParsedComment> sanitized = new ArrayList<>();
@@ -95,6 +103,48 @@ public class CommentParser {
         }
         if (sanitized.isEmpty()) {
             sanitized.add(new ParsedComment(null, null, Severity.INFO, "(model response contained no publishable content)"));
+        }
+        return sanitized;
+    }
+
+    /**
+     * Structured Review Output (SRO-68, threat model SOR-05, BLOCKING-derived): the {@code
+     * RETRY_THEN_FALLBACK} escape hatch's <b>only</b> permitted parse path for a structured (v3)
+     * response — the genuine JSON-array branch only. Deliberately never falls through to the
+     * whole-response-as-one-{@code INFO}-comment branch {@link #parse} uses (which, on a v3-shaped
+     * response, would publish the model's raw transcript essentially always) — an explicit, separate
+     * entry point rather than a flag on {@link #parse}, so every existing v1/v2 call site is untouched
+     * (SRO-30: "{@code CommentParser} is not modified").
+     *
+     * @return the parsed, sanitized comments, or an <b>empty list</b> (never the raw-transcript
+     *         placeholder) if the genuine JSON-array branch did not yield anything — the caller
+     *         (ResultProcessor) treats an empty return as "the fallback itself failed too", proceeding
+     *         exactly as {@code RETRY_THEN_FAIL}
+     */
+    public List<ParsedComment> parseStructuredFallback(String rawResponse, int maxCountOverride) {
+        if (rawResponse == null || rawResponse.isBlank()) {
+            return List.of();
+        }
+        List<RawComment> jsonComments = tryParseJsonArray(rawResponse);
+        if (jsonComments == null || jsonComments.isEmpty()) {
+            return List.of();
+        }
+        int maxCount = Math.max(0, maxCountOverride);
+        List<ParsedComment> sanitized = new ArrayList<>();
+        int dropped = 0;
+        for (RawComment candidate : jsonComments) {
+            ParsedComment comment = sanitize(candidate);
+            if (comment == null) {
+                continue;
+            }
+            if (sanitized.size() >= maxCount) {
+                dropped++;
+                continue;
+            }
+            sanitized.add(comment);
+        }
+        if (dropped > 0) {
+            log.warn("Dropped {} parsed comment(s) beyond the configured cap of {} (structured fallback)", dropped, maxCount);
         }
         return sanitized;
     }

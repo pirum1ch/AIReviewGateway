@@ -22,5 +22,9 @@ public record MetricsSnapshot(
         long promptDisabledCount,
         long promptSectionMissingCount,
         Map<String, Long> ownershipMismatches,
-        long workerFailureReportsIgnored) {
+        long workerFailureReportsIgnored,
+        long legacyParseFallback,
+        Map<String, Long> structuredValidationFailures,
+        Map<String, Long> structuredConstraintSent,
+        long structuredFallbackUsed) {
 }

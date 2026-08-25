@@ -303,9 +303,15 @@ public class QueueManager {
         // this block's mode gate only decides whether a decoder-level CONSTRAINT is additionally built.
         String responseFormat = null;
         String jsonSchema = null;
+        if (structuredVersion && !properties.getStructured().isEnabled()) {
+            // SRO-45: keeps the kill-switch-off population visible in the same metric, distinguishing
+            // "the model is good" from "we never turned it on" at a glance.
+            metricsCounters.incrementStructuredConstraintSent("KILL_SWITCH_OFF");
+        }
         if (structuredVersion && properties.getStructured().isEnabled()) {
             StructuredOutputMode mode = decoderConstraintRenderer.resolveMode(
                     backend.getStructuredOutputMode(), properties.getStructured().getDefaultMode());
+            metricsCounters.incrementStructuredConstraintSent(mode.name());
             if (mode != StructuredOutputMode.OFF) {
                 String schema = reviewSchemaBuilder.build(thisChunkPaths, structuredSchemaOptions());
                 int schemaBytes = schema.getBytes(StandardCharsets.UTF_8).length;

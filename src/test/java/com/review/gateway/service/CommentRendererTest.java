@@ -14,7 +14,7 @@ class CommentRendererTest {
 
     private CommentRenderer newRenderer() {
         GatewayProperties properties = new GatewayProperties();
-        return new CommentRenderer(new CommentParser(properties), new TextSanitizer(), properties);
+        return new CommentRenderer(new CommentParser(properties, new MetricsCounters()), new TextSanitizer(), properties);
     }
 
     private String gitSection(String path, String... hunkAndBody) {
@@ -183,7 +183,7 @@ class CommentRendererTest {
     void includeDiffContextFalseDisablesTheBlockEntirely() {
         GatewayProperties properties = new GatewayProperties();
         properties.getStructured().setIncludeDiffContext(false);
-        CommentRenderer renderer = new CommentRenderer(new CommentParser(properties), new TextSanitizer(), properties);
+        CommentRenderer renderer = new CommentRenderer(new CommentParser(properties, new MetricsCounters()), new TextSanitizer(), properties);
         String diff = gitSection("A.java", "@@ -1,1 +1,1 @@", "+onlyLine");
 
         String rendered = renderer.render("A.java", 1, Severity.MAJOR, "issue", "", diff);
@@ -222,7 +222,7 @@ class CommentRendererTest {
     void oversizedBodyDropsDiffContextBeforeSuggestionBeforeTruncatingProse() {
         GatewayProperties properties = new GatewayProperties();
         properties.getPublish().setMaxCommentLength(200);
-        CommentRenderer renderer = new CommentRenderer(new CommentParser(properties), new TextSanitizer(), properties);
+        CommentRenderer renderer = new CommentRenderer(new CommentParser(properties, new MetricsCounters()), new TextSanitizer(), properties);
         String diff = gitSection("A.java", "@@ -1,1 +1,1 @@", "+" + "x".repeat(50));
         String longProse = "y".repeat(500);
         String suggestion = "z".repeat(100);

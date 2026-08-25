@@ -83,12 +83,18 @@ class ResultProcessorConcurrentSubmitTest extends AbstractPostgresIntegrationTes
         EventService eventService = new EventService(reviewEventRepository, new TextSanitizer());
         StateMachine stateMachine = new StateMachine(eventService);
         JobStateMachine jobStateMachine = new JobStateMachine(eventService);
-        CommentParser commentParser = new CommentParser(new GatewayProperties());
+        CommentParser commentParser = new CommentParser(new GatewayProperties(), new MetricsCounters());
         GatewayProperties properties = new GatewayProperties();
         ChunkCoordinator chunkCoordinator = new ChunkCoordinator(reviewRepository, reviewJobRepository,
                 reviewChunkRepository, reviewCommentRepository, stateMachine, jobStateMachine, properties, entityManager, transactionManager);
-        return new ResultProcessor(reviewRepository, reviewJobRepository, reviewResultRepository,
-                commentParser, jobStateMachine, chunkCoordinator, properties, entityManager, transactionManager);
+        RetryManager retryManager = new RetryManager(reviewJobRepository, jobStateMachine, chunkCoordinator,
+                properties, new TextSanitizer(), entityManager, transactionManager);
+        CommentRenderer commentRenderer = new CommentRenderer(commentParser, new TextSanitizer(), properties);
+        StructuredResponseParser structuredResponseParser = new StructuredResponseParser(
+                commentParser, commentRenderer, new TextSanitizer(), properties);
+        return new ResultProcessor(reviewRepository, reviewJobRepository, reviewChunkRepository, reviewResultRepository,
+                commentParser, structuredResponseParser, jobStateMachine, chunkCoordinator, retryManager,
+                new MetricsCounters(), properties, entityManager, transactionManager);
     }
 
     @Test

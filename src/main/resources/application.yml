@@ -51,6 +51,11 @@ gateway:
     # обновляйте это значение (и MAX_REQUEST_BODY_BYTES, если он задан), если изменятся
     # max-chunks/max-diff-tokens/chars-per-token.
     max-request-body-bytes: ${MAX_REQUEST_BODY_BYTES:320000}  # SR-11/CSR-02 edge cap for POST /reviews — максимальный размер тела запроса POST /reviews в байтах; должен быть согласован с формулой CSR-02 выше
+    # Structured Review Output (SRO-66a, threat model SOT-03/SOR-03): безусловная (для всех версий
+    # промпта) граница числа путей, извлекаемых DiffChunker.Section из ОДНОЙ секции diff -- защита от
+    # памяти-амплификации на уровне F-DC-01; никогда не срабатывает на настоящем выводе `git diff`
+    # (одна секция = один файл).
+    max-paths-per-section: 64   # максимальное число путей файлов, извлекаемых из одной секции diff (memory-safety bound, SRO-66a)
   heartbeat:
     interval: 60s                   # expected worker ping cadence — ожидаемый интервал между heartbeat-пингами воркера
     timeout: 180s                   # stuck if now - heartbeat_at exceeds this — если с момента последнего heartbeat прошло больше этого времени, джоба считается "зависшей" и возвращается в очередь
@@ -123,6 +128,29 @@ gateway:
     connect-timeout: 3s          # таймаут установления соединения при чтении промпт-файлов из GitLab
     read-timeout: 8s             # таймаут чтения ответа при получении одного промпт-файла из GitLab
     total-timeout: 20s           # суммарный таймаут на получение всех промпт-секций для одного Review
+  # Structured Review Output (threat model SOR-08, CRITICAL): allowlist прикладного значения
+  # promptVersion, проверяемый на самом краю POST /reviews. "v3" НАМЕРЕННО отсутствует в значении по
+  # умолчанию -- оператор добавляет его вручную только после того, как весь парк Worker'ов уже несёт
+  # v3.yml (порядок разворачивания: сначала Worker'ы, потом Gateway, §11).
+  review:
+    allowed-prompt-versions: ${ALLOWED_PROMPT_VERSIONS:v1,v2}   # allowlist значений promptVersion, принимаемых POST /reviews; "v3" добавляется явно оператором после разворачивания Worker'ов с v3.yml
+  # Structured Review Output (docs/structured-review-output-architecture.md): decoder-constrained,
+  # coverage-enforced ответы модели для promptVersion "v3". Полностью аддитивно -- ничего здесь не
+  # меняет поведение v1/v2.
+  structured:
+    enabled: ${STRUCTURED_OUTPUT_ENABLED:true}   # SRO-39 kill-switch: false -- ни один constraint не отправляется, v3 парсится тем же CommentParser, что и v1/v2; список покрытия (coverage list) в промпте всё равно рендерится
+    default-mode: ${STRUCTURED_OUTPUT_DEFAULT_MODE:OFF}   # SRO-07: используется, когда backends.structured_output_mode IS NULL -- OFF означает "ничего не меняется в байтах запроса к llama-server" пока оператор не включит конкретный backend
+    max-files-per-chunk: 40      # SRO-14/66: верхняя граница числа файлов в одном структурированном чанке (влияет на размер схемы/coverage-блока/ответа)
+    max-path-chars: 256          # SRO-65: максимальная длина пути, допустимого в качестве ключа схемы (после sanitizePath); длиннее -- 422 STRUCTURED_OUTPUT_UNSUPPORTED
+    max-schema-bytes: 65536      # SRO-15: backstop -- при исправных SRO-65/66 не должен срабатывать никогда
+    max-findings-per-file: 20    # SRO-27 -> maxItems массива findings
+    max-comment-chars: 1200      # SRO-27 -> maxLength поля comment одного finding
+    max-suggestion-chars: 2000   # SRO-27 -> maxLength поля suggestion одного finding
+    per-file-summary: true       # SRO-25: включает обязательное поле summary на уровне файла (anti-skip device); false экономит токены ценой более слабой защиты от пропуска файла
+    on-invalid-response: RETRY_THEN_FAIL   # SRO-38/68: RETRY_THEN_FAIL (по умолчанию) | RETRY_THEN_FALLBACK (emergency escape hatch, публикует только генуинный JSON-массив с меткой "UNVALIDATED")
+    include-diff-context: true   # SRO-51: включает извлечение и рендер блока ```diff с контекстом вокруг строки finding
+    diff-context-lines: 3        # SRO-51: число строк контекста с каждой стороны от строки finding
+    answer-reserve: 8000         # §10: заменяет gateway.diff.answer-reserve при расчёте бюджета ТОЛЬКО для структурированных версий промпта (гарантированная форма ответа многословнее обычного JSON-массива)
 
 # ПРИМЕЧАНИЕ: gateway.security.*/gateway.gitlab.token ОБЯЗАНЫ быть длиной >=32 символов (SR-01), а
 # gateway.gitlab.base-url ОБЯЗАН начинаться с https:// (SR-15) -- иначе GatewayProperties прерывает

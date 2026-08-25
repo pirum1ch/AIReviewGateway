@@ -100,7 +100,9 @@ public class StatisticsService {
 
         return new MetricsSnapshot(total, byStatus, avgQueueMs, avgRunMs, totalComments, retries,
                 promptDisabledCount, promptSectionMissingCount,
-                metricsCounters.ownershipMismatchSnapshot(), metricsCounters.workerFailureReportsIgnoredCount());
+                metricsCounters.ownershipMismatchSnapshot(), metricsCounters.workerFailureReportsIgnoredCount(),
+                metricsCounters.legacyParseFallbackCount(), metricsCounters.structuredValidationFailuresSnapshot(),
+                metricsCounters.structuredConstraintSentSnapshot(), metricsCounters.structuredFallbackUsedCount());
     }
 
     private double nullToZero(Double value) {

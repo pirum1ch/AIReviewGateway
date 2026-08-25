@@ -195,6 +195,15 @@ public class GatewayProperties {
                             + "max-paths-per-section=" + diff.getMaxPathsPerSection() + ", max-files-per-chunk="
                             + structured.getMaxFilesPerChunk());
         }
+        // SRO-38: fail fast on a typo'd on-invalid-response value rather than degrading it silently at
+        // claim/result time -- ResultProcessor itself still defends via OnInvalidResponse.fromNullable
+        // (never Enum.valueOf), but a bad *configured* value should never reach production unnoticed.
+        if (com.review.gateway.model.enums.OnInvalidResponse.fromNullable(structured.getOnInvalidResponse()).isEmpty()) {
+            throw new IllegalStateException(
+                    "gateway.structured.on-invalid-response must be RETRY_THEN_FAIL or RETRY_THEN_FALLBACK; got: "
+                            + structured.getOnInvalidResponse());
+        }
+
         // Point 3: a smaller structured reserve than the v1/v2 reserve is always a misconfiguration --
         // the guaranteed-shape structured response is strictly more verbose than a bare JSON array.
         if (structured.getAnswerReserve() < diff.getAnswerReserve()) {

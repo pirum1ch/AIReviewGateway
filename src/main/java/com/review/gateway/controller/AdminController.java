@@ -42,7 +42,9 @@ public class AdminController {
         return new MetricsResponse(snapshot.total(), byStatus, snapshot.avgQueueMs(),
                 snapshot.avgRunMs(), snapshot.totalComments(), snapshot.retries(),
                 properties.getPrompt().isEnabled(), snapshot.promptDisabledCount(), snapshot.promptSectionMissingCount(),
-                snapshot.ownershipMismatches(), snapshot.workerFailureReportsIgnored());
+                snapshot.ownershipMismatches(), snapshot.workerFailureReportsIgnored(),
+                snapshot.legacyParseFallback(), snapshot.structuredValidationFailures(),
+                snapshot.structuredConstraintSent(), snapshot.structuredFallbackUsed());
     }
 
     private BackendView toView(BackendSnapshot snapshot) {

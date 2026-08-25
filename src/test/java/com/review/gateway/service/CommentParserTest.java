@@ -16,7 +16,7 @@ class CommentParserTest {
     }
 
     private CommentParser parser() {
-        return new CommentParser(properties());
+        return new CommentParser(properties(), new MetricsCounters());
     }
 
     @Test
@@ -135,7 +135,7 @@ class CommentParserTest {
     void commentCountIsCapped() {
         GatewayProperties properties = properties();
         properties.getPublish().setMaxCommentCount(2);
-        CommentParser parser = new CommentParser(properties);
+        CommentParser parser = new CommentParser(properties, new MetricsCounters());
 
         StringBuilder raw = new StringBuilder("[");
         for (int i = 0; i < 5; i++) {
@@ -155,7 +155,7 @@ class CommentParserTest {
     void commentLengthIsCappedWithTruncationMarker() {
         GatewayProperties properties = properties();
         properties.getPublish().setMaxCommentLength(50);
-        CommentParser parser = new CommentParser(properties);
+        CommentParser parser = new CommentParser(properties, new MetricsCounters());
 
         String raw = "x".repeat(500);
 
@@ -342,7 +342,7 @@ class CommentParserTest {
     void commentTextCapAppliesToTheEscapedValueNotThePreEscapeValue() {
         GatewayProperties properties = properties();
         properties.getPublish().setMaxCommentLength(50);
-        CommentParser parser = new CommentParser(properties);
+        CommentParser parser = new CommentParser(properties, new MetricsCounters());
 
         // 100 literal '"' characters pre-escape (already over the 50-char cap on its own), but the
         // defect being guarded against is specifically that escaping inflates a string that was
