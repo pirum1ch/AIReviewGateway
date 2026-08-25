@@ -471,3 +471,325 @@ turned on safely was written (F-SRO-05).
 Send it back for one more `backend-developer` pass on F-SRO-01 … F-SRO-05 (with F-SRO-06 … F-SRO-10
 riding along in the same files), then a short appsec re-verification round focused on those five and on
 the new tests. Nothing else in this branch needs to be revisited.
+
+---
+---
+
+# Verification round (appsec, after the fix pass) — `a874d8d..1a8d5bf`
+
+Scope: the 10 fix commits `ed88587`…`1a8d5bf` — 24 files, **+1631/−172** (9 production sources,
+10 test classes, 4 documentation files). Working tree **clean** at `1a8d5bf` (the uncommitted README
+block flagged under F-SRO-05 in round 1 was committed and corrected as part of `7fd398e`, not
+reverted). Method: re-derived each finding's security property from the shipped code at HEAD, not from
+the commit messages or the developer's summary; two of the five must-fixes additionally proven
+load-bearing by a temporary revert experiment (below).
+
+**Suites (run by me, this session, `mvn clean test` from a clean state, both modules):** Gateway →
+exit 0, `Tests=813, Failures=0, Errors=0, Skipped=0` (80 surefire report files). Worker →
+exit 0, `Tests=156, Failures=0, Errors=0, Skipped=0`. Delta accounted for exactly: Gateway 776 → 813 =
+**+37**, which is the 39 new `void` test methods in the fix diff minus the 2 QA fixtures that were
+*inverted in place* (`duplicateTopLevelFilesKey…`, `duplicateNestedFileKey…`) rather than added.
+Worker is unchanged at 156 because the fix round touched no Worker source at all (`worker/README.md`
+only) — consistent with `git diff --stat`. No `/tmp/epg*` accumulation and no disk pressure (48% used);
+no `@SpringBootTest` flakiness in either run, including the two tests QA had flagged.
+
+**Scanners (run by me, the repo's own gate config from `.github/workflows/security-gate.yml`):**
+`semgrep --config p/java --config p/sql-injection --config p/secrets` over `src/main/java` +
+`worker/src/main/java` → **0 findings**, 167 files, 96 rules, ~100% parse rate.
+`gitleaks git --no-banner --redact -c .gitleaks.toml` over the full history (133 commits, 3.40 MB) →
+**no leaks found**. SCA: `pom.xml` and `worker/pom.xml` still have a **zero-byte diff** vs. the merge
+base `1957f2b` — no dependency delta, so the `osv-scanner`/SBOM jobs have nothing new to evaluate;
+`.github/workflows/security-gate.yml` is likewise untouched, so the SR-23 gate covers this branch
+unchanged. No new SQL, no migration change, no `SecurityConfig`/role-matrix change, no new endpoint.
+
+## Verdict summary
+
+| # | Round-1 severity | Verification verdict |
+|---|---|---|
+| **F-SRO-01** | Medium (blocking) | ✅ **CLOSED** — and proven load-bearing by a revert experiment |
+| **F-SRO-02** | Medium (blocking) | ✅ **CLOSED** — all four sub-fixes landed; proven load-bearing by a revert experiment |
+| **F-SRO-03** | Medium (blocking) | ✅ **CLOSED** — v1/v2 arithmetic re-derived line by line and is provably identical |
+| **F-SRO-04** | Medium (blocking) | ✅ **CLOSED** — cap applied strictly *before* the diff-context work, not merely applied |
+| **F-SRO-05** | Low (blocking by repo rule) | ✅ **CLOSED** — §14 worked through item by item; substantive, not a stub |
+| **F-SRO-06 … F-SRO-10** | Low (should-fix) | ✅ **CLOSED** — none skipped; one cosmetic half of F-SRO-08's remediation not taken, harmless (see below) |
+| F-SRO-11 … F-SRO-18 | Info | Open, unchanged, non-blocking by round-1 ruling — except **F-SRO-12**, effectively closed by `DEPLOYMENT.md` §8c |
+| `SOR-INH-1/2/3` | Accepted residuals | Still hold as stated; F-SRO-01/02/03 having closed, two of them are now *narrower* than accepted, not wider |
+| **F-SRO-19** (new) | Info | `docker-compose.yml` does not forward the three new V5 env vars |
+| **F-SRO-20** (new) | Info | The `TRUNCATED` detail string still embeds the raw `finishReason` (both sinks sanitize it) |
+| **F-SRO-21** (new) | Info | `ReviewSchemaBuilder`'s new duplicate-path invariant, if it ever fired, would fail a claim rather than fail the job closed |
+
+No Critical/High/Medium remains open. Nothing in the three new observations blocks the merge.
+
+## Per-finding verdicts
+
+### F-SRO-01 (Medium) — **CLOSED**
+
+`StructuredResponseParser`'s dedicated `JsonFactory` is now built with
+`.enable(StreamReadFeature.STRICT_DUPLICATE_DETECTION)` alongside the existing `StreamReadConstraints`.
+I traced the resulting failure path end to end at HEAD rather than assuming it: a duplicate key throws a
+plain `JsonParseException`, which the `catch (JsonParseException | MismatchedInputException …)` arm
+maps to `FailureKind.NOT_JSON` with `getClass().getSimpleName()` as the detail — **no exception message
+is inspected, stored or logged**, so the fix costs no F02-03/WOR-05 discipline exception, exactly as the
+round-1 remediation specified. `NOT_JSON` is an already-counted, already-retryable kind that routes
+through `RetryManager.requeueOrFail`, so the case now fails closed instead of completing green with zero
+findings. The remedy I offered as optional (the two-parse `SCHEMA_MISMATCH` discriminator) was correctly
+not taken — it was never required, and the javadoc records the `NOT_JSON`-not-`SCHEMA_MISMATCH`
+classification and the reason for it.
+
+The two QA fixtures that had pinned the pre-fix silent-data-loss behavior were **inverted in place**
+rather than deleted (as asked), and a `nonDuplicateResponseStillParsesSuccessfully…` regression guard
+was added so the flag cannot break ordinary responses.
+
+**Load-bearing, proven:** I removed the single `.enable(STRICT_DUPLICATE_DETECTION)` line in the working
+tree and re-ran `StructuredResponseParserTest` — `duplicateTopLevelFilesKeyIsRejectedAsNotJson` and
+`duplicateNestedFileKeyWithinASingleFilesObjectIsRejectedAsNotJson` both **fail**. File restored; tree
+verified clean; no production code changed by me.
+
+### F-SRO-02 (Medium) — **CLOSED**
+
+All four parts of the round-1 remediation landed, and they landed in the same commit pair as F-SRO-01
+(`e2670d2` immediately before `ed88587` — the sequencing requirement is satisfied, so the branch never
+contains a commit with strict duplicate detection on and the collision source open):
+
+1. **Edge rejection, not detection.** `ReviewService.validateStructuredOutputEligibility` now trips on
+   `new LinkedHashSet<>(sanitizedPaths).size() != sanitizedPaths.size()` **in addition to** the original
+   size-drop test, and both conditions throw the same `StructuredOutputUnsupportedException` ⇒
+   `422 STRUCTURED_OUTPUT_UNSUPPORTED`. This is a genuine reject at the edge, before any Review, chunk or
+   job row exists — not a log line. The message names the property and the remedy ("use `promptVersion`
+   `v2` or rename the affected file(s)") and **never echoes either path**, preserving the SRO-16/17/65
+   throw-site discipline.
+2. **Builder invariant.** `ReviewSchemaBuilder.build` now throws `IllegalArgumentException` on a
+   duplicate entry unconditionally, so a `required` array naming the same key twice can no longer be
+   handed to the third-party GBNF compiler even if a caller misbehaves (the `SOR-INH-2` posture, SRO-67a
+   precedent).
+3. **Parser iterates the deduped set.** `for (String path : expectedSet)` replaces
+   `for (String path : expectedPaths)` (landed in `ed88587`), so double publication is structurally
+   impossible; a dedicated test asserts `expectedPaths = ["A.java","A.java"]` yields exactly one comment.
+4. **`diff --git` trim parity.** `extractPathFromHeaderLine`'s `diff --git` branch now `trim()`s like the
+   `+++ `/`--- ` branches. I re-checked the chunk-boundary safety argument myself: `filePaths` never
+   feeds chunk *text* (chunk text derives from section text), so this cannot move a v1/v2 boundary — and
+   the new `diffGitHeaderPathIsTrimmedForParityWithTheOtherHeaderBranches` test shows the two branches
+   now agree and dedupe to one entry.
+
+**Load-bearing, proven:** reverting the `LinkedHashSet` clause to the round-1 size-only comparison makes
+`ReviewServiceTest.structuredVersionWithTwoPathsThatCollideAfterSanitizationIsRejected` **fail**. File
+restored; tree verified clean.
+
+### F-SRO-03 (Medium) — **CLOSED**, and the v1/v2 non-regression re-derived rather than assumed
+
+This was the highest-risk diff of the five (shared chunking code), so I re-derived the byte-compat
+property from the shipped `DiffChunker.split` rather than trusting the corpus test:
+
+- **Threaded all the way in.** `ReviewService.createReview` computes `answerReserveTokens` **once**
+  (`structured ? gateway.structured.answer-reserve : gateway.diff.answer-reserve`) and passes it to
+  `diffSizeValidator.assertPromptFits(…, answerReserveTokens)`; `DiffChunker.split` independently derives
+  the same value from its own `maxFilesPerChunk > 0` discriminator and passes it into the real
+  `diffSizeValidator.budgetTokens(systemPromptTokens, answerReserveTokens)` call at `:147`. I grepped
+  every remaining `budgetTokens`/`assertPromptFits` call site in `src/main/java`: there are exactly two,
+  both threaded. The startup assertion no longer checks a budget nothing uses.
+- **The coverage reserve is one shared formula.** `GatewayProperties.coverageReserveTokens(int,int,int)`
+  is now the single implementation, called by both `validateStructuredOnStartup` and `split`; three tests
+  pin the arithmetic and the `charsPerToken = 0` guard. SRO-64d's drift risk is closed by construction,
+  which is what was asked for.
+- **The single-chunk shortcut is covered.** `singleChunkBudgetTokens = wholeBudgetTokens −
+  headerReserveTokens` for a structured version, `= wholeBudgetTokens` otherwise — so a v3 Review that
+  renders a coverage block at `chunkCount == 1` is now sized for it.
+- **v1/v2 is provably byte-identical.** For `maxFilesPerChunk <= 0` every new expression collapses to the
+  pre-fix one, term for term: `answerReserveTokens` → `properties.getDiff().getAnswerReserve()` (the
+  exact value the one-arg `budgetTokens` overload still delegates with), `headerReserveTokens` →
+  `Math.max(0, diff.getChunkHeaderReserveTokens())` (identical expression, only hoisted), and
+  `singleChunkBudgetTokens` → `wholeBudgetTokens` (the un-reserved shortcut budget, unchanged). The only
+  other movement is `charsPerToken` being computed earlier in the method — a pure, side-effect-free hoist
+  of an identical expression. `DiffSizeValidatorTest.twoArgBudgetTokensWithDiffAnswerReserveMatchesTheOneArgOverload`
+  pins the delegation, and the T-6.1 corpus test (`f577670`) is green in my run.
+- Failure direction on a hostile config (a coverage reserve exceeding the whole budget) is a clamp to
+  `1` token ⇒ `DiffTooLargeException` ⇒ `422` — fail-closed, and unreachable through the startup check.
+
+### F-SRO-04 (Medium) — **CLOSED**, cap confirmed to precede the expensive work
+
+Ordering verified by reading `StructuredResponseParser.validate` at HEAD, since "applied somewhere" was
+the specific risk:
+
+1. Coverage / shape / length / `maxItems` validation runs against **every** finding first (unchanged) —
+   the cap cannot mask a `COVERAGE_SHORTFALL` or a `SCHEMA_MISMATCH`, and there is a dedicated test
+   (`structuredCommentCapNeverAffectsCoverageValidationOnlyRendering`) asserting exactly that.
+2. `findingsToRender` is computed **next** (`findings.subList(0, effectiveCap)`), with a DEBUG line.
+3. `commentRenderer.prepareChunkDiffIndex(chunkDiff)` runs **once** after that.
+4. Only then does the render loop iterate `findingsToRender`.
+
+So neither `extractDiffContext` nor `render` ever executes for a finding that could not be published.
+`ResultProcessor.processStructuredJobPhase` now passes `fairShareCommentCap(reviewId)` — the same
+`max(1, maxCommentCount / chunkCount)` the legacy path uses — closing the SRO-33 starvation gap, with a
+Zonky integration test (`fairShareCommentCapAppliesOnTheStructuredPathAcrossMultipleChunks`) proving
+chunk 0 no longer starves chunk 1.
+
+The `ChunkDiffIndex` refactor is behaviour-preserving on inspection: `locateSectionStart` now scans the
+pre-collected `diff --git` line indices (the same set the old full-line scan would have matched, since
+the old predicate required `startsWith("diff --git ")`), `locateNextSectionStart(index, sectionStart)`
+returns the first header index `> sectionStart` (equivalent to the old `from = sectionStart + 1` scan),
+and `prepareChunkDiffIndex(null)` yields the `ABSENT` index whose lookups always miss — the exact
+pre-fix `chunkDiff == null` short-circuit. Three tests pin the equivalence, including
+`renderIndexedProducesTheExactSameOutputAsTheStringOverload`. SOR-12 is unaffected: the index is still
+built from `chunk.getDiff()` for the locked job row's own `(reviewId, chunkIndex)`, never from anything
+in the model response.
+
+The optional "move the render loop out of the locked transaction" half was not taken. I am not
+re-raising it: with the cap in place the worst case falls from 800 renders × a full-diff rescan each to
+≤ `fairShare` (≤ 50) renders over a pre-built index, which is the property `SOR-18` actually asked for.
+
+### F-SRO-05 (Low, blocking by repo rule) — **CLOSED**, spot-checked against §14 item by item
+
+Not a stub: +549 lines across `README.md`, `DEPLOYMENT.md`, `worker/README.md`, `CLAUDE.md`. I checked
+the six doc-only TRACKED requirements that were the stated acceptance criteria, plus the extras:
+
+| Item | Where | Verdict |
+|---|---|---|
+| `SOR-17` residual + its single lever | `DEPLOYMENT.md` §8c "Monitored residual" — states `max-validation-attempts` is **not implemented**, names `gateway.structured.enabled=false` as the only lever, gives the `structuredValidationFailures` early signal and the "resubmit as v2" workaround | ✅ (this also closes **F-SRO-12** by the documented-position option) |
+| `SOR-19` first-attempt semantics | `README.md` §6.1c: "`finish_reason` (and the raw response it came from) describes only the first attempt", with the `SRO-37` write-once rationale | ✅ |
+| `SOR-20` rollback tolerance + fifth-mode `CHECK` | `DEPLOYMENT.md` §8c, including the explicit `DROP/ADD CONSTRAINT` recipe and the "relax first" ordering | ✅ |
+| `SOR-23` `core.quotePath` + `422` fallback | `README.md` (7 occurrences, incl. §6.1c and the rollout ladder's stage 4) | ✅ |
+| SRO-08 capability recipe **with negative control** | `DEPLOYMENT.md` §2 — two `curl` calls, the second an enum of nonsense values precisely so a fail-open backend cannot pass by luck, plus the `failed to parse grammar` log check and an explicit "do NOT enable" instruction | ✅ — this is the strongest single piece of the doc commit |
+| SRO-68d `RETRY_THEN_FALLBACK` re-acceptance | `README.md` §4.5 callout: names the SR-08/SR-09 residual, says it is MR-author-forceable, and states `gateway.structured.enabled=false` as the correct incident response | ✅ |
+| Workers-first as a **hard prerequisite** | `DEPLOYMENT.md` §2 and §8c "What NOT to do"; `README.md` ×2 | ✅ |
+| Both cross-module couplings | `DEPLOYMENT.md` §8c (`answer-reserve` ↔ `v3.yml maxTokens`; `max-schema-bytes` ↔ `max-constraint-bytes`, with the "silent on mismatch" warning), mirrored in `README.md` §4.5 and `worker/README.md` §5.2 | ✅ |
+| The three new env vars | `DEPLOYMENT.md` §2 + §10.1 example env file; `README.md` §4.5 table | ✅ (but see F-SRO-19) |
+| The stale §7.1 sentence | Corrected — the README now says an unallowlisted `promptVersion` fails at `POST /reviews`, "not on the Worker side once a job is claimed" | ✅ |
+
+`CLAUDE.md`'s data-model bullets and the rollout ladder (§11, all five stages) are present too.
+
+### F-SRO-06 … F-SRO-10 (Low, should-fix) — all **CLOSED**, none skipped
+
+- **F-SRO-06.** `sanitizeCodeBlock` now returns a `SanitizedCode(text, altered)` record with
+  `altered = raw == null || !capped.equals(raw)` — a conservative over-approximation, which is the right
+  direction. Both the suggestion and diff-context blocks append the Gateway-constant
+  `_(normalized for display; not a verbatim quotation)_` when altered, and the diff-context block carries
+  the unconditional `Context (excerpt from the reviewed diff):` label. Both strings are `private static
+  final` constants at fixed positions (WOR-04/SRO-41), never derived from model output. Five tests,
+  including the "unaltered ⇒ no marker" negative case. The SRO-53 whole-block drop ordering is unchanged.
+- **F-SRO-07.** `collapseBacktickRuns` is applied to the already-sanitized prose **inside
+  `CommentRenderer`**, not inside `CommentParser.sanitizeProseText` — so v1/v2 prose stays byte-identical
+  per SRO-54/SR-08/SR-09, and a test explicitly asserts that. The fallback re-assembly now re-runs
+  `hasBalancedFences` and degrades to `assembleWithTruncatedProse` if it still fails. A four-backtick
+  prose comment now keeps both code blocks and yields a balanced body.
+- **F-SRO-08.** (a) The parser compares `FinishReason.fromWireValue(finishReason) == FinishReason.LENGTH`,
+  the same whitelist parse `storeRawResult` uses, with a four-variant test (`"Length"`, `"LENGTH"`,
+  `" length"`, `"length "`) plus a `"stop"` negative. (b) `SubmitResultCommand.toString()` filters
+  `finishReason` to `[A-Za-z_]`/`?` with a 32-char cap; CR/LF can no longer reach a log line, and the
+  accessor still returns the raw value. See F-SRO-20 for the cosmetic half not taken.
+- **F-SRO-09.** `CreateReviewRequest.promptVersion` gains `@Size(max = 32)` +
+  `@Pattern("^[A-Za-z0-9._-]{1,32}$")` (matching `reviews.prompt_version`'s column width), and
+  `validatePromptVersionAllowlist` no longer echoes the value — it names only the allowed set, itself a
+  Gateway config value. Two controller tests prove `400` at the edge; one service test proves the throw
+  site never reflects the value even when reached directly.
+- **F-SRO-10.** `MAX_KEY_CHARS` 64 → 40 (worst case ≈ 504 chars for prefix + detail, under
+  `RetryManager`'s 512 cap). Verified with a real Zonky integration test that submits 5 × 256-char
+  missing paths **and** 5 × 256-char unexpected keys and asserts the persisted `last_error` still
+  contains `missing=`, `unexpected=`, and one real key from each side — i.e. the property, not the
+  constant.
+
+## Fresh-eyes pass over the fix commits themselves
+
+Beyond re-verifying the ten findings, I read the whole `a874d8d..HEAD` production diff looking for what
+the fix round might have introduced. No injection surface, no access-control change, no new endpoint, no
+query change, no migration change, no lock-ordering change, no dependency change, no logging-discipline
+regression (every new log statement passes ids, counts, or Gateway-constant text). Three Info-grade
+observations, none blocking:
+
+### F-SRO-19 (Info, **NEW**) — `docker-compose.yml` does not forward the three new V5 env vars
+
+`docker-compose.yml`'s `gateway` service enumerates its environment explicitly (no `env_file`), and the
+fix round did not add `ALLOWED_PROMPT_VERSIONS`, `STRUCTURED_OUTPUT_ENABLED` or
+`STRUCTURED_OUTPUT_DEFAULT_MODE` to it — so under the Docker deployment path documented in
+`DEPLOYMENT.md` §11, exporting them in the host shell has no effect and `v3` cannot be allowlisted
+without editing the compose file. This is precisely the gap commit `e17897f` on this same branch fixed
+for the V3 Prompt Manager variables (whose own comment states "Compose only forwards variables listed
+here"), i.e. the F-PM-02 config-drift lesson recurring one release later. **Non-blocking:** the
+direction is fail-closed (`v3` simply stays disabled under Compose, which is also the shipped default),
+and the primary deployment path in this runbook is systemd, whose `§10.1` env file *is* documented. Fix
+by adding the three lines to the `gateway` service's `environment:` block, mirroring `e17897f`.
+
+### F-SRO-20 (Info, **NEW**) — the `TRUNCATED` detail still embeds the raw `finishReason`
+
+F-SRO-08's remediation had two halves; the developer took the load-bearing one (the whitelist
+comparison) and not the cosmetic one ("derive the `detail` string from `FinishReason.wireValue()`").
+`StructuredResponseParser` still builds `"finish_reason=" + finishReason` from the raw wire value. I
+traced both sinks and there is no live issue: the value is `@Size(max = 32)`-bounded at the DTO edge,
+and it reaches persistence only through `RetryManager.sanitizeLastError` →
+`TextSanitizer.sanitizeSingleLine(…, 512)` and through `EventService.record` → `scrub` →
+`TextSanitizer.sanitizePath`, both of which strip Cc/Cf/Zl/Zp. So no CR/LF or control character can
+reach `review_jobs.last_error` or `review_events.details`, and `last_error` still has no client-facing
+call site (WOR-20). Recorded only so the next round does not have to re-derive it.
+
+### F-SRO-21 (Info, **NEW**) — the new builder invariant fails a *claim*, not a *job*
+
+`ReviewSchemaBuilder.build`'s new duplicate-path `IllegalArgumentException` is called from
+`QueueManager.claimJobRow` (`:316`). If it ever fired it would abort the claim transaction rather than
+terminate the job the way the neighbouring fail-closed paths do (`COVERAGE_LIST_UNAVAILABLE`,
+`SCHEMA_TOO_LARGE`), so a poison row would produce a repeating claim failure instead of a clean
+`FAILED`. It is unreachable by construction — the only source of a duplicate was the sanitization
+collision F-SRO-02 now rejects at the edge, `v3` has never shipped so no pre-existing `review_chunks`
+row can carry one, and the pre-existing empty-list invariant at the same call site has exactly the same
+shape (guarded by SRO-67b before the builder is reached). Worth a matching guard if this area is ever
+revisited; not worth a commit now.
+
+*(Also noted, not a finding: F-SRO-06's `altered` marker will fire on any diff-context excerpt taken
+from a CRLF file, because the `\r` is stripped as Cc. The marker is truthful — the text genuinely was
+altered — so this is cosmetic noise, not a correctness issue.)*
+
+## Round-1 Info findings and accepted residuals — re-checked, not re-litigated
+
+Per the round-1 ruling these do not block, and I am not re-opening any of them. Status at HEAD:
+
+| # | Status |
+|---|---|
+| F-SRO-11 (a/b/c: `SOR-16` provenance, `SRO-46` metric, `SRO-26` dead `summary`) | Open, untouched |
+| **F-SRO-12** (`max-validation-attempts` knob) | **Effectively closed** — `DEPLOYMENT.md` §8c now records the single-lever position as the deliberate answer, which was one of the two remediation options offered |
+| F-SRO-13 (weak `SOR-11` architecture test; the accepted `finish_reason` branch) | Open, untouched |
+| F-SRO-14 (`summary` `maxLength` not re-validated) | Open, untouched — **must still be resolved before `SRO-26` is ever wired up** |
+| F-SRO-15 (`SET` vs `SET LOCAL` in V4/V5 migrations) | Open, untouched — fix V4 and V5 together |
+| F-SRO-16 (`pathLinesSeen` vs. distinct-path comparison) | Open, untouched |
+| F-SRO-17 (`structuredConstraintSent` counted before the `SCHEMA_TOO_LARGE` return) | Open, untouched |
+| F-SRO-18 (intra-chunk section misattribution) | Open, untouched — and unchanged in shape by F-SRO-04's index refactor, which preserves the same first-match semantics |
+| `SOR-INH-1` | Still holds, and now **narrower** than in round 1: F-SRO-03 removed the "ordinary large MRs burn all three attempts" widening, and F-SRO-12's documentation supplies the operator response the residual assumed |
+| `SOR-INH-2` | Still holds, and now **narrower**: F-SRO-02 stopped a duplicated `required` entry from ever reaching the third-party grammar compiler, and SRO-08's `curl` recipe with its negative control — the third compensating control — now exists |
+| `SOR-INH-3` | Unchanged. F-SRO-01's closure removes the one case where content influence reached *shape* |
+
+## Findings open after this round
+
+| # | Severity | Status |
+|---|---|---|
+| F-SRO-19 | Info | Open — one-line compose change, should ride shortly after merge |
+| F-SRO-11, F-SRO-13 … F-SRO-18, F-SRO-20, F-SRO-21 | Info | Open, accepted, none blocking |
+
+---
+
+## FINAL VERDICT: **PASS — APPROVED FOR MERGE** (`feature/structured-review-output` → `master`)
+
+All five must-fix findings are genuinely closed in shipped code, and the two whose closure was most
+easily faked were proven load-bearing by reverting them and watching the new tests fail:
+
+- **F-SRO-01** now fails closed as `NOT_JSON` on a duplicate key, with no exception-message handling and
+  no new discipline exception — the flagship control can no longer degrade to *no control while
+  reporting success*.
+- **F-SRO-02** rejects a sanitization collision at the edge with `422 STRUCTURED_OUTPUT_UNSUPPORTED`,
+  and is additionally defended by a builder invariant, a deduped parser iteration and the `diff --git`
+  trim parity — all four parts, landed in the required order relative to F-SRO-01.
+- **F-SRO-03** threads both reserves into the real `DiffChunker.split`/`DiffSizeValidator.budgetTokens`
+  arithmetic including the single-chunk shortcut, with the coverage formula extracted to one shared
+  method so the startup check and the runtime cannot drift; the v1/v2 path collapses term-for-term to
+  the pre-fix expressions and is byte-identical.
+- **F-SRO-04** applies `fairShareCommentCap` **before** the render loop and builds the chunk-diff index
+  once, so the model-controlled 800-render amplification inside the job-row-locked transaction is gone.
+- **F-SRO-05** is real documentation, not a token stub: every §14 item is present, including the SRO-08
+  capability recipe *with* its negative control and the Workers-first ordering as a hard prerequisite.
+
+All five should-fixes landed too. Both suites are green from a clean state (Gateway 813, Worker 156)
+with the delta accounted for test-by-test; semgrep on the gate config reports 0 findings; gitleaks over
+133 commits reports no leaks; and there is no dependency, CI, migration, query, endpoint or
+access-control delta in the fix round. The three new observations are Info-grade — one one-line compose
+omission and two "recorded so nobody re-derives it" notes — and none warrants another pipeline
+iteration.
+
+Recommend merging to `master`, with **F-SRO-19** (the three V5 env vars in `docker-compose.yml`) as the
+only follow-up worth doing promptly, and **F-SRO-14** as a hard precondition on any future `SRO-26`
+work.
