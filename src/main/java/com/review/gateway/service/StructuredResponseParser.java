@@ -83,7 +83,19 @@ public class StructuredResponseParser {
 
     private static final Set<String> TOP_LEVEL_REQUIRED_KEYS = Set.of("files", "summary");
     private static final int MAX_LISTED_KEYS = 5;
-    private static final int MAX_KEY_CHARS = 64;
+    /**
+     * F-SRO-10 (appsec SAST fix round): lowered from 64. Worst case ({@link #MAX_LISTED_KEYS} keys per
+     * side, each capped to this length, plus the {@code (+K more)} remainder marker on both the {@code
+     * missing=}/{@code unexpected=} halves) must fit under {@code RetryManager.MAX_LAST_ERROR_LENGTH}
+     * (512) <em>together with</em> {@code composeStructuredFailureReason}'s
+     * {@code "structured-output: COVERAGE_SHORTFALL; "} prefix (the longest {@link FailureKind} name) —
+     * at 64 chars/key that combined worst case was ~700 chars, so {@code RetryManager.sanitizeLastError}'s
+     * right-truncation at 512 could cut into the {@code unexpected=} half itself (the model-controlled
+     * diagnosis this cap exists to preserve). At 40 chars/key the worst case is ~504 chars for {@code
+     * (prefix + detail)} alone, leaving only {@code RetryManager}'s own attempt-count suffix (appended
+     * after this class returns) as the part truncation can still touch.
+     */
+    private static final int MAX_KEY_CHARS = 40;
 
     private final CommentParser commentParser;
     private final CommentRenderer commentRenderer;

@@ -575,4 +575,52 @@ class ResultProcessorTest extends AbstractPostgresIntegrationTest {
         assertThat(reloaded.getLastError()).startsWith("structured-output: COVERAGE_SHORTFALL");
         assertThat(reloaded.getLastError()).contains("B.java");
     }
+
+    // ---- F-SRO-10: the 512-char last_error cap must never truncate away the "unexpected=" half ----
+
+    @Test
+    void coverageShortfallLastErrorNeverTruncatesAwayTheUnexpectedHalfEvenWithLongPaths() {
+        // 5 missing + 5 unexpected paths, each near gateway.structured.max-path-chars (256), pushes
+        // formatCoverageDetail's worst case close to RetryManager's 512-char last_error cap. Before
+        // F-SRO-10 (MAX_KEY_CHARS=64), the combined (Gateway-constant prefix + detail) could reach ~740
+        // chars, and RetryManager.sanitizeLastError's right-truncation at 512 would cut into the
+        // "unexpected=" half itself -- the model-controlled diagnosis this cap exists to preserve.
+        Review review = persistRunningStructuredReview("sha-struct-longpaths");
+        List<String> missingPaths = new java.util.ArrayList<>();
+        for (int i = 0; i < 5; i++) {
+            missingPaths.add(longPath("missing" + i));
+        }
+        persistChunk(review.getId(), SINGLE_FILE_DIFF, missingPaths);
+        ReviewJob job = persistStructuredJob(review, 1);
+
+        StringBuilder filesJson = new StringBuilder("{");
+        for (int i = 0; i < 5; i++) {
+            if (i > 0) {
+                filesJson.append(',');
+            }
+            filesJson.append('"').append(longPath("unexpectd" + i)).append("\":{\"findings\":[],\"summary\":\"s\"}");
+        }
+        filesJson.append('}');
+        String raw = "{\"files\":" + filesJson + ",\"summary\":\"y\"}";
+
+        CommentParser commentParser = new CommentParser(new GatewayProperties(), new MetricsCounters());
+        ResultProcessor processor = newResultProcessor(commentParser);
+
+        processor.process(review.getId(), job.getId(), "worker-1", job.getBackendId(),
+                new SubmitResultCommand(raw, 10, 5, 1000L, "model-x", null));
+
+        ReviewJob reloaded = reviewJobRepository.findById(job.getId()).orElseThrow();
+        String lastError = reloaded.getLastError();
+        assertThat(lastError.length()).isLessThanOrEqualTo(512);
+        assertThat(lastError).contains("missing=");
+        assertThat(lastError)
+                .as("the unexpected= label and at least one real key must survive, never truncated away")
+                .contains("unexpected=")
+                .contains("unexpectd0");
+        assertThat(lastError).contains("missing0");
+    }
+
+    private String longPath(String label) {
+        return label + "-" + "x".repeat(256 - label.length() - 1);
+    }
 }
