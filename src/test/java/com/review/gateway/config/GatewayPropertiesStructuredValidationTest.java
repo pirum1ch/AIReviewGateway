@@ -119,4 +119,31 @@ class GatewayPropertiesStructuredValidationTest {
 
         assertThatCode(properties::validateOnStartup).doesNotThrowAnyException();
     }
+
+    // ---- F-SRO-03: coverageReserveTokens is the ONE shared formula both this startup check and
+    // DiffChunker.split's runtime chunk sizing must use -- pinning the arithmetic here guards against
+    // the two drifting apart again.
+
+    @Test
+    void coverageReserveTokensMatchesTheDocumentedFormula() {
+        // ceil((maxFilesPerChunk * (maxPathChars + 1) + 400) / charsPerToken)
+        assertThatCode(() -> {
+            long reserve = GatewayProperties.coverageReserveTokens(40, 256, 4);
+            long expected = (long) Math.ceil((40.0 * (256 + 1) + 400) / 4);
+            org.assertj.core.api.Assertions.assertThat(reserve).isEqualTo(expected);
+        }).doesNotThrowAnyException();
+    }
+
+    @Test
+    void coverageReserveTokensWithCharsPerTokenOfOneMatchesTheDefaultStructuredConfig() {
+        // Shipped defaults: max-files-per-chunk=40, max-path-chars=256 (see application.yml).
+        long reserve = GatewayProperties.coverageReserveTokens(40, 256, 1);
+
+        org.assertj.core.api.Assertions.assertThat(reserve).isEqualTo(40L * 257 + 400);
+    }
+
+    @Test
+    void coverageReserveTokensNeverDividesByZeroCharsPerToken() {
+        assertThatCode(() -> GatewayProperties.coverageReserveTokens(40, 256, 0)).doesNotThrowAnyException();
+    }
 }

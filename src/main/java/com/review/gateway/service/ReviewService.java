@@ -161,9 +161,18 @@ public class ReviewService {
         // Never inside a DB transaction (architecture §3): a GitLab HTTP call must never hold a Hikari
         // connection or a row lock.
         PromptManager.PromptResolution promptResolution = promptManager.resolve(command.projectId());
-        diffSizeValidator.assertPromptFits(promptResolution.estimatedTokens());
 
+        // F-SRO-03: the structured-version-specific answer reserve (gateway.structured.answer-reserve,
+        // larger than v1/v2's to make room for the guaranteed-shape JSON response) must size BOTH this
+        // pre-chunking prompt-fits check and DiffChunker.split's runtime chunk budget below -- computed
+        // once, before either call, so they cannot diverge from each other or from the startup assertion
+        // (GatewayProperties.validateStructuredOnStartup) that already checks this same arithmetic.
         boolean structured = StructuredOutputSupport.isStructured(command.promptVersion());
+        int answerReserveTokens = structured
+                ? properties.getStructured().getAnswerReserve()
+                : properties.getDiff().getAnswerReserve();
+        diffSizeValidator.assertPromptFits(promptResolution.estimatedTokens(), answerReserveTokens);
+
         int maxFilesPerChunk = structured ? properties.getStructured().getMaxFilesPerChunk() : 0;
         DiffChunker.ChunkPlan plan = diffChunker.split(command.diff(), promptResolution.estimatedTokens(), maxFilesPerChunk);
         if (plan.chunks().size() > 1) {

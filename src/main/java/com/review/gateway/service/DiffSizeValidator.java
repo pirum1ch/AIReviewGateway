@@ -50,12 +50,25 @@ public class DiffSizeValidator {
      * Prompt Manager (architecture §9, PMR-21): the diff budget shrinks by the actual resolved
      * system-prompt size for <em>this</em> Review — {@code gateway.diff.prompt-reserve} now means only
      * the {@code user}-template's fixed wrapper text, not "the whole system prompt" (that was the
-     * pre-Prompt-Manager meaning).
+     * pre-Prompt-Manager meaning). Delegates to {@link #budgetTokens(int, int)} with {@code
+     * gateway.diff.answer-reserve} — v1/v2 arithmetic is byte-identical to before F-SRO-03 (T-6.1).
      */
     public int budgetTokens(int systemPromptTokens) {
+        return budgetTokens(systemPromptTokens, properties.getDiff().getAnswerReserve());
+    }
+
+    /**
+     * F-SRO-03 (appsec SAST fix round): structured-version-aware overload. {@code answerReserveTokens}
+     * is threaded explicitly by the caller rather than always reading {@code gateway.diff.answer-reserve}
+     * internally, so a structured prompt version's larger reserve ({@code
+     * gateway.structured.answer-reserve}) can size the exact same arithmetic the startup budget check
+     * (5-point {@code GatewayProperties.validateStructuredOnStartup}) already asserts — before this
+     * overload existed, that startup assertion checked a budget the runtime code never actually used.
+     */
+    public int budgetTokens(int systemPromptTokens, int answerReserveTokens) {
         GatewayProperties.Diff cfg = properties.getDiff();
         int derived = cfg.getContextWindow() - cfg.getPromptReserve() - Math.max(0, systemPromptTokens)
-                - cfg.getAnswerReserve();
+                - answerReserveTokens;
         return Math.min(cfg.getMaxDiffTokens(), Math.max(0, derived));
     }
 
@@ -67,8 +80,18 @@ public class DiffSizeValidator {
      * own diagnostic rather than silently shrinking every chunk or overflowing the model context.
      */
     public void assertPromptFits(int systemPromptTokens) {
+        assertPromptFits(systemPromptTokens, properties.getDiff().getAnswerReserve());
+    }
+
+    /**
+     * F-SRO-03: structured-version-aware overload — see {@link #budgetTokens(int, int)}. Called by
+     * {@code ReviewService} with {@code gateway.structured.answer-reserve} for a structured
+     * {@code promptVersion}, so the same reserve that sizes {@code DiffChunker.split}'s runtime chunking
+     * also gates this pre-chunking budget check.
+     */
+    public void assertPromptFits(int systemPromptTokens, int answerReserveTokens) {
         int minDiffBudgetTokens = properties.getPrompt().getLimits().getMinDiffBudgetTokens();
-        int budget = budgetTokens(systemPromptTokens);
+        int budget = budgetTokens(systemPromptTokens, answerReserveTokens);
         if (budget < minDiffBudgetTokens) {
             log.info("Rejecting review: system prompt of {} tokens leaves only {} tokens of diff budget, "
                     + "below the configured minimum of {}", systemPromptTokens, budget, minDiffBudgetTokens);

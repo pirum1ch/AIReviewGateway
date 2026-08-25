@@ -435,6 +435,66 @@ class DiffChunkerTest {
     }
 
     @Test
+    void structuredVersionSingleChunkShortcutReservesRoomForTheCoverageBlockSRO64d() {
+        // F-SRO-03/SRO-64d: a structured version's single-chunk shortcut must ALSO reserve room for the
+        // coverage block that renders even when chunkCount == 1 -- a non-structured version gets the
+        // full, un-reserved budget for the same shortcut (byte-identical v1/v2 behavior, §8).
+        String sectionA = gitSection("A.java", oneHunk("+" + "a".repeat(200)));
+        String sectionB = gitSection("B.java", oneHunk("+" + "b".repeat(200)));
+        int sectionLen = sectionA.length();
+        assertThat(sectionB.length()).isEqualTo(sectionLen);
+        String diff = sectionA + sectionB;
+
+        // coverageReserveTokens(maxFilesPerChunk=2, maxPathChars=10, charsPerToken=1)
+        //   = ceil((2 * (10 + 1) + 400) / 1) = 422
+        int coverageReserveTokens = 422;
+        GatewayProperties properties = propertiesWithBudget(1_000_000, 0, 5);
+        properties.getDiff().setContextWindow(2 * sectionLen + coverageReserveTokens - 50);
+        properties.getDiff().setPromptReserve(0);
+        properties.getStructured().setAnswerReserve(0);
+        properties.getStructured().setMaxPathChars(10);
+        DiffChunker chunker = newChunker(properties);
+
+        DiffChunker.ChunkPlan nonStructured = chunker.split(diff, 0, 0);
+        DiffChunker.ChunkPlan structured = chunker.split(diff, 0, 2);
+
+        assertThat(nonStructured.chunks())
+                .as("non-structured (maxFilesPerChunk=0) takes the un-reserved single-chunk shortcut")
+                .hasSize(1);
+        assertThat(structured.chunks().size())
+                .as("structured version must NOT take the single-chunk shortcut once the coverage-block "
+                        + "reserve is subtracted from the budget -- it must pack into more than one chunk")
+                .isGreaterThan(1);
+        for (DiffChunker.DiffChunk chunk : structured.chunks()) {
+            assertThat(chunk.filePaths().size()).isLessThanOrEqualTo(2);
+        }
+    }
+
+    @Test
+    void structuredVersionUsesTheStructuredAnswerReserveNotTheDiffAnswerReserve() {
+        // F-SRO-03: gateway.structured.answer-reserve (not gateway.diff.answer-reserve) must size a
+        // structured version's runtime budget -- previously only GatewayProperties' startup assertion
+        // ever read structured.answer-reserve; the runtime chunker used diff.answer-reserve for every
+        // prompt version.
+        GatewayProperties properties = propertiesWithBudget(1_000_000, 0, 5);
+        properties.getDiff().setContextWindow(5000);
+        properties.getDiff().setPromptReserve(0);
+        properties.getDiff().setAnswerReserve(500);
+        properties.getStructured().setAnswerReserve(4000);
+        properties.getStructured().setMaxPathChars(10);
+        DiffChunker chunker = newChunker(properties);
+        String diff = gitSection("A.java", oneHunk("+" + "x".repeat(600)));
+
+        // Non-structured: budget = 5000 - 0 - 500(diff.answer-reserve) = 4500, comfortably fits.
+        DiffChunker.ChunkPlan nonStructured = chunker.split(diff, 0, 0);
+        assertThat(nonStructured.chunks()).hasSize(1);
+
+        // Structured: budget = 5000 - 0 - 4000(structured.answer-reserve) = 1000, minus the coverage
+        // reserve for the single-chunk shortcut -- far too tight for the same diff to fit in one chunk.
+        assertThatThrownBy(() -> chunker.split(diff, 0, 1)).isInstanceOf(DiffTooLargeException.class);
+    }
+
+    @Test
     void aSingleSectionExceedingMaxFilesPerChunkIsRejectedAtTheEdge() {
         // A section can only ever carry >1 path in the rare CSR-11-adjacent shape where diff --git,
         // +++, and a distinct --- line disagree -- exercised here indirectly is not needed: the simplest

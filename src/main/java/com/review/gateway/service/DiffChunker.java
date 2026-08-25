@@ -112,6 +112,16 @@ public class DiffChunker {
      * whole diff's file count exceeds it. Passed as {@code 0} for every non-structured prompt version, so
      * v1/v2 chunk boundaries are byte-for-byte unchanged (§8).
      *
+     * <p><b>F-SRO-03 (appsec SAST fix round, SRO-64d):</b> for a structured prompt version ({@code
+     * maxFilesPerChunk > 0}), the per-chunk budget is sized with {@code gateway.structured.answer-reserve}
+     * (not {@code gateway.diff.answer-reserve}) and the header reserve is the SRO-64d-computed coverage
+     * block reserve ({@link GatewayProperties#coverageReserveTokens} — the exact formula {@code
+     * GatewayProperties.validateStructuredOnStartup} already asserts at boot), not {@code
+     * gateway.diff.chunk-header-reserve-tokens} — including for the single-chunk shortcut, which for a
+     * structured version still renders a coverage block even though {@code chunkCount == 1}. Both are
+     * no-ops for every non-structured prompt version ({@code maxFilesPerChunk <= 0}), so v1/v2 chunk
+     * boundaries stay byte-for-byte unchanged (§8).
+     *
      * @throws DiffTooLargeException if bin-packing would need more than {@code gateway.diff.max-chunks}
      *                                 chunks, if a single file's diff (even split at hunk boundaries, with
      *                                 its header replayed) still can't fit in one chunk, or (when
@@ -120,7 +130,21 @@ public class DiffChunker {
      */
     public ChunkPlan split(String diff, int systemPromptTokens, int maxFilesPerChunk) {
         String effectiveDiff = diff == null ? "" : diff;
-        int wholeBudgetTokens = Math.max(1, diffSizeValidator.budgetTokens(systemPromptTokens));
+        boolean structuredVersion = maxFilesPerChunk > 0;
+        int charsPerToken = Math.max(1, properties.getDiff().getCharsPerToken());
+
+        // F-SRO-03: the structured-specific answer reserve and the computed coverage-block header
+        // reserve, threaded into the same arithmetic DiffSizeValidator/binPack already use for v1/v2 --
+        // previously these existed only in GatewayProperties' startup assertion and were never read here.
+        int answerReserveTokens = structuredVersion
+                ? properties.getStructured().getAnswerReserve()
+                : properties.getDiff().getAnswerReserve();
+        int headerReserveTokens = structuredVersion
+                ? (int) Math.min(Integer.MAX_VALUE, GatewayProperties.coverageReserveTokens(
+                        maxFilesPerChunk, properties.getStructured().getMaxPathChars(), charsPerToken))
+                : Math.max(0, properties.getDiff().getChunkHeaderReserveTokens());
+
+        int wholeBudgetTokens = Math.max(1, diffSizeValidator.budgetTokens(systemPromptTokens, answerReserveTokens));
         int estimatedWhole = diffSizeValidator.estimateTokens(effectiveDiff);
 
         ParsedDiff parsed = parseSections(effectiveDiff);
@@ -130,21 +154,23 @@ public class DiffChunker {
         // A no-op (maxFilesPerChunk <= 0) for every non-structured prompt version.
         enforceStructuredCoverageBounds(parsed, maxFilesPerChunk);
 
-        // Single-chunk shortcut (§2): if the whole diff already fits the (un-reduced) per-request
-        // budget, no context header will ever be rendered (ChunkContextRenderer only fires when
-        // chunkCount > 1) -- so use the FULL budget here, not the header-reserved one, and return the
-        // original diff String instance unmodified. This is what guarantees byte-identical behavior
-        // for small MRs (backward compatibility, §8). SRO-14: also defeated when a structured
-        // maxFilesPerChunk bound can't accommodate the whole diff's distinct file count in one chunk.
+        // Single-chunk shortcut (§2): if the whole diff already fits the per-request budget, no context
+        // header will ever be rendered (ChunkContextRenderer only fires when chunkCount > 1) -- so a
+        // NON-structured version uses the FULL, un-reserved budget here, returning the original diff
+        // String instance unmodified (byte-identical behavior for small MRs, §8). A STRUCTURED version
+        // (SRO-64d) instead uses the header-reserved budget even for one chunk, because its coverage
+        // block renders regardless of chunkCount. SRO-14: also defeated when a structured maxFilesPerChunk
+        // bound can't accommodate the whole diff's distinct file count in one chunk.
         List<String> allFilePaths = parsed.pathsTrusted() ? collectAllFilePaths(parsed.sections()) : List.of();
         boolean singleChunkFileCountFits = maxFilesPerChunk <= 0 || allFilePaths.size() <= maxFilesPerChunk;
-        if (estimatedWhole <= wholeBudgetTokens && singleChunkFileCountFits) {
+        int singleChunkBudgetTokens = structuredVersion
+                ? Math.max(1, wholeBudgetTokens - headerReserveTokens)
+                : wholeBudgetTokens;
+        if (estimatedWhole <= singleChunkBudgetTokens && singleChunkFileCountFits) {
             DiffChunk single = new DiffChunk(0, diff, estimatedWhole, allFilePaths);
             return new ChunkPlan(List.of(single), estimatedWhole, parsed.pathsTrusted());
         }
 
-        int charsPerToken = Math.max(1, properties.getDiff().getCharsPerToken());
-        int headerReserveTokens = Math.max(0, properties.getDiff().getChunkHeaderReserveTokens());
         int perChunkBudgetTokens = Math.max(1, wholeBudgetTokens - headerReserveTokens);
         int perChunkBudgetChars = perChunkBudgetTokens * charsPerToken;
         int maxChunks = Math.max(1, properties.getDiff().getMaxChunks());

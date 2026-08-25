@@ -130,6 +130,23 @@ public class GatewayProperties {
      */
     private static final int COVERAGE_BLOCK_FIXED_CHARS = 400;
 
+    /**
+     * F-SRO-03 (appsec SAST fix round): the coverage-block header-reserve formula, extracted to this one
+     * shared static method so {@link #validateStructuredOnStartup()} (the startup budget assertion) and
+     * {@code DiffChunker.split}'s runtime chunk sizing can never compute two different numbers for the
+     * same inputs. Before this fix, the formula existed only inline inside the startup check — the
+     * startup validation asserted a budget the runtime chunker never actually used.
+     *
+     * @return the coverage-block header reserve, in tokens, for a structured-output chunk whose coverage
+     *         list can carry up to {@code maxFilesPerChunk} paths of up to {@code maxPathChars} each
+     */
+    public static long coverageReserveTokens(int maxFilesPerChunk, int maxPathChars, int charsPerToken) {
+        int effectiveCharsPerToken = Math.max(1, charsPerToken);
+        return (long) Math.ceil(
+                ((double) Math.max(0, maxFilesPerChunk) * (Math.max(0, maxPathChars) + 1) + COVERAGE_BLOCK_FIXED_CHARS)
+                        / effectiveCharsPerToken);
+    }
+
     @PostConstruct
     void validateOnStartup() {
         requireSecret("gateway.security.ci-token", security.getCiToken());
@@ -215,10 +232,11 @@ public class GatewayProperties {
 
         // Point 4 (SRO-64d): the coverage block must fit the budget. Sized for the worst case -- every
         // path at max-path-chars -- because a budget that only works for typical inputs is not a budget.
+        // F-SRO-03: this must be the exact same formula DiffChunker.split uses at runtime (see
+        // coverageReserveTokens's javadoc) -- computed once, shared, so the two can never drift apart.
         int charsPerToken = Math.max(1, diff.getCharsPerToken());
-        long coverageReserveTokens = (long) Math.ceil(
-                ((double) structured.getMaxFilesPerChunk() * (structured.getMaxPathChars() + 1)
-                        + COVERAGE_BLOCK_FIXED_CHARS) / charsPerToken);
+        long coverageReserveTokens =
+                coverageReserveTokens(structured.getMaxFilesPerChunk(), structured.getMaxPathChars(), charsPerToken);
 
         // Point 5 (threat model SOR-13, CRITICAL): include the Prompt Manager term when it is enabled.
         long promptManagerTerm = prompt.isEnabled() ? prompt.getLimits().getMaxSystemPromptTokens() : 0;

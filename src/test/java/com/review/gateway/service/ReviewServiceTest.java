@@ -373,6 +373,40 @@ class ReviewServiceTest {
     }
 
     @Test
+    void nonStructuredVersionAssertsPromptFitsWithTheDiffAnswerReserve() {
+        // F-SRO-03: assertPromptFits must be called with the version-appropriate answer reserve --
+        // gateway.diff.answer-reserve for v1/v2, computed once and threaded through, not silently
+        // defaulted inside DiffSizeValidator.
+        when(reviewRepository.findByProjectIdAndMergeRequestIdAndHeadShaNotAndStatusInOrderByIdAsc(any(), any(), any(), any()))
+                .thenReturn(List.of());
+        when(deduplicationService.findActiveReview(1L, 2L, "sha-v1")).thenReturn(Optional.empty());
+        when(reviewRepository.saveAndFlush(any(Review.class)))
+                .thenAnswer(inv -> ReviewTestSupport.withId(inv.getArgument(0), 500L));
+
+        reviewService.createReview(command("sha-v1"));
+
+        verify(diffSizeValidator).assertPromptFits(anyInt(), eq(properties.getDiff().getAnswerReserve()));
+    }
+
+    @Test
+    void structuredVersionAssertsPromptFitsWithTheStructuredAnswerReserve() {
+        properties.getReview().getAllowedPromptVersions().add("v3");
+        when(diffChunker.split(anyString(), anyInt(), anyInt())).thenAnswer(inv -> new DiffChunker.ChunkPlan(
+                List.of(new DiffChunker.DiffChunk(0, inv.getArgument(0), 10, List.of("src/A.java"))), 10, true));
+        when(chunkContextRenderer.sanitizePath("src/A.java")).thenReturn("src/A.java");
+        when(reviewRepository.findByProjectIdAndMergeRequestIdAndHeadShaNotAndStatusInOrderByIdAsc(any(), any(), any(), any()))
+                .thenReturn(List.of());
+        when(deduplicationService.findActiveReview(1L, 2L, "sha-v3")).thenReturn(Optional.empty());
+        when(reviewRepository.saveAndFlush(any(Review.class)))
+                .thenAnswer(inv -> ReviewTestSupport.withId(inv.getArgument(0), 501L));
+        CreateReviewCommand command = new CreateReviewCommand(1L, 2L, "sha-v3", "base-sha", "diff content", "v3", 10);
+
+        reviewService.createReview(command);
+
+        verify(diffSizeValidator).assertPromptFits(anyInt(), eq(properties.getStructured().getAnswerReserve()));
+    }
+
+    @Test
     void structuredVersionWithEligibleTrustedPathsPassesEdgeValidation() {
         properties.getReview().getAllowedPromptVersions().add("v3");
         when(diffChunker.split(anyString(), anyInt(), anyInt())).thenAnswer(inv -> new DiffChunker.ChunkPlan(
