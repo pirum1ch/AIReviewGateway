@@ -70,6 +70,11 @@ class StructuredOutputEndToEndIntegrationTest {
         // gateway.backend.failure-grace must be zeroed in lockstep (GatewayProperties startup coupling).
         registry.add("gateway.retry.requeue-delay", () -> "0s");
         registry.add("gateway.backend.failure-grace", () -> "0s");
+        // SRO-15's backstop, set unreachably low so any schema-building test deterministically exercises
+        // the SCHEMA_TOO_LARGE fail-closed claim-time path. Safe for every other test in this class: none
+        // of them use a non-OFF backend mode, so ReviewSchemaBuilder.build (and this bound) never runs
+        // for them -- `if (mode != StructuredOutputMode.OFF)` gates schema construction entirely.
+        registry.add("gateway.structured.max-schema-bytes", () -> "10");
     }
 
     @AfterEach
@@ -266,5 +271,38 @@ class StructuredOutputEndToEndIntegrationTest {
         ResponseEntity<Map> noMoreWork = restTemplate.exchange("/jobs/claim", HttpMethod.POST,
                 new HttpEntity<>(claimBody, headersFor(WORKER_TOKEN)), Map.class);
         assertThat(noMoreWork.getStatusCode().value()).isEqualTo(204);
+    }
+
+    // ---- SRO-15/T-1.8: max-schema-bytes backstop -- no test existed for this path at all ----
+
+    @SuppressWarnings("unchecked")
+    @Test
+    void aRenderedSchemaExceedingMaxSchemaBytesFailsTheJobClosedAtClaimTimeRatherThanDispatchingIt() {
+        // gateway.structured.max-schema-bytes=10 (class-wide @DynamicPropertySource) makes this
+        // unreachable in practice with any real chunk -- exactly the "backstop only" contract SRO-15
+        // describes. A non-OFF backend mode is required so ReviewSchemaBuilder.build actually runs (the
+        // OFF-mode tests above never reach this code path at all).
+        Backend backend = new Backend("backend-schema-too-large", "http://192.168.1.71:8080", "model-x", 5);
+        backend.setStatus(BackendStatus.ACTIVE);
+        backend.setStructuredOutputMode("RESPONSE_FORMAT_JSON_SCHEMA");
+        backendRepository.saveAndFlush(backend);
+
+        ResponseEntity<Map> created = createReview(505, 5005, "sha-schema-too-large", "v3");
+        assertThat(created.getStatusCode().value()).isEqualTo(201);
+        Number reviewId = (Number) created.getBody().get("reviewId");
+
+        // SRO-15's fail-closed claim path never returns a claimed job for this attempt -- matches the
+        // PMR-09/SRO-67b shape (queue-empty-shaped 204), even though the job is FAILED behind the scenes.
+        Map<String, Object> claimBody = Map.of("backendId", "backend-schema-too-large", "workerId", "worker-schema-too-large");
+        ResponseEntity<Map> claimResponse = restTemplate.exchange("/jobs/claim", HttpMethod.POST,
+                new HttpEntity<>(claimBody, headersFor(WORKER_TOKEN)), Map.class);
+        assertThat(claimResponse.getStatusCode().value()).isEqualTo(204);
+
+        ResponseEntity<Map> finalStatus = restTemplate.exchange("/reviews/" + reviewId, HttpMethod.GET,
+                new HttpEntity<>(headersFor(CI_TOKEN)), Map.class);
+        assertThat(finalStatus.getBody().get("status"))
+                .as("SRO-15: the job is never dispatched to a Worker -- it fails closed at claim time, "
+                        + "exactly like PMR-09/SRO-67b's shape, never a silently oversized request")
+                .isEqualTo("FAILED");
     }
 }
