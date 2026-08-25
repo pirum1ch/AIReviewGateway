@@ -245,6 +245,42 @@ class CommentRendererTest {
         assertThat(countOccurrences(rendered, "````") % 2).isEqualTo(0);
     }
 
+    // ---- F-SRO-07: a literal 4+-backtick run in the PROSE field must not defeat fence-balance ----
+
+    @Test
+    void aFourBacktickRunInTheProseStillYieldsABalancedBodyWithBothCodeBlocksIntact() {
+        // Before F-SRO-07, sanitizeCodeBlock guaranteed code content could never contain a 3+ backtick
+        // run, but the prose pipeline (CommentParser.sanitizeProseText) left backticks untouched -- a
+        // literal 4-backtick run in the model's comment text made hasBalancedFences see an ODD total
+        // count, which dropped BOTH the diff-context and suggestion blocks. Now the prose itself is
+        // backtick-collapsed before assembly, so the model-controlled text can never contain a 3+
+        // backtick run either, and both code blocks survive.
+        CommentRenderer renderer = newRenderer();
+        String diff = gitSection("A.java", "@@ -1,1 +1,1 @@", "+content");
+        String proseWithFourBackticks = "See ```` for details";
+
+        String rendered = renderer.render("A.java", 1, Severity.MAJOR, proseWithFourBackticks, "fix code", diff);
+
+        assertThat(countOccurrences(rendered, "````") % 2)
+                .as("the assembled body must always have a balanced fence-marker count")
+                .isEqualTo(0);
+        assertThat(rendered).contains("content"); // the diff-context block survived
+        assertThat(rendered).contains("fix code"); // the suggestion block survived
+    }
+
+    @Test
+    void proseBackticksAreCollapsedButTheAccessibleCommentTextConceptIsUnaffectedForV1V2() {
+        // F-SRO-07 is deliberately CommentRenderer-local: CommentParser.sanitizeProseText (the v1/v2
+        // pipeline) must stay byte-identical -- this class collapses backticks on ITS OWN COPY of the
+        // already-sanitized prose, never inside CommentParser itself.
+        CommentParser commentParser = new CommentParser(new GatewayProperties(), new MetricsCounters());
+        String proseWithBackticks = "some ```` backticks";
+
+        String v1v2Sanitized = commentParser.sanitizeProseText(proseWithBackticks);
+
+        assertThat(v1v2Sanitized).contains("````");
+    }
+
     private long countOccurrences(String haystack, String needle) {
         long count = 0;
         int index = 0;

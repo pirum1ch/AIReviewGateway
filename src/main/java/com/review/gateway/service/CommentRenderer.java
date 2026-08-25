@@ -20,10 +20,12 @@ import java.util.regex.Pattern;
  * via {@link CommentParser}) are completely unchanged.
  *
  * <p>Two sanitization pipelines, deliberately different (SRO-54/55): prose (comment text) goes through
- * {@link CommentParser}'s existing pipeline unchanged; code (diff context, suggestion) goes through
- * {@link #sanitizeCodeBlock}, which never HTML-escapes (escaping corrupts code inside a fence and
- * protects nothing there — entities are not decoded in a CommonMark fenced block) but does strip
- * control/format characters, collapse backtick runs, and cap length.
+ * {@link CommentParser}'s existing pipeline unchanged, plus (F-SRO-07, appsec SAST fix round) a
+ * backtick-run collapse applied here — never inside {@code CommentParser} itself, which must stay
+ * byte-identical for v1/v2; code (diff context, suggestion) goes through {@link #sanitizeCodeBlock},
+ * which never HTML-escapes (escaping corrupts code inside a fence and protects nothing there — entities
+ * are not decoded in a CommonMark fenced block) but does strip control/format characters, collapse
+ * backtick runs, and cap length.
  *
  * <p><b>SOR-09 (fence integrity):</b> backtick-run collapsing always runs before any length cap; a block
  * is dropped whole (never truncated internally) in the order diff-context, then suggestion, then the
@@ -87,7 +89,15 @@ public class CommentRenderer {
                                  String rawSuggestion, ChunkDiffIndex diffIndex) {
         String sanitizedPath = safeHeaderPath(commentParser.sanitizeFilePath(filePath));
         String header = renderHeader(severity, sanitizedPath, lineNumber);
-        String prose = commentParser.sanitizeProseText(rawComment);
+        // F-SRO-07 (appsec SAST fix round): collapse backtick runs in the PROSE too, not only inside code
+        // blocks. sanitizeCodeBlock already guarantees code content can never contain a 3+ backtick run,
+        // so CODE_FENCE (four backticks) could previously only appear as a genuine pair UNLESS the model
+        // put a literal 4+-backtick run in the prose field -- which defeats hasBalancedFences below (an
+        // odd fence count drops BOTH code blocks) and, worse, the pre-fix fallback re-assembly never
+        // re-verified the result, so the shipped body could still contain the unbalanced fence. Applied
+        // here (not inside CommentParser.sanitizeProseText, which must stay byte-identical for v1/v2 per
+        // SRO-54/SR-08/SR-09) on the already-sanitized prose, before assembly and before any cap.
+        String prose = collapseBacktickRuns(commentParser.sanitizeProseText(rawComment));
 
         Optional<String> diffBlock = renderDiffContextBlock(diffIndex, filePath, lineNumber);
         Optional<String> suggestionBlock = renderSuggestionBlock(rawSuggestion);
@@ -113,6 +123,14 @@ public class CommentRenderer {
             log.warn("Assembled structured comment body failed fence-balance verification; dropping all code blocks");
             assembled = assemble(header, prose, Optional.empty(), Optional.empty());
             if (assembled.length() > maxLength) {
+                assembled = assembleWithTruncatedProse(header, prose, maxLength);
+            }
+            // F-SRO-07: re-verify the fallback itself -- with backtick-collapsed prose this should now be
+            // structurally impossible to fail, but SOR-09's own rule is "verify, never assume", so the
+            // fallback gets the same treatment as the primary assembly rather than being trusted blind.
+            if (!hasBalancedFences(assembled)) {
+                log.warn("Fallback structured comment body still failed fence-balance verification; "
+                        + "truncating prose as a last resort");
                 assembled = assembleWithTruncatedProse(header, prose, maxLength);
             }
         }
