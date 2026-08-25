@@ -80,7 +80,8 @@ public class JobController {
     @PostMapping("/{id}/result")
     public ResponseEntity<SubmitResultResponse> submitResult(@PathVariable("id") Long id, @Valid @RequestBody SubmitResultRequest request) {
         SubmitResultCommand command = new SubmitResultCommand(
-                request.rawResponse(), request.promptTokens(), request.completionTokens(), request.durationMs(), request.model());
+                request.rawResponse(), request.promptTokens(), request.completionTokens(), request.durationMs(),
+                request.model(), request.finishReason());
         SubmitResultOutcome outcome = queueManager.submitResult(id, request.workerId(), command);
         if (outcome.outcome() == ResultOutcome.NOT_FOUND) {
             return ResponseEntity.notFound().build();

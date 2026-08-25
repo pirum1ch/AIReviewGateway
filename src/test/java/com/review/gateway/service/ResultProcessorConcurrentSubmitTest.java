@@ -117,13 +117,13 @@ class ResultProcessorConcurrentSubmitTest extends AbstractPostgresIntegrationTes
                 startLatch.countDown();
                 startLatch.await(10, TimeUnit.SECONDS);
                 return processorA.process(reviewId, jobId, "worker-1", backendId,
-                        new SubmitResultCommand("[{\"comment\":\"finding from A\"}]", 1, 1, 10L, "model-x"));
+                        new SubmitResultCommand("[{\"comment\":\"finding from A\"}]", 1, 1, 10L, "model-x", null));
             });
             Future<ReviewStatus> futureB = executor.submit(() -> {
                 startLatch.countDown();
                 startLatch.await(10, TimeUnit.SECONDS);
                 return processorB.process(reviewId, jobId, "worker-1", backendId,
-                        new SubmitResultCommand("[{\"comment\":\"finding from B\"}]", 1, 1, 10L, "model-x"));
+                        new SubmitResultCommand("[{\"comment\":\"finding from B\"}]", 1, 1, 10L, "model-x", null));
             });
 
             ReviewStatus resultA = futureA.get(15, TimeUnit.SECONDS);

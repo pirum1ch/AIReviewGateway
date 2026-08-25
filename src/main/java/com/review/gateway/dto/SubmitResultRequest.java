@@ -18,5 +18,6 @@ public record SubmitResultRequest(
         Integer promptTokens,
         Integer completionTokens,
         Long durationMs,
-        String model) {
+        String model,
+        @Size(max = 32) String finishReason) {
 }

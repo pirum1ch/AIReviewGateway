@@ -268,7 +268,7 @@ class QueueManagerIntegrationTest extends AbstractPostgresIntegrationTest {
         reviewRepository.saveAndFlush(completed);
 
         SubmitResultOutcome outcome = queueManager.submitResult(claimed.jobId(), "worker-1",
-                new SubmitResultCommand("raw response", 10, 20, 500L, "model-x"));
+                new SubmitResultCommand("raw response", 10, 20, 500L, "model-x", null));
 
         assertThat(outcome.outcome()).isEqualTo(ResultOutcome.IDEMPOTENT_NOOP);
         assertThat(outcome.currentStatus()).isEqualTo(ReviewStatus.COMPLETED);
@@ -285,7 +285,7 @@ class QueueManagerIntegrationTest extends AbstractPostgresIntegrationTest {
         ClaimedJob claimed = queueManager.claim("mac-mini-i", "worker-1").orElseThrow();
 
         SubmitResultOutcome outcome = queueManager.submitResult(claimed.jobId(), "worker-IMPOSTOR",
-                new SubmitResultCommand("raw response", 10, 20, 500L, "model-x"));
+                new SubmitResultCommand("raw response", 10, 20, 500L, "model-x", null));
 
         assertThat(outcome.outcome()).isEqualTo(ResultOutcome.OWNERSHIP_MISMATCH);
         verify(resultProcessor, never()).process(any(), any(), any(), any(), any());
@@ -296,7 +296,7 @@ class QueueManagerIntegrationTest extends AbstractPostgresIntegrationTest {
         QueueManager queueManager = newQueueManager(Mockito.mock(ResultProcessor.class));
 
         SubmitResultOutcome outcome = queueManager.submitResult(999_999L, "worker-1",
-                new SubmitResultCommand("raw", 1, 1, 1L, "model"));
+                new SubmitResultCommand("raw", 1, 1, 1L, "model", null));
 
         assertThat(outcome.outcome()).isEqualTo(ResultOutcome.NOT_FOUND);
     }
@@ -313,7 +313,7 @@ class QueueManagerIntegrationTest extends AbstractPostgresIntegrationTest {
         when(resultProcessor.process(any(), any(), any(), any(), any())).thenReturn(ReviewStatus.COMPLETED);
 
         SubmitResultOutcome outcome = queueManager.submitResult(claimed.jobId(), "worker-1",
-                new SubmitResultCommand("raw response", 10, 20, 500L, "model-x"));
+                new SubmitResultCommand("raw response", 10, 20, 500L, "model-x", null));
 
         assertThat(outcome.outcome()).isEqualTo(ResultOutcome.ACCEPTED);
         assertThat(outcome.currentStatus()).isEqualTo(ReviewStatus.COMPLETED);

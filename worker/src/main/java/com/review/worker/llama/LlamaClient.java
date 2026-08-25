@@ -203,9 +203,13 @@ public class LlamaClient {
         Usage usage = response.usage();
         Integer promptTokens = usage != null ? usage.promptTokens() : null;
         Integer completionTokens = usage != null ? usage.completionTokens() : null;
+        // SRO-42: already parsed into Choice and, until now, discarded -- propagated so the Gateway can
+        // tell "max-tokens exhausted" (finish_reason=length) apart from "the model produced garbage".
+        String finishReason = firstChoice.finishReason();
         log.info("llama-server completion received (durationMs={}, promptTokens={}, completionTokens={})",
                 durationMs, promptTokens, completionTokens);
-        return new LlamaResult(firstChoice.message().content(), promptTokens, completionTokens, durationMs, requestedModel);
+        return new LlamaResult(firstChoice.message().content(), promptTokens, completionTokens, durationMs,
+                requestedModel, finishReason);
     }
 
     /**

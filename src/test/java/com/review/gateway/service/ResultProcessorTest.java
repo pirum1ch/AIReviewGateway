@@ -128,7 +128,7 @@ class ResultProcessorTest extends AbstractPostgresIntegrationTest {
 
         ResultProcessor processor = newResultProcessor(commentParser);
         ReviewStatus finalStatus = processor.process(review.getId(), job.getId(), "worker-1", job.getBackendId(),
-                new SubmitResultCommand("raw-broken", 10, 5, 1000L, "model-x"));
+                new SubmitResultCommand("raw-broken", 10, 5, 1000L, "model-x", null));
 
         assertThat(finalStatus).isEqualTo(ReviewStatus.FAILED);
         assertThat(reviewResultRepository.existsByReviewIdAndChunkIndex(review.getId(), 0)).isTrue();
@@ -150,7 +150,7 @@ class ResultProcessorTest extends AbstractPostgresIntegrationTest {
         ResultProcessor processor = newResultProcessor(commentParser);
         String raw = "[{\"file\":\"A.java\",\"line\":1,\"severity\":\"MAJOR\",\"comment\":\"Fix this\"}]";
         ReviewStatus finalStatus = processor.process(review.getId(), job.getId(), "worker-1", job.getBackendId(),
-                new SubmitResultCommand(raw, 10, 5, 1000L, "model-x"));
+                new SubmitResultCommand(raw, 10, 5, 1000L, "model-x", null));
 
         assertThat(finalStatus).isEqualTo(ReviewStatus.COMPLETED);
         assertThat(reviewResultRepository.existsByReviewIdAndChunkIndex(review.getId(), 0)).isTrue();
@@ -164,6 +164,49 @@ class ResultProcessorTest extends AbstractPostgresIntegrationTest {
         assertThat(reloadedJob.getFinishedAt()).isNotNull();
     }
 
+    // ---- Structured Review Output: finish_reason propagation/normalization (SRO-42/43/44) ----
+
+    @Test
+    void recognizedFinishReasonIsStoredNormalizedLowercase() {
+        Review review = persistRunningReview("sha-finish-length");
+        ReviewJob job = persistJob(review);
+        CommentParser commentParser = new CommentParser(new GatewayProperties());
+
+        newResultProcessor(commentParser).process(review.getId(), job.getId(), "worker-1", job.getBackendId(),
+                new SubmitResultCommand("[]", 10, 5, 1000L, "model-x", "LENGTH"));
+
+        assertThat(reviewResultRepository.findByReviewIdAndChunkIndex(review.getId(), 0).orElseThrow().getFinishReason())
+                .isEqualTo("length");
+    }
+
+    @Test
+    void nullFinishReasonIsStoredAsNullNotAsUnknown() {
+        // SRO-44: an old Worker/backend build that omits the field must be distinguishable from a
+        // genuinely-unrecognized value -- both must never be conflated.
+        Review review = persistRunningReview("sha-finish-null");
+        ReviewJob job = persistJob(review);
+        CommentParser commentParser = new CommentParser(new GatewayProperties());
+
+        newResultProcessor(commentParser).process(review.getId(), job.getId(), "worker-1", job.getBackendId(),
+                new SubmitResultCommand("[]", 10, 5, 1000L, "model-x", null));
+
+        assertThat(reviewResultRepository.findByReviewIdAndChunkIndex(review.getId(), 0).orElseThrow().getFinishReason())
+                .isNull();
+    }
+
+    @Test
+    void unrecognizedFinishReasonIsNormalizedToUnknownNeverEnumValueOf() {
+        Review review = persistRunningReview("sha-finish-unknown");
+        ReviewJob job = persistJob(review);
+        CommentParser commentParser = new CommentParser(new GatewayProperties());
+
+        newResultProcessor(commentParser).process(review.getId(), job.getId(), "worker-1", job.getBackendId(),
+                new SubmitResultCommand("[]", 10, 5, 1000L, "model-x", "some-future-llama-cpp-value"));
+
+        assertThat(reviewResultRepository.findByReviewIdAndChunkIndex(review.getId(), 0).orElseThrow().getFinishReason())
+                .isEqualTo("unknown");
+    }
+
     @Test
     void resultIsIdempotentWhenReviewResultAlreadyExists() {
         Review review = persistRunningReview("sha-idempotent");
@@ -174,7 +217,7 @@ class ResultProcessorTest extends AbstractPostgresIntegrationTest {
 
         // First delivery.
         processor.process(review.getId(), job.getId(), "worker-1", job.getBackendId(),
-                new SubmitResultCommand("first raw response", 1, 1, 10L, "model-x"));
+                new SubmitResultCommand("first raw response", 1, 1, 10L, "model-x", null));
 
         long resultCountAfterFirst = reviewResultRepository.findByReviewIdAndChunkIndex(review.getId(), 0).stream().count();
 
@@ -182,7 +225,7 @@ class ResultProcessorTest extends AbstractPostgresIntegrationTest {
         // (ResultProcessor itself doesn't re-check RUNNING -- that's QueueManager's job -- but its
         // storeRawResult step must still be idempotent if ever invoked twice for the same review).
         processor.process(review.getId(), job.getId(), "worker-1", job.getBackendId(),
-                new SubmitResultCommand("first raw response", 1, 1, 10L, "model-x"));
+                new SubmitResultCommand("first raw response", 1, 1, 10L, "model-x", null));
 
         assertThat(reviewResultRepository.findByReviewIdAndChunkIndex(review.getId(), 0).orElseThrow().getRawResponse())
                 .isEqualTo("first raw response");
@@ -203,7 +246,7 @@ class ResultProcessorTest extends AbstractPostgresIntegrationTest {
 
         String oversizedRaw = "x".repeat(1000);
         ReviewStatus finalStatus = processor.process(review.getId(), job.getId(), "worker-1", job.getBackendId(),
-                new SubmitResultCommand(oversizedRaw, 10, 5, 1000L, "model-x"));
+                new SubmitResultCommand(oversizedRaw, 10, 5, 1000L, "model-x", null));
 
         assertThat(finalStatus).isEqualTo(ReviewStatus.COMPLETED);
 
@@ -236,7 +279,7 @@ class ResultProcessorTest extends AbstractPostgresIntegrationTest {
 
         String withinCapRaw = "a normal, short model response";
         processor.process(review.getId(), job.getId(), "worker-1", job.getBackendId(),
-                new SubmitResultCommand(withinCapRaw, 10, 5, 1000L, "model-x"));
+                new SubmitResultCommand(withinCapRaw, 10, 5, 1000L, "model-x", null));
 
         String storedRaw = reviewResultRepository.findByReviewIdAndChunkIndex(review.getId(), 0).orElseThrow().getRawResponse();
         assertThat(storedRaw).isEqualTo(withinCapRaw);

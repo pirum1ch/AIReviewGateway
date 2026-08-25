@@ -112,7 +112,7 @@ class ResultProcessorOversizedFilePathTest extends AbstractPostgresIntegrationTe
         String raw = "[{\"file\":\"" + hugeFilePath + "\",\"line\":1,\"severity\":\"MINOR\",\"comment\":\"finding\"}]";
 
         assertThatCode(() -> processor.process(review.getId(), job.getId(), "worker-1", job.getBackendId(),
-                new SubmitResultCommand(raw, 10, 5, 1000L, "model-x")))
+                new SubmitResultCommand(raw, 10, 5, 1000L, "model-x", null)))
                 .as("FIXED: CommentParser now caps filePath length the same way it caps comment text, "
                         + "so an oversized LLM-supplied file path no longer overflows "
                         + "review_comments.file_path VARCHAR(1024)")
@@ -150,7 +150,7 @@ class ResultProcessorOversizedFilePathTest extends AbstractPostgresIntegrationTe
         String raw = "[{\"file\":\"" + jsonEscapedFilePathValue + "\",\"comment\":\"finding\"}]";
 
         assertThatCode(() -> processor.process(review.getId(), job.getId(), "worker-1", job.getBackendId(),
-                new SubmitResultCommand(raw, 10, 5, 1000L, "model-x")))
+                new SubmitResultCommand(raw, 10, 5, 1000L, "model-x", null)))
                 .as("FIXED: capLength runs after htmlEscape, so escaping's inflation of an all-quote "
                         + "filePath cannot overflow review_comments.file_path VARCHAR(1024)")
                 .doesNotThrowAnyException();

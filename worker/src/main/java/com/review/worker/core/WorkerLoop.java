@@ -421,7 +421,7 @@ public class WorkerLoop {
      */
     private RedeliveryOutcome submitResultWithRedelivery(long jobId, String workerId, LlamaResult result) {
         ResultRequest request = new ResultRequest(workerId, result.rawResponse(), result.promptTokens(),
-                result.completionTokens(), result.durationMs(), result.model());
+                result.completionTokens(), result.durationMs(), result.model(), result.finishReason());
         long backoffMs = 0;
         while (true) {
             try {

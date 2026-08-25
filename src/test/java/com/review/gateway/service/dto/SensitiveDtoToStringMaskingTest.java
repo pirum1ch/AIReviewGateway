@@ -37,7 +37,7 @@ class SensitiveDtoToStringMaskingTest {
 
     @Test
     void submitResultCommandToStringNeverContainsTheRawResponse() {
-        SubmitResultCommand command = new SubmitResultCommand(SECRET_RAW_RESPONSE, 10, 20, 500L, "model-x");
+        SubmitResultCommand command = new SubmitResultCommand(SECRET_RAW_RESPONSE, 10, 20, 500L, "model-x", null);
 
         String rendered = command.toString();
 
@@ -49,7 +49,7 @@ class SensitiveDtoToStringMaskingTest {
 
     @Test
     void submitResultCommandAccessorStillReturnsTheFullRawResponseUnmasked() {
-        SubmitResultCommand command = new SubmitResultCommand(SECRET_RAW_RESPONSE, 10, 20, 500L, "model-x");
+        SubmitResultCommand command = new SubmitResultCommand(SECRET_RAW_RESPONSE, 10, 20, 500L, "model-x", null);
 
         assertThat(command.rawResponse()).isEqualTo(SECRET_RAW_RESPONSE);
     }
@@ -57,6 +57,6 @@ class SensitiveDtoToStringMaskingTest {
     @Test
     void toStringMaskingHandlesNullContentGracefully() {
         assertThat(new CreateReviewCommand(1L, 2L, "sha", "base", null, "v1", 10).toString()).contains("0 chars");
-        assertThat(new SubmitResultCommand(null, null, null, null, null).toString()).contains("0 chars");
+        assertThat(new SubmitResultCommand(null, null, null, null, null, null).toString()).contains("0 chars");
     }
 }

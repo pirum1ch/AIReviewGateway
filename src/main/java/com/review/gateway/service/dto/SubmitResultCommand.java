@@ -8,7 +8,8 @@ public record SubmitResultCommand(
         Integer promptTokens,
         Integer completionTokens,
         Long durationMs,
-        String model) {
+        String model,
+        String finishReason) {
 
     /**
      * F-DC-07: masked {@code toString()} — {@code rawResponse} is the full, untrusted raw LLM output
@@ -21,6 +22,6 @@ public record SubmitResultCommand(
         int rawResponseChars = rawResponse == null ? 0 : rawResponse.length();
         return "SubmitResultCommand[rawResponse=<masked, " + rawResponseChars + " chars>, promptTokens="
                 + promptTokens + ", completionTokens=" + completionTokens + ", durationMs=" + durationMs
-                + ", model=" + model + "]";
+                + ", model=" + model + ", finishReason=" + finishReason + "]";
     }
 }

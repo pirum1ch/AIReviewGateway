@@ -5,6 +5,7 @@ import com.review.gateway.model.Review;
 import com.review.gateway.model.ReviewJob;
 import com.review.gateway.model.ReviewResult;
 import com.review.gateway.model.enums.EventType;
+import com.review.gateway.model.enums.FinishReason;
 import com.review.gateway.model.enums.JobStatus;
 import com.review.gateway.model.enums.ReviewStatus;
 import com.review.gateway.repository.ReviewJobRepository;
@@ -83,7 +84,7 @@ public class ResultProcessor {
         CappedRawResponse capped = capRawResponseIfNeeded(command.rawResponse());
         SubmitResultCommand effectiveCommand = capped.truncated()
                 ? new SubmitResultCommand(capped.value(), command.promptTokens(), command.completionTokens(),
-                        command.durationMs(), command.model())
+                        command.durationMs(), command.model(), command.finishReason())
                 : command;
 
         JobPhaseOutcome outcome = requiresNewTransactionTemplate.execute(status ->
@@ -186,8 +187,25 @@ public class ResultProcessor {
                 : null;
         ReviewResult result = new ReviewResult(reviewId, chunkIndex, jobId, command.rawResponse(), null,
                 command.promptTokens(), command.completionTokens(), totalTokens,
-                command.durationMs(), command.model(), backendId);
+                command.durationMs(), command.model(), backendId, normalizeFinishReason(command.finishReason()));
         reviewResultRepository.save(result);
+    }
+
+    /**
+     * SRO-43/44: whitelist-parses the Worker-supplied {@code finish_reason} against {@link FinishReason}'s
+     * closed vocabulary — never {@code Enum.valueOf} on the raw wire text. {@code null} (an old Worker, or
+     * a backend/llama-server build that omits the field) is preserved as {@code null} rather than coerced
+     * to {@code "unknown"} — the migration's own documented meaning of {@code NULL} for this column.
+     */
+    private String normalizeFinishReason(String rawFinishReason) {
+        if (rawFinishReason == null) {
+            return null;
+        }
+        FinishReason parsed = FinishReason.fromWireValue(rawFinishReason);
+        if (parsed == FinishReason.UNKNOWN) {
+            log.debug("Unrecognized finish_reason (length={}); storing as 'unknown'", rawFinishReason.length());
+        }
+        return parsed.wireValue();
     }
 
     /**

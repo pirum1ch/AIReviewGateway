@@ -45,7 +45,7 @@ class SensitiveDtoToStringMaskingTest {
 
     @Test
     void resultRequestToStringNeverContainsTheRawResponse() {
-        ResultRequest request = new ResultRequest("worker-1", SECRET_RAW_RESPONSE, 10, 20, 500L, "model-x");
+        ResultRequest request = new ResultRequest("worker-1", SECRET_RAW_RESPONSE, 10, 20, 500L, "model-x", null);
 
         String rendered = request.toString();
 
@@ -59,7 +59,7 @@ class SensitiveDtoToStringMaskingTest {
 
     @Test
     void resultRequestAccessorStillReturnsTheFullRawResponseUnmasked() {
-        ResultRequest request = new ResultRequest("worker-1", SECRET_RAW_RESPONSE, 10, 20, 500L, "model-x");
+        ResultRequest request = new ResultRequest("worker-1", SECRET_RAW_RESPONSE, 10, 20, 500L, "model-x", null);
 
         assertThat(request.rawResponse()).isEqualTo(SECRET_RAW_RESPONSE);
     }
@@ -79,7 +79,7 @@ class SensitiveDtoToStringMaskingTest {
     @Test
     void toStringMaskingHandlesNullContentGracefully() {
         assertThat(new JobPayload(null, "v1", null, null, null, null).toString()).contains("0 chars");
-        assertThat(new ResultRequest("w", null, null, null, null, null).toString()).contains("0 chars");
+        assertThat(new ResultRequest("w", null, null, null, null, null, null).toString()).contains("0 chars");
     }
 
     /** V2 (diff chunking): {@code chunkContext} is just as sensitive (MR-author-controlled file names/prompt text) as {@code diff}. */

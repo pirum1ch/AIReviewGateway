@@ -61,6 +61,16 @@ public class ReviewResult {
     @Column(name = "backend_id", updatable = false)
     private Long backendId;
 
+    /**
+     * Structured Review Output (V5, SRO-42/43/44): llama-server's {@code finish_reason} for this
+     * chunk's completion, whitelist-parsed and normalized on the Gateway ({@link
+     * com.review.gateway.model.enums.FinishReason#fromWireValue}) before storage — never the raw wire
+     * text verbatim. {@code NULL} means "not reported" (an old Worker, or a backend/llama-server build
+     * that omits the field), preserved as {@code NULL} rather than coerced to {@code "unknown"}.
+     */
+    @Column(name = "finish_reason", updatable = false, length = 32)
+    private String finishReason;
+
     @Column(name = "created_at", nullable = false, updatable = false)
     private Instant createdAt;
 
@@ -70,7 +80,7 @@ public class ReviewResult {
 
     public ReviewResult(Long reviewId, Integer chunkIndex, Long jobId, String rawResponse, String summary,
                         Integer promptTokens, Integer completionTokens, Integer totalTokens, Long durationMs,
-                        String model, Long backendId) {
+                        String model, Long backendId, String finishReason) {
         this.reviewId = Objects.requireNonNull(reviewId, "reviewId");
         this.chunkIndex = chunkIndex != null ? chunkIndex : 0;
         this.jobId = jobId;
@@ -82,6 +92,7 @@ public class ReviewResult {
         this.durationMs = durationMs;
         this.model = model;
         this.backendId = backendId;
+        this.finishReason = finishReason;
     }
 
     @PrePersist
@@ -135,6 +146,10 @@ public class ReviewResult {
 
     public Long getBackendId() {
         return backendId;
+    }
+
+    public String getFinishReason() {
+        return finishReason;
     }
 
     public Instant getCreatedAt() {
