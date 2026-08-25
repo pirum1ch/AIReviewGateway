@@ -161,7 +161,13 @@ public class StructuredResponseParser {
 
         // SRO-32 step 4 (TRUNCATED), checked before NOT_JSON: known-truncated signals take precedence
         // over whatever readTree would have made of a (possibly coincidentally valid-looking) prefix.
-        boolean knownTruncated = "length".equals(finishReason) || rawResponseTruncated;
+        // F-SRO-08(a): compare the WHITELIST-PARSED value, not the raw wire string -- storeRawResult
+        // persists review_results.finish_reason via this same FinishReason.fromWireValue parse (trim +
+        // lowercase), so a differently-cased/whitespace-padded "Length"/"LENGTH"/" length" would otherwise
+        // be stored as "length" but NOT classified TRUNCATED here, falling through to a confusing
+        // NOT_JSON/SCHEMA_MISMATCH instead.
+        boolean knownTruncated = com.review.gateway.model.enums.FinishReason.fromWireValue(finishReason)
+                == com.review.gateway.model.enums.FinishReason.LENGTH || rawResponseTruncated;
         if (knownTruncated) {
             return ValidationResult.fail(FailureKind.TRUNCATED,
                     "finish_reason=" + (finishReason == null ? "null" : finishReason)

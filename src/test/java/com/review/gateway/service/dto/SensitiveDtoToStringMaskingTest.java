@@ -59,4 +59,32 @@ class SensitiveDtoToStringMaskingTest {
         assertThat(new CreateReviewCommand(1L, 2L, "sha", "base", null, "v1", 10).toString()).contains("0 chars");
         assertThat(new SubmitResultCommand(null, null, null, null, null, null).toString()).contains("0 chars");
     }
+
+    // ---- F-SRO-08(b): finishReason must never render CR/LF (or any other non-alphanumeric byte) raw ----
+
+    @Test
+    void submitResultCommandToStringNeverContainsRawCrLfFromFinishReason() {
+        String maliciousFinishReason = "stop\r\nINJECTED LOG LINE: fake event";
+        SubmitResultCommand command = new SubmitResultCommand("raw", 1, 2, 3L, "model-x", maliciousFinishReason);
+
+        String rendered = command.toString();
+
+        assertThat(rendered).doesNotContain("\r").doesNotContain("\n");
+        assertThat(rendered).doesNotContain("INJECTED LOG LINE");
+    }
+
+    @Test
+    void submitResultCommandToStringPreservesALegitimateFinishReasonValue() {
+        SubmitResultCommand command = new SubmitResultCommand("raw", 1, 2, 3L, "model-x", "length");
+
+        assertThat(command.toString()).contains("finishReason=length");
+    }
+
+    @Test
+    void submitResultCommandAccessorStillReturnsTheRawFinishReasonUnmasked() {
+        String maliciousFinishReason = "stop\r\nINJECTED";
+        SubmitResultCommand command = new SubmitResultCommand("raw", 1, 2, 3L, "model-x", maliciousFinishReason);
+
+        assertThat(command.finishReason()).isEqualTo(maliciousFinishReason);
+    }
 }

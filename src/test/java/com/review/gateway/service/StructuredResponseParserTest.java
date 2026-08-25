@@ -161,6 +161,30 @@ class StructuredResponseParserTest {
     }
 
     @Test
+    void finishReasonLengthIsClassifiedTruncatedRegardlessOfCaseOrWhitespace() {
+        // F-SRO-08(a): must compare the whitelist-PARSED value (FinishReason.fromWireValue: trim +
+        // lowercase), not the raw wire string -- the value actually STORED in review_results.finish_reason
+        // goes through that same parse, so a differently-cased/padded wire value must classify identically
+        // to "length" here, or the DB row and the classification silently disagree.
+        StructuredResponseParser parser = newParser();
+
+        for (String raw : new String[] {"Length", "LENGTH", " length", "length "}) {
+            ValidationResult result = parser.validate("{}", List.of("A.java"), false, raw, null, defaultOptions(), NO_EFFECTIVE_CAP);
+            assertThat(result.failure().kind()).as("finishReason=%s", raw).isEqualTo(FailureKind.TRUNCATED);
+        }
+    }
+
+    @Test
+    void finishReasonStopIsNotClassifiedTruncated() {
+        String raw = "{\"files\":{\"A.java\":{\"findings\":[],\"summary\":\"s\"}},\"summary\":\"overall\"}";
+        StructuredResponseParser parser = newParser();
+
+        ValidationResult result = parser.validate(raw, List.of("A.java"), false, "stop", null, defaultOptions(), NO_EFFECTIVE_CAP);
+
+        assertThat(result.isSuccess()).isTrue();
+    }
+
+    @Test
     void rawResponseTruncatedFlagIsClassifiedTruncated() {
         StructuredResponseParser parser = newParser();
 
