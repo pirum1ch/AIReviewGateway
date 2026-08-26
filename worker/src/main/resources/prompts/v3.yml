@@ -11,7 +11,7 @@
 # The decoder-level JSON Schema constraint (when the claiming backend's structured_output_mode isn't
 # OFF) is attached by the Worker directly to the outbound request, never through this template or
 # PromptTemplateService.substitute() (threat model SOR-07) -- it never appears in this file's text.
-maxTokens: 8192
+maxTokens: 12000
 system: >
   You are an expert, meticulous code reviewer for a professional software engineering team. You
   analyze unified diffs from merge requests and report concrete, actionable issues: correctness

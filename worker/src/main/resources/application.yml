@@ -80,7 +80,7 @@ llama:
   url: ${LLAMA_URL:http://127.0.0.1:8000}   # URL локального (или разрешённого нелокального, см. allow-non-loopback) llama-server, к которому Worker отправляет запросы на инференс
   model: ${LLAMA_MODEL}            # имя/идентификатор модели, которое передаётся в запросе к llama-server
   temperature: ${LLAMA_TEMPERATURE:0.1}   # параметр temperature для генерации LLM — степень случайности/творчества ответа (ниже — более детерминированный ответ)
-  max-tokens: ${LLAMA_MAX_TOKENS:4096}    # максимальное число токенов в ответе, которое Worker запрашивает у llama-server, если шаблон промпта (prompts/*.yml) не переопределяет своё значение maxTokens (например, v3.yml -> 8192) — ЧАСТЬ ОБЩЕГО БЮДЖЕТА ТОКЕНОВ, должна расти вместе с gateway.structured.answer-reserve для v3 (см. сводную таблицу в DEPLOYMENT.md)
+  max-tokens: ${LLAMA_MAX_TOKENS:12000}    # максимальное число токенов в ответе, которое Worker запрашивает у llama-server, если шаблон промпта (prompts/*.yml) не переопределяет своё значение maxTokens (например, v3.yml -> 8192) — ЧАСТЬ ОБЩЕГО БЮДЖЕТА ТОКЕНОВ, должна расти вместе с gateway.structured.answer-reserve для v3 (см. сводную таблицу в DEPLOYMENT.md)
   # WSR-06 (SHOULD): a non-loopback llama.url only warns at startup unless this is set, since the
   # llama-server socket is unauthenticated by design.
   # WSR-06 (рекомендация): если llama.url указывает не на loopback-адрес, при старте выводится только

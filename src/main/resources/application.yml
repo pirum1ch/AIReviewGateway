@@ -81,9 +81,9 @@ gateway:
   # всеми связями/неравенствами между ними — в DEPLOYMENT.md, раздел "Бюджет LLM-токенов:
   # сводная таблица". Смотрите её целиком перед тем, как менять любое из значений ниже.
   diff:
-    context-window: 16384          # размер контекстного окна используемой LLM в токенах — база для расчёта бюджетов на промпт/diff/ответ
-    prompt-reserve: 2000            # сколько токенов контекстного окна резервируется под системный промпт
-    answer-reserve: 4000            # сколько токенов контекстного окна резервируется под ответ модели
+    context-window: 65536          # размер контекстного окна используемой LLM в токенах — база для расчёта бюджетов на промпт/diff/ответ
+    prompt-reserve: 10000            # сколько токенов контекстного окна резервируется под системный промпт
+    answer-reserve: 12000            # сколько токенов контекстного окна резервируется под ответ модели
     max-diff-tokens: 10000          # derived cap; per-chunk budget as of V2 diff chunking (CSR-05) — производный предел: максимум токенов diff на один чанк/запрос к LLM
     chars-per-token: 4              # heuristic for the token estimator — эвристика "символов на токен", применяемая для оценки числа токенов без реального токенайзера
     # F-DC-04 fix: это значение ОБЯЗАНО соответствовать формуле CSR-02 (max-chunks * max-diff-tokens *
@@ -187,7 +187,7 @@ gateway:
   # умолчанию -- оператор добавляет его вручную только после того, как весь парк Worker'ов уже несёт
   # v3.yml (порядок разворачивания: сначала Worker'ы, потом Gateway, §11).
   review:
-    allowed-prompt-versions: ${ALLOWED_PROMPT_VERSIONS:v1,v2}   # allowlist значений promptVersion, принимаемых POST /reviews; "v3" добавляется явно оператором после разворачивания Worker'ов с v3.yml
+    allowed-prompt-versions: ${ALLOWED_PROMPT_VERSIONS:v1,v2,v3}   # allowlist значений promptVersion, принимаемых POST /reviews; "v3" добавляется явно оператором после разворачивания Worker'ов с v3.yml
 
 # ПРИМЕЧАНИЕ: gateway.security.*/gateway.gitlab.token ОБЯЗАНЫ быть длиной >=32 символов (SR-01), а
 # gateway.gitlab.base-url ОБЯЗАН начинаться с https:// (SR-15) -- иначе GatewayProperties прерывает

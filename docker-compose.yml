@@ -50,6 +50,8 @@ services:
       POSTGRES_DB: review_gateway
       POSTGRES_USER: review_gateway
       POSTGRES_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD}
+    ports:
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
