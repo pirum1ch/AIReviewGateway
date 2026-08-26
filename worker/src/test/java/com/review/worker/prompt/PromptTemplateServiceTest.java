@@ -404,11 +404,15 @@ class PromptTemplateServiceTest {
     // ---- Structured Review Output: v3.yml (SRO-60) ----
 
     @Test
-    void v3TemplateResolvesWithMaxTokens8192() {
+    void v3TemplateResolvesWithItsOwnMaxTokens() {
+        // Was pinned to the shipped default (8192); v3.yml's maxTokens has since been raised to 12000
+        // (live-tuned to keep pace with gateway.diff.answer-reserve, which was also raised to 12000 --
+        // see DEPLOYMENT.md's "Бюджет LLM-токенов" table). Still a literal, still must be updated by
+        // hand if v3.yml's maxTokens changes again -- there is no dynamic cross-check.
         ResolvedPrompt resolved = service.resolve("v3", "diff --git a/A.java b/A.java\n+x();",
                 "<<<FILES_IN_THIS_PART>>>\nA.java\n<<<END_FILES_IN_THIS_PART>>>\n");
 
-        assertThat(resolved.maxTokens()).isEqualTo(8192);
+        assertThat(resolved.maxTokens()).isEqualTo(12000);
         assertThat(resolved.messages()).hasSize(2);
         String userMessage = resolved.messages().get(1).content();
         assertThat(userMessage).contains("A.java");
