@@ -255,6 +255,13 @@ public class GatewayProperties {
                             + "gateway.prompt.limits.min-diff-budget-tokens (" + minDiffBudgetTokens
                             + ") — refusing to start");
         }
+        log.info("Structured Review Output budget check passed: context-window={} - prompt-reserve={} - "
+                        + "structured.answer-reserve={} - coverageReserveTokens={} (max-files-per-chunk={}, "
+                        + "max-path-chars={}){} = {} remaining diff-token budget per chunk (min required: {})",
+                diff.getContextWindow(), diff.getPromptReserve(), structured.getAnswerReserve(),
+                coverageReserveTokens, structured.getMaxFilesPerChunk(), structured.getMaxPathChars(),
+                prompt.isEnabled() ? " - max-system-prompt-tokens=" + prompt.getLimits().getMaxSystemPromptTokens() : "",
+                remainingDiffBudget, minDiffBudgetTokens);
     }
 
     /**
