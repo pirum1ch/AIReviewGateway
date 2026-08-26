@@ -886,6 +886,59 @@ allowlist gate is application-level, not a schema constraint).
 - No new grant is needed (§3) — the existing `review_gateway` role already has `UPDATE` on `backends` and
   `INSERT` on `review_results`.
 
+### Бюджет LLM-токенов: сводная таблица
+
+Gateway и Worker — два независимых процесса (`chore/config-consolidation`: не обязательно даже на одной
+машине — см. [§1](#1-architecture-overview)), поэтому у них физически не может быть одного общего файла
+конфигурации. Все параметры ниже вместе формируют **один** бюджет контекстного окна модели, но живут в
+разных файлах: `src/main/resources/application.yml` (Gateway, блок `gateway.diff.*`/`gateway.structured.*`/
+`gateway.prompt.limits.*` — секция "§B Бюджет LLM-токенов" в файле), `worker/src/main/resources/
+application.yml` (блок `llama.*`/`worker.limits.*` — секция "§B" там же) и `worker/src/main/resources/
+prompts/*.yml` (`maxTokens` на шаблон). Эта таблица — единственное место, где вся картина собрана вместе;
+при изменении любого значения ниже сверяйтесь с ней целиком, а не только с локальным комментарием в
+одном файле.
+
+**Нет автоматической проверки, которая охватывала бы оба процесса сразу** — Gateway не знает во время
+своего старта, какой `maxTokens` реально настроен на удалённых Worker'ах (и наоборот). Единственный способ
+свериться сегодня — сравнить два независимых лога:
+- Gateway при каждом успешном старте пишет INFO-строку `"Structured Review Output budget check passed:
+  ..."` (`GatewayProperties.validateStructuredOnStartup`) с разбивкой всей формулы бюджета.
+- Worker при каждом старте пишет по одной INFO-строке `"Prompt template '<version>': effective
+  maxTokens=..."` на каждый найденный шаблон (`PromptTemplateService.logResolvedTemplateBudgetsOnStartup`).
+
+| Параметр | Процесс / файл | Дефолт | За что отвечает | С чем связан |
+|---|---|---|---|---|
+| `gateway.diff.context-window` | Gateway | 16384 | Общий размер контекстного окна модели — база для всех расчётов ниже | Должен совпадать с реальным контекстным окном модели на `llama-server` |
+| `gateway.diff.prompt-reserve` | Gateway | 2000 | Резерв под системный промпт для v1/v2 (и как база, когда Prompt Manager выключен) | Вычитается из `context-window` |
+| `gateway.diff.answer-reserve` | Gateway | 4000 | Резерв под ответ модели для v1/v2 | `gateway.structured.answer-reserve` обязан быть ≥ этого значения (проверяется на старте) |
+| `gateway.diff.max-diff-tokens` | Gateway | 10000 | Потолок на diff в одном чанке | Независимый potолок поверх расчёта по окну (см. CSR-02 в комментарии рядом с параметром) |
+| `gateway.diff.chars-per-token` | Gateway | 4 | Эвристика перевода символов diff'а в токены (нет настоящего токенизатора) | Используется во всех формулах ниже, включая `coverageReserveTokens` |
+| `gateway.diff.max-paths-per-section` | Gateway | 64 | Верхняя граница путей, извлекаемых из ОДНОЙ секции diff (memory-safety, SRO-66a) | Должен быть ≥ `gateway.structured.max-files-per-chunk` (проверяется на старте) |
+| `gateway.prompt.limits.max-system-prompt-tokens` | Gateway | 6000 | Потолок размера промпта, собираемого Prompt Manager'ом из Git | Учитывается в формуле бюджета, только если `gateway.prompt.enabled=true` |
+| `gateway.prompt.limits.min-diff-budget-tokens` | Gateway | 1000 | Минимальный порог остатка бюджета под сам diff — если меньше, Gateway отказывается стартовать | Правая часть неравенства формулы бюджета (см. §8c выше) |
+| `gateway.structured.max-files-per-chunk` | Gateway | 40 | Верхняя граница файлов в одном структурированном чанке | Входит в формулу `coverageReserveTokens` |
+| `gateway.structured.max-path-chars` | Gateway | 256 | Максимальная длина одного пути-ключа схемы | Входит в формулу `coverageReserveTokens`; должен быть ≤ 300 |
+| `gateway.structured.max-schema-bytes` | Gateway | 65536 | Backstop-потолок размера самой JSON-схемы | Должен быть **меньше** `worker.limits.max-constraint-bytes` с запасом на wire-обёртку |
+| `gateway.structured.max-findings-per-file` | Gateway | 20 | Потолок числа находок на файл | Влияет на реальный размер ответа v3 (не входит в формулу бюджета напрямую) |
+| `gateway.structured.max-comment-chars` | Gateway | 1200 | `maxLength` поля `comment` одной находки | Влияет на реальный размер ответа v3 |
+| `gateway.structured.max-suggestion-chars` | Gateway | 2000 | `maxLength` поля `suggestion` одной находки | Влияет на реальный размер ответа v3 |
+| `gateway.structured.answer-reserve` | Gateway | 8000 | Резерв под ответ модели для v3 (вместо `diff.answer-reserve`) | Должен расти вместе с `v3.yml`'s `maxTokens` (Worker); обязан быть ≥ `gateway.diff.answer-reserve` |
+| `llama.max-tokens` | Worker | 4096 | Глобальный дефолт `max_tokens`, если конкретный шаблон промпта его не переопределяет | Используется `v1.yml`/`v2.yml` (своего значения не задают) |
+| `v3.yml` → `maxTokens` | Worker (файл шаблона) | 8192 | Реальный потолок токенов, которые модель может сгенерировать для v3-ответа | Должен быть ≥ `gateway.structured.answer-reserve` — иначе Gateway резервирует бюджет под ответ длиннее, чем Worker реально позволит модели сгенерировать |
+| `worker.limits.max-diff-bytes` | Worker | 262144 | Байтовый потолок на diff + chunkContext + systemMessages суммарно | Независим от токен-формулы Gateway'я, отдельная защита на стороне Worker'а (WSR-03) |
+| `worker.limits.max-response-bytes` | Worker | 200000 | Байтовый потолок на ответ LLM, который Worker готов принять | Тот же порядок величины, что и `gateway.publish.max-raw-response-length` (200000, §E в `application.yml`) — оба независимо ограничивают одно и то же на разных концах |
+| `worker.limits.max-system-messages` | Worker | 8 | Потолок числа system-сообщений от Prompt Manager'а | Независим от `gateway.prompt.limits.max-sections` (WSR-03 sibling) |
+| `worker.limits.max-constraint-bytes` | Worker | 69632 | Байтовый потолок на присланную Gateway'ем JSON-схему/constraint | Обязан **превышать** `gateway.structured.max-schema-bytes` на размер самой большой wire-обёртки (~70 байт) |
+
+**Формула итогового бюджета** (то же самое, что печатает Gateway в лог при старте):
+
+```
+context-window − prompt-reserve − structured.answer-reserve − coverageReserveTokens(max-files-per-chunk, max-path-chars, chars-per-token)
+  − (prompt.enabled ? max-system-prompt-tokens : 0)  ≥  min-diff-budget-tokens
+```
+
+Если меняете любой параметр слева — сверяйтесь с этой таблицей на предмет других параметров, которые с ним связаны, ДО перезапуска, а не после отказа стартовать.
+
 ### Monitored residual: LLM-compute amplification on validation failure
 
 `gateway.structured.max-validation-attempts` (a per-Review override for the retry-attempt budget on
