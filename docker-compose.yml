@@ -50,6 +50,8 @@ services:
       POSTGRES_DB: review_gateway
       POSTGRES_USER: review_gateway
       POSTGRES_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD}
+    ports:
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
@@ -92,7 +94,7 @@ services:
       # Prompt Manager block above: Compose only forwards variables listed here. Left at their
       # off-by-default-risk values (v3 not allowlisted, no backend constrained) unless the operator
       # explicitly exports the corresponding host env var (see README.md's promptVersion v3 section).
-      ALLOWED_PROMPT_VERSIONS: ${ALLOWED_PROMPT_VERSIONS:-v1,v2}
+      ALLOWED_PROMPT_VERSIONS: ${ALLOWED_PROMPT_VERSIONS:-v3}
       STRUCTURED_OUTPUT_ENABLED: ${STRUCTURED_OUTPUT_ENABLED:-true}
       STRUCTURED_OUTPUT_DEFAULT_MODE: ${STRUCTURED_OUTPUT_DEFAULT_MODE:-OFF}
     ports:
