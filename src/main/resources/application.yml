@@ -83,7 +83,7 @@ gateway:
   diff:
     context-window: 65536          # размер контекстного окна используемой LLM в токенах — база для расчёта бюджетов на промпт/diff/ответ
     prompt-reserve: 10000            # сколько токенов контекстного окна резервируется под системный промпт
-    answer-reserve: 12000            # сколько токенов контекстного окна резервируется под ответ модели -- ОДНО значение и для v1/v2, и для structured (v3) промптов (chore/answer-reserve-consolidation: раньше был отдельный gateway.structured.answer-reserve, объединено после повторных ошибок рассинхрона). Должно расти вместе с llama.max-tokens/v3.yml → maxTokens на стороне Worker'а (см. сводную таблицу в DEPLOYMENT.md)
+    answer-reserve: 12000            # сколько токенов контекстного окна резервируется под ответ модели
     max-diff-tokens: 10000          # derived cap; per-chunk budget as of V2 diff chunking (CSR-05) — производный предел: максимум токенов diff на один чанк/запрос к LLM
     chars-per-token: 4              # heuristic for the token estimator — эвристика "символов на токен", применяемая для оценки числа токенов без реального токенайзера
     # F-DC-04 fix: это значение ОБЯЗАНО соответствовать формуле CSR-02 (max-chunks * max-diff-tokens *
@@ -115,8 +115,7 @@ gateway:
     on-invalid-response: RETRY_THEN_FAIL   # SRO-38/68: RETRY_THEN_FAIL (по умолчанию) | RETRY_THEN_FALLBACK (emergency escape hatch, публикует только генуинный JSON-массив с меткой "UNVALIDATED")
     include-diff-context: true   # SRO-51: включает извлечение и рендер блока ```diff с контекстом вокруг строки finding
     diff-context-lines: 3        # SRO-51: число строк контекста с каждой стороны от строки finding
-    # answer-reserve для structured (v3) больше не отдельный параметр -- используется общий
-    # gateway.diff.answer-reserve выше (chore/answer-reserve-consolidation).
+    answer-reserve: 8000         # §10: заменяет gateway.diff.answer-reserve при расчёте бюджета ТОЛЬКО для структурированных версий промпта (гарантированная форма ответа многословнее обычного JSON-массива) — ЧАСТЬ ОБЩЕГО БЮДЖЕТА ТОКЕНОВ, должна расти вместе с worker/.../prompts/v3.yml → maxTokens (см. сводную таблицу в DEPLOYMENT.md)
 
   # ---- §C Prompt Manager (V3, опционально) -----------------------------------------------------
   # gateway.prompt.limits.* ниже — тоже часть бюджета LLM-токенов (см. §B и сводную таблицу в
