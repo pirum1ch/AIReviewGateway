@@ -162,15 +162,14 @@ public class ReviewService {
         // connection or a row lock.
         PromptManager.PromptResolution promptResolution = promptManager.resolve(command.projectId());
 
-        // F-SRO-03: the structured-version-specific answer reserve (gateway.structured.answer-reserve,
-        // larger than v1/v2's to make room for the guaranteed-shape JSON response) must size BOTH this
-        // pre-chunking prompt-fits check and DiffChunker.split's runtime chunk budget below -- computed
-        // once, before either call, so they cannot diverge from each other or from the startup assertion
+        // F-SRO-03: the answer reserve must size BOTH this pre-chunking prompt-fits check and
+        // DiffChunker.split's runtime chunk budget below -- computed once, before either call, so they
+        // cannot diverge from each other or from the startup assertion
         // (GatewayProperties.validateStructuredOnStartup) that already checks this same arithmetic.
+        // chore/answer-reserve-consolidation: a single gateway.diff.answer-reserve now sizes both v1/v2
+        // and structured (v3) responses -- no branch needed.
         boolean structured = StructuredOutputSupport.isStructured(command.promptVersion());
-        int answerReserveTokens = structured
-                ? properties.getStructured().getAnswerReserve()
-                : properties.getDiff().getAnswerReserve();
+        int answerReserveTokens = properties.getDiff().getAnswerReserve();
         diffSizeValidator.assertPromptFits(promptResolution.estimatedTokens(), answerReserveTokens);
 
         int maxFilesPerChunk = structured ? properties.getStructured().getMaxFilesPerChunk() : 0;

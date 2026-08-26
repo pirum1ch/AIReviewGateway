@@ -113,14 +113,16 @@ public class DiffChunker {
      * v1/v2 chunk boundaries are byte-for-byte unchanged (§8).
      *
      * <p><b>F-SRO-03 (appsec SAST fix round, SRO-64d):</b> for a structured prompt version ({@code
-     * maxFilesPerChunk > 0}), the per-chunk budget is sized with {@code gateway.structured.answer-reserve}
-     * (not {@code gateway.diff.answer-reserve}) and the header reserve is the SRO-64d-computed coverage
-     * block reserve ({@link GatewayProperties#coverageReserveTokens} — the exact formula {@code
-     * GatewayProperties.validateStructuredOnStartup} already asserts at boot), not {@code
+     * maxFilesPerChunk > 0}), the per-chunk budget's answer reserve is {@code gateway.diff.answer-reserve}
+     * — the SAME single value v1/v2 uses (chore/answer-reserve-consolidation: a formerly separate {@code
+     * gateway.structured.answer-reserve} was merged into this one after repeatedly causing exactly the
+     * misconfiguration its own startup check existed to catch) — and the header reserve is the
+     * SRO-64d-computed coverage block reserve ({@link GatewayProperties#coverageReserveTokens} — the exact
+     * formula {@code GatewayProperties.validateStructuredOnStartup} already asserts at boot), not {@code
      * gateway.diff.chunk-header-reserve-tokens} — including for the single-chunk shortcut, which for a
-     * structured version still renders a coverage block even though {@code chunkCount == 1}. Both are
-     * no-ops for every non-structured prompt version ({@code maxFilesPerChunk <= 0}), so v1/v2 chunk
-     * boundaries stay byte-for-byte unchanged (§8).
+     * structured version still renders a coverage block even though {@code chunkCount == 1}. The header
+     * reserve is a no-op for every non-structured prompt version ({@code maxFilesPerChunk <= 0}), so v1/v2
+     * chunk boundaries stay byte-for-byte unchanged (§8).
      *
      * @throws DiffTooLargeException if bin-packing would need more than {@code gateway.diff.max-chunks}
      *                                 chunks, if a single file's diff (even split at hunk boundaries, with
@@ -133,12 +135,12 @@ public class DiffChunker {
         boolean structuredVersion = maxFilesPerChunk > 0;
         int charsPerToken = Math.max(1, properties.getDiff().getCharsPerToken());
 
-        // F-SRO-03: the structured-specific answer reserve and the computed coverage-block header
-        // reserve, threaded into the same arithmetic DiffSizeValidator/binPack already use for v1/v2 --
-        // previously these existed only in GatewayProperties' startup assertion and were never read here.
-        int answerReserveTokens = structuredVersion
-                ? properties.getStructured().getAnswerReserve()
-                : properties.getDiff().getAnswerReserve();
+        // F-SRO-03: the computed coverage-block header reserve, threaded into the same arithmetic
+        // DiffSizeValidator/binPack already use for v1/v2 -- previously it existed only in
+        // GatewayProperties' startup assertion and was never read here. The answer reserve itself is now
+        // a single gateway.diff.answer-reserve value regardless of prompt version
+        // (chore/answer-reserve-consolidation) -- no branch needed.
+        int answerReserveTokens = properties.getDiff().getAnswerReserve();
         int headerReserveTokens = structuredVersion
                 ? (int) Math.min(Integer.MAX_VALUE, GatewayProperties.coverageReserveTokens(
                         maxFilesPerChunk, properties.getStructured().getMaxPathChars(), charsPerToken))

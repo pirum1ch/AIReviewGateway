@@ -70,16 +70,9 @@ class GatewayPropertiesStructuredValidationTest {
                 .hasMessageContaining("max-files-per-chunk");
     }
 
-    @Test
-    void structuredAnswerReserveMustBeAtLeastDiffAnswerReserve() {
-        GatewayProperties properties = validProperties();
-        properties.getStructured().setAnswerReserve(1000); // below the default diff.answer-reserve (4000)
-
-        assertThatThrownBy(properties::validateOnStartup)
-                .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("structured.answer-reserve")
-                .hasMessageContaining("diff.answer-reserve");
-    }
+    // structuredAnswerReserveMustBeAtLeastDiffAnswerReserve (Point 3) removed:
+    // chore/answer-reserve-consolidation merged gateway.structured.answer-reserve into
+    // gateway.diff.answer-reserve -- there is no longer a second value to compare against.
 
     @Test
     void coverageBlockMustFitTheRemainingBudget() {
@@ -100,11 +93,17 @@ class GatewayPropertiesStructuredValidationTest {
      */
     @Test
     void promptManagerTermIsIncludedWhenPromptManagerIsEnabled() {
+        // chore/answer-reserve-consolidation: the shipped default budget without Prompt Manager is now
+        // 16384 - 2000 - 4000(diff.answer-reserve, shared with structured since the merge) - 2670
+        // (coverageReserveTokens) = 7714 -- comfortably above min-diff-budget-tokens (1000), where it
+        // used to be negative back when structured used its own, larger 8000 default. A
+        // max-system-prompt-tokens value has to exceed 7714 - 1000 = 6714 to still exercise this test's
+        // actual point: that the Prompt Manager term is included in the formula at all.
         GatewayProperties properties = validProperties();
         properties.getPrompt().setEnabled(true);
         properties.getGitlab().setPromptToken("e".repeat(32));
         properties.getPrompt().getCorporate().setProject("group/project");
-        properties.getPrompt().getLimits().setMaxSystemPromptTokens(6000);
+        properties.getPrompt().getLimits().setMaxSystemPromptTokens(8000);
 
         assertThatThrownBy(properties::validateOnStartup)
                 .isInstanceOf(IllegalStateException.class)

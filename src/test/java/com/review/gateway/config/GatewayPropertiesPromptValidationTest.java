@@ -48,14 +48,6 @@ class GatewayPropertiesPromptValidationTest {
         properties.getPrompt().getCorporate().setRef("main");
         properties.getPrompt().getCorporate().setBasePromptPath("prompts/base-system-prompt.md");
         properties.getPrompt().getCorporate().setReviewRulesPath("prompts/review-rules.md");
-        // Structured Review Output (threat model SOR-13): the shipped structured.answer-reserve default
-        // (8000) does not fit alongside a 6000-token system prompt at the shipped context-window -- that
-        // is the exact, intended SOR-13 startup-refusal scenario (see
-        // GatewayPropertiesStructuredValidationTest#promptManagerTermIsIncludedWhenPromptManagerIsEnabled).
-        // This file tests Prompt Manager validation specifically, so its fixture pins
-        // structured.answer-reserve at its minimum legal value (equal to diff.answer-reserve) to stay
-        // budget-consistent without that being the thing under test here.
-        properties.getStructured().setAnswerReserve(properties.getDiff().getAnswerReserve());
         return properties;
     }
 

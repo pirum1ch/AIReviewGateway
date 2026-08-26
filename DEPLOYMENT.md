@@ -871,10 +871,11 @@ allowlist gate is application-level, not a schema constraint).
   A single `UPDATE`, no restart — this is deliberately a data change, not a config/redeploy, so a canary
   rollout (see the rollout ladder below) never needs a Gateway restart between stages.
 - **Cross-module coupling, both silent on mismatch (no startup check spans both processes):**
-  - `gateway.structured.answer-reserve` (Gateway, default `8000`) must stay `≥` `v3.yml`'s `maxTokens`
-    minus some margin, ideally equal to it (shipped: both `8000`/`8192`, close enough by design) — a
-    mismatch doesn't fail startup on either side; it just risks a truncated completion under a large chunk
-    if the Gateway's budget assumption is smaller than what the Worker actually requests.
+  - `gateway.diff.answer-reserve` (Gateway — used for both v1/v2 and structured/v3 since
+    `chore/answer-reserve-consolidation`, see the table below) must stay `≥` `v3.yml`'s `maxTokens`
+    minus some margin, ideally equal to it — a mismatch doesn't fail startup on either side; it just
+    risks a truncated completion under a large chunk if the Gateway's budget assumption is smaller than
+    what the Worker actually requests.
   - `gateway.structured.max-schema-bytes` (Gateway, default `65536`) must stay **below**
     `worker.limits.max-constraint-bytes` (Worker, default `69632`) by at least the largest wire-wrapper
     overhead — the shipped defaults already satisfy this (69632 = 65536 + 4096 headroom). If you change
@@ -910,7 +911,7 @@ prompts/*.yml` (`maxTokens` на шаблон). Эта таблица — еди
 |---|---|---|---|---|
 | `gateway.diff.context-window` | Gateway | 16384 | Общий размер контекстного окна модели — база для всех расчётов ниже | Должен совпадать с реальным контекстным окном модели на `llama-server` |
 | `gateway.diff.prompt-reserve` | Gateway | 2000 | Резерв под системный промпт для v1/v2 (и как база, когда Prompt Manager выключен) | Вычитается из `context-window` |
-| `gateway.diff.answer-reserve` | Gateway | 4000 | Резерв под ответ модели для v1/v2 | `gateway.structured.answer-reserve` обязан быть ≥ этого значения (проверяется на старте) |
+| `gateway.diff.answer-reserve` | Gateway | 4000 | Резерв под ответ модели — ОДНО значение для v1/v2 И для structured (v3); раньше был отдельный `gateway.structured.answer-reserve`, объединены (`chore/answer-reserve-consolidation`) после повторных ошибок рассинхрона между ними | Должен расти вместе с `v3.yml`'s `maxTokens` (Worker) |
 | `gateway.diff.max-diff-tokens` | Gateway | 10000 | Потолок на diff в одном чанке | Независимый potолок поверх расчёта по окну (см. CSR-02 в комментарии рядом с параметром) |
 | `gateway.diff.chars-per-token` | Gateway | 4 | Эвристика перевода символов diff'а в токены (нет настоящего токенизатора) | Используется во всех формулах ниже, включая `coverageReserveTokens` |
 | `gateway.diff.max-paths-per-section` | Gateway | 64 | Верхняя граница путей, извлекаемых из ОДНОЙ секции diff (memory-safety, SRO-66a) | Должен быть ≥ `gateway.structured.max-files-per-chunk` (проверяется на старте) |
@@ -922,9 +923,8 @@ prompts/*.yml` (`maxTokens` на шаблон). Эта таблица — еди
 | `gateway.structured.max-findings-per-file` | Gateway | 20 | Потолок числа находок на файл | Влияет на реальный размер ответа v3 (не входит в формулу бюджета напрямую) |
 | `gateway.structured.max-comment-chars` | Gateway | 1200 | `maxLength` поля `comment` одной находки | Влияет на реальный размер ответа v3 |
 | `gateway.structured.max-suggestion-chars` | Gateway | 2000 | `maxLength` поля `suggestion` одной находки | Влияет на реальный размер ответа v3 |
-| `gateway.structured.answer-reserve` | Gateway | 8000 | Резерв под ответ модели для v3 (вместо `diff.answer-reserve`) | Должен расти вместе с `v3.yml`'s `maxTokens` (Worker); обязан быть ≥ `gateway.diff.answer-reserve` |
 | `llama.max-tokens` | Worker | 4096 | Глобальный дефолт `max_tokens`, если конкретный шаблон промпта его не переопределяет | Используется `v1.yml`/`v2.yml` (своего значения не задают) |
-| `v3.yml` → `maxTokens` | Worker (файл шаблона) | 8192 | Реальный потолок токенов, которые модель может сгенерировать для v3-ответа | Должен быть ≥ `gateway.structured.answer-reserve` — иначе Gateway резервирует бюджет под ответ длиннее, чем Worker реально позволит модели сгенерировать |
+| `v3.yml` → `maxTokens` | Worker (файл шаблона) | 8192 | Реальный потолок токенов, которые модель может сгенерировать для v3-ответа | Должен быть ≥ `gateway.diff.answer-reserve` — иначе Gateway резервирует бюджет под ответ длиннее, чем Worker реально позволит модели сгенерировать |
 | `worker.limits.max-diff-bytes` | Worker | 262144 | Байтовый потолок на diff + chunkContext + systemMessages суммарно | Независим от токен-формулы Gateway'я, отдельная защита на стороне Worker'а (WSR-03) |
 | `worker.limits.max-response-bytes` | Worker | 200000 | Байтовый потолок на ответ LLM, который Worker готов принять | Тот же порядок величины, что и `gateway.publish.max-raw-response-length` (200000, §E в `application.yml`) — оба независимо ограничивают одно и то же на разных концах |
 | `worker.limits.max-system-messages` | Worker | 8 | Потолок числа system-сообщений от Prompt Manager'а | Независим от `gateway.prompt.limits.max-sections` (WSR-03 sibling) |
@@ -933,7 +933,7 @@ prompts/*.yml` (`maxTokens` на шаблон). Эта таблица — еди
 **Формула итогового бюджета** (то же самое, что печатает Gateway в лог при старте):
 
 ```
-context-window − prompt-reserve − structured.answer-reserve − coverageReserveTokens(max-files-per-chunk, max-path-chars, chars-per-token)
+context-window − prompt-reserve − answer-reserve − coverageReserveTokens(max-files-per-chunk, max-path-chars, chars-per-token)
   − (prompt.enabled ? max-system-prompt-tokens : 0)  ≥  min-diff-budget-tokens
 ```
 

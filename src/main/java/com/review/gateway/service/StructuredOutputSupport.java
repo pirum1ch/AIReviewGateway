@@ -7,9 +7,9 @@ import java.util.Set;
  * Output version — i.e. whether {@code DiffChunker} applies {@code max-files-per-chunk} and the
  * SRO-66b edge bounds, {@code POST /reviews} runs the SRO-16/17/65 edge validation, {@code
  * QueueManager.claimJobRow} renders the SRO-64 coverage block and may build a decoder constraint,
- * {@code StructuredResponseParser} (not {@code CommentParser}) parses the result, {@code
- * gateway.structured.answer-reserve} and the computed coverage header reserve apply, and the SRO-68
- * fallback restriction applies.
+ * {@code StructuredResponseParser} (not {@code CommentParser}) parses the result, the computed coverage
+ * header reserve applies (the answer reserve itself, {@code gateway.diff.answer-reserve}, is shared with
+ * v1/v2 since chore/answer-reserve-consolidation), and the SRO-68 fallback restriction applies.
  *
  * <p>{@code reviews.prompt_version} already persists this immutably at Review-creation time, so the
  * decision is stable and reconstructible for the whole life of a Review, including across Gateway

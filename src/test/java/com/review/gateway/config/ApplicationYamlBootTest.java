@@ -60,20 +60,17 @@ class ApplicationYamlBootTest {
 
     @Test
     void promptManagerOptedInWithItsOwnDocumentedEnvVarsAlsoBootsCleanly() {
+        // chore/answer-reserve-consolidation: this test used to also override
+        // gateway.structured.answer-reserve to a value consistent with gateway.diff.answer-reserve, to
+        // stay under the (since-removed) SOR-13 budget check without that being the thing under test
+        // here. That override is gone along with the property it targeted -- the shipped
+        // gateway.diff.answer-reserve default (4000, used for both v1/v2 and structured now) already
+        // satisfies the budget check on its own with Prompt Manager enabled at its shipped
+        // max-system-prompt-tokens (6000), so no override is needed.
         runner.withPropertyValues(
                         "PROMPT_MANAGER_ENABLED=true",
                         "GITLAB_PROMPT_TOKEN=glpat-yyyyyyyyyyyyyyyyyyyy",
-                        "PROMPT_CORPORATE_PROJECT=group/ai-review-prompts",
-                        // Structured Review Output (threat model SOR-13): the shipped
-                        // gateway.structured.answer-reserve (8000) does not fit alongside the shipped
-                        // gateway.prompt.limits.max-system-prompt-tokens (6000) at the shipped
-                        // context-window -- that is the intended SOR-13 startup-refusal scenario (see
-                        // GatewayPropertiesStructuredValidationTest). This test boots Prompt Manager
-                        // specifically, so it pins structured.answer-reserve at its minimum legal value
-                        // (equal to diff.answer-reserve) to stay budget-consistent without that being the
-                        // thing under test here -- exactly the same fix applied to
-                        // GatewayPropertiesPromptValidationTest's shared fixture.
-                        "gateway.structured.answer-reserve=4000")
+                        "PROMPT_CORPORATE_PROJECT=group/ai-review-prompts")
                 .run(context -> {
                     assertThat(context).hasNotFailed();
                     GatewayProperties properties = context.getBean(GatewayProperties.class);

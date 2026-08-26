@@ -221,14 +221,15 @@ public class GatewayProperties {
                             + structured.getOnInvalidResponse());
         }
 
-        // Point 3: a smaller structured reserve than the v1/v2 reserve is always a misconfiguration --
-        // the guaranteed-shape structured response is strictly more verbose than a bare JSON array.
-        if (structured.getAnswerReserve() < diff.getAnswerReserve()) {
-            throw new IllegalStateException(
-                    "gateway.structured.answer-reserve must be >= gateway.diff.answer-reserve; got "
-                            + "structured.answer-reserve=" + structured.getAnswerReserve() + ", diff.answer-reserve="
-                            + diff.getAnswerReserve());
-        }
+        // Point 3 (chore/answer-reserve-consolidation): PREVIOUSLY a >= check between two separately
+        // configurable knobs (gateway.structured.answer-reserve vs gateway.diff.answer-reserve). That
+        // split existed so a v3-specific reserve could be more generous than v1/v2's without affecting
+        // v1/v2's own chunk-packing budget -- but in practice this repeatedly caused exactly the
+        // misconfiguration this check existed to catch: an operator raises one and forgets the other,
+        // learning about it only from a refused startup. There is now a SINGLE
+        // gateway.diff.answer-reserve, used for both v1/v2 and structured (v3) budget math (see
+        // DiffChunker.split/ReviewService, which no longer branch on prompt version for this value) --
+        // nothing left to compare here, so this point is removed rather than made permanently trivial.
 
         // Point 4 (SRO-64d): the coverage block must fit the budget. Sized for the worst case -- every
         // path at max-path-chars -- because a budget that only works for typical inputs is not a budget.
@@ -241,13 +242,13 @@ public class GatewayProperties {
         // Point 5 (threat model SOR-13, CRITICAL): include the Prompt Manager term when it is enabled.
         long promptManagerTerm = prompt.isEnabled() ? prompt.getLimits().getMaxSystemPromptTokens() : 0;
 
-        long remainingDiffBudget = diff.getContextWindow() - diff.getPromptReserve() - structured.getAnswerReserve()
+        long remainingDiffBudget = diff.getContextWindow() - diff.getPromptReserve() - diff.getAnswerReserve()
                 - coverageReserveTokens - promptManagerTerm;
         int minDiffBudgetTokens = prompt.getLimits().getMinDiffBudgetTokens();
         if (remainingDiffBudget < minDiffBudgetTokens) {
             throw new IllegalStateException(
                     "gateway.structured budget is inconsistent: gateway.diff.context-window - "
-                            + "gateway.diff.prompt-reserve - gateway.structured.answer-reserve - "
+                            + "gateway.diff.prompt-reserve - gateway.diff.answer-reserve - "
                             + "coverageReserveTokens(" + coverageReserveTokens + ", derived from "
                             + "gateway.structured.max-files-per-chunk and gateway.structured.max-path-chars)"
                             + (prompt.isEnabled() ? " - gateway.prompt.limits.max-system-prompt-tokens" : "")
@@ -256,9 +257,9 @@ public class GatewayProperties {
                             + ") — refusing to start");
         }
         log.info("Structured Review Output budget check passed: context-window={} - prompt-reserve={} - "
-                        + "structured.answer-reserve={} - coverageReserveTokens={} (max-files-per-chunk={}, "
+                        + "answer-reserve={} - coverageReserveTokens={} (max-files-per-chunk={}, "
                         + "max-path-chars={}){} = {} remaining diff-token budget per chunk (min required: {})",
-                diff.getContextWindow(), diff.getPromptReserve(), structured.getAnswerReserve(),
+                diff.getContextWindow(), diff.getPromptReserve(), diff.getAnswerReserve(),
                 coverageReserveTokens, structured.getMaxFilesPerChunk(), structured.getMaxPathChars(),
                 prompt.isEnabled() ? " - max-system-prompt-tokens=" + prompt.getLimits().getMaxSystemPromptTokens() : "",
                 remainingDiffBudget, minDiffBudgetTokens);
@@ -1350,8 +1351,13 @@ public class GatewayProperties {
         private boolean includeDiffContext = true;
         /** SRO-51: lines of context on each side of the finding's line. */
         private int diffContextLines = 3;
-        /** §10: replaces {@code gateway.diff.answer-reserve} in the budget computation for structured prompt versions only. */
-        private int answerReserve = 8000;
+        // chore/answer-reserve-consolidation: this class USED TO have its own `answerReserve` field
+        // (§10 of the original design), separate from gateway.diff.answer-reserve, specifically so a
+        // structured (v3) response's answer budget could be more generous than v1/v2's without affecting
+        // v1/v2's own chunk-packing math. In practice this repeatedly caused exactly the misconfiguration
+        // its startup check (validateStructuredOnStartup Point 3) existed to catch: an operator raises
+        // one and forgets the other. Removed -- gateway.diff.answer-reserve is now the single value used
+        // for both (see DiffChunker.split/ReviewService, no longer branching on prompt version for this).
 
         public boolean isEnabled() {
             return enabled;
@@ -1447,14 +1453,6 @@ public class GatewayProperties {
 
         public void setDiffContextLines(int diffContextLines) {
             this.diffContextLines = diffContextLines;
-        }
-
-        public int getAnswerReserve() {
-            return answerReserve;
-        }
-
-        public void setAnswerReserve(int answerReserve) {
-            this.answerReserve = answerReserve;
         }
     }
 

@@ -58,12 +58,15 @@ public class DiffSizeValidator {
     }
 
     /**
-     * F-SRO-03 (appsec SAST fix round): structured-version-aware overload. {@code answerReserveTokens}
-     * is threaded explicitly by the caller rather than always reading {@code gateway.diff.answer-reserve}
-     * internally, so a structured prompt version's larger reserve ({@code
-     * gateway.structured.answer-reserve}) can size the exact same arithmetic the startup budget check
-     * (5-point {@code GatewayProperties.validateStructuredOnStartup}) already asserts — before this
-     * overload existed, that startup assertion checked a budget the runtime code never actually used.
+     * F-SRO-03 (appsec SAST fix round): explicit-reserve overload. {@code answerReserveTokens} is
+     * threaded explicitly by the caller rather than always reading {@code gateway.diff.answer-reserve}
+     * internally, so this same arithmetic can size the startup budget check (5-point {@code
+     * GatewayProperties.validateStructuredOnStartup}) exactly — before this overload existed, that
+     * startup assertion checked a budget the runtime code never actually used. Every caller currently
+     * passes {@code gateway.diff.answer-reserve} regardless of prompt version
+     * (chore/answer-reserve-consolidation merged the formerly-separate {@code
+     * gateway.structured.answer-reserve} into it); the parameter stays explicit rather than reading the
+     * property internally so this method has no config dependency of its own.
      */
     public int budgetTokens(int systemPromptTokens, int answerReserveTokens) {
         GatewayProperties.Diff cfg = properties.getDiff();
@@ -84,10 +87,9 @@ public class DiffSizeValidator {
     }
 
     /**
-     * F-SRO-03: structured-version-aware overload — see {@link #budgetTokens(int, int)}. Called by
-     * {@code ReviewService} with {@code gateway.structured.answer-reserve} for a structured
-     * {@code promptVersion}, so the same reserve that sizes {@code DiffChunker.split}'s runtime chunking
-     * also gates this pre-chunking budget check.
+     * F-SRO-03: explicit-reserve overload — see {@link #budgetTokens(int, int)}. Called by
+     * {@code ReviewService} with {@code gateway.diff.answer-reserve}, so the same reserve that sizes
+     * {@code DiffChunker.split}'s runtime chunking also gates this pre-chunking budget check.
      */
     public void assertPromptFits(int systemPromptTokens, int answerReserveTokens) {
         int minDiffBudgetTokens = properties.getPrompt().getLimits().getMinDiffBudgetTokens();

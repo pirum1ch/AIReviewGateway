@@ -409,7 +409,10 @@ class ReviewServiceTest {
     }
 
     @Test
-    void structuredVersionAssertsPromptFitsWithTheStructuredAnswerReserve() {
+    void structuredVersionAssertsPromptFitsWithTheSameDiffAnswerReserve() {
+        // chore/answer-reserve-consolidation: a formerly-separate gateway.structured.answer-reserve was
+        // merged into gateway.diff.answer-reserve -- a structured (v3) Review must now assert with the
+        // exact same reserve a non-structured one uses, not a distinct, separately configurable one.
         properties.getReview().getAllowedPromptVersions().add("v3");
         when(diffChunker.split(anyString(), anyInt(), anyInt())).thenAnswer(inv -> new DiffChunker.ChunkPlan(
                 List.of(new DiffChunker.DiffChunk(0, inv.getArgument(0), 10, List.of("src/A.java"))), 10, true));
@@ -423,7 +426,7 @@ class ReviewServiceTest {
 
         reviewService.createReview(command);
 
-        verify(diffSizeValidator).assertPromptFits(anyInt(), eq(properties.getStructured().getAnswerReserve()));
+        verify(diffSizeValidator).assertPromptFits(anyInt(), eq(properties.getDiff().getAnswerReserve()));
     }
 
     @Test

@@ -268,7 +268,15 @@ for the full validation/retry/failure-kind model.
 | `gateway.structured.per-file-summary` | — | `true` | Requires a non-empty per-file `summary` field — an anti-skip device (a model that silently drops a file is more likely to also skip its summary). `false` saves tokens at the cost of a weaker signal. |
 | `gateway.structured.on-invalid-response` | — | `RETRY_THEN_FAIL` | `RETRY_THEN_FAIL` (default) or `RETRY_THEN_FALLBACK`. **`RETRY_THEN_FALLBACK` is a documented risk re-acceptance, not a quality knob** — see the callout below. |
 | `gateway.structured.include-diff-context` / `diff-context-lines` | — | `true` / `3` | Whether a rendered finding includes a fenced `diff`-language excerpt (±N lines) around its line, taken only from that finding's own file section of the **locked job row's own chunk diff** — never from anything in the model's response. |
-| `gateway.structured.answer-reserve` | — | `8000` | Replaces `gateway.diff.answer-reserve` when sizing the diff-chunking budget for a `v3` Review — the guaranteed-shape JSON response is more verbose than a bare comment array. **Must be `≥ gateway.diff.answer-reserve`** (checked at startup) and **must match `v3.yml`'s `maxTokens` (`8192`)** — the two are read by different processes (Gateway budgeting vs. the Worker's actual `llama-server` request) and a mismatch is silent: nothing fails loudly, a too-small `answer-reserve` just risks a truncated completion under a large chunk. |
+
+`gateway.diff.answer-reserve` (default `4000`) sizes the diff-chunking budget for **both** v1/v2 and
+structured (`v3`) Reviews — there is no separate `structured.answer-reserve` (a formerly-separate
+property was merged into this one, `chore/answer-reserve-consolidation`, after repeatedly causing an
+operator to raise one and forget the other). **Must match `v3.yml`'s `maxTokens` (`8192`)** — the two
+are read by different processes (Gateway budgeting vs. the Worker's actual `llama-server` request) and a
+mismatch is silent: nothing fails loudly, a too-small `answer-reserve` just risks a truncated completion
+under a large chunk. See `DEPLOYMENT.md`'s "Бюджет LLM-токенов: сводная таблица" for the full
+cross-process picture.
 
 **`RETRY_THEN_FALLBACK` re-accepts a residual, on an attacker-reachable path.** When the attempt budget
 is exhausted, this setting makes the Gateway fall back to the legacy `CommentParser`'s genuine
