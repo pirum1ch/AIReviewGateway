@@ -210,32 +210,65 @@ Before setting a backend's `structured_output_mode` to anything but `OFF`
 ([§8c](#8c-upgrading-to-v5-structured-review-output)), verify it directly against **that** backend — this
 repository pins no `llama.cpp`/`llama-server` version, and structured-output support (and, worse, silent
 *fail-open* on an unparseable grammar — a documented `llama.cpp` behavior, not a bug in this codebase) is
-a per-build capability, not something safe to assume from a version number. The recipe needs **two**
-calls, not one — a schema the model conforms to easily proves nothing about a fail-open backend, which
-passes that call by luck:
+a per-build capability, not something safe to assume from a version number.
+
+**This recipe posts the Gateway's REAL, production-shaped schema, not a toy one.** An earlier revision of
+this recipe used a two-field toy schema (`{"ok": boolean}` / an enum of nonsense values) for the positive
+check. That was wrong: a toy schema has **no repetition site** and cannot detect the actual failure class
+this platform hit in production — a `2026-08` canary where `structured_output_mode` was rejected 100% of
+the time because the schema's `maxLength` bounds compiled to a GBNF repetition that tripped llama.cpp's
+grammar-parser complexity guard (`MAX_REPETITION_THRESHOLD = 2000`; see
+`docs/structured-output-grammar-budget-architecture.md` §1 for the full incident). The fix
+(`ReviewSchemaBuilder` no longer emits `maxLength` at all) means the schema below is smaller than it used
+to be, but the check still needs to compile the REAL schema shape, at the REAL `maxItems`/file-count the
+Gateway actually sends — a toy schema would have looked fine throughout that entire incident.
+
+The two schema fixtures below are committed, golden output of `ReviewSchemaBuilderTest` (`src/test/
+resources/fixtures/structured-output-grammar-budget/schema-1-file.json` / `schema-40-files.json`) at this
+repository's production config defaults (`max-findings-per-file=20`, `max-files-per-chunk=40`) — copy
+them to the backend host (or generate your own via `jq` if your deployment's `gateway.structured.*`
+values differ from the defaults) so this check never drifts from what `ReviewSchemaBuilder` actually
+builds. The recipe still needs **two** calls, not one — a schema the model conforms to easily proves
+nothing about a fail-open backend, which passes that call by luck:
 
 ```bash
-# 1. Positive check: a trivial schema most models satisfy even unprompted. A conforming response alone
-#    does NOT prove the constraint is enforced -- see the negative check below.
+# 0. Copy (or scp) the two committed schema fixtures onto the backend host first:
+#    src/test/resources/fixtures/structured-output-grammar-budget/schema-1-file.json
+#    src/test/resources/fixtures/structured-output-grammar-budget/schema-40-files.json
+
+# 1. Positive check, 1-file schema: the SMALLEST real schema this Gateway ever sends. Must compile AND
+#    the model's response must conform. A conforming response alone does NOT prove the constraint is
+#    enforced -- see the negative check below.
+SCHEMA_1=$(cat schema-1-file.json)
 curl -sS "http://192.168.1.101:8000/v1/chat/completions" \
   -H "Content-Type: application/json" \
-  -d '{
-        "model": "qwen2.5-coder",
-        "messages": [{"role": "user", "content": "Reply with a JSON object."}],
-        "response_format": {
-          "type": "json_schema",
-          "json_schema": { "name": "toy", "schema": {
-            "type": "object", "additionalProperties": false,
-            "required": ["ok"], "properties": { "ok": { "type": "boolean" } }
-          }}
-        }
-      }' | jq '.choices[0].message.content'
+  -d "$(jq -n --argjson schema "$SCHEMA_1" '{
+        model: "qwen2.5-coder",
+        messages: [{role: "user", content: "Reply with a JSON object matching the schema."}],
+        response_format: { type: "json_schema", json_schema: { name: "review_chunk_1_file", schema: $schema } }
+      }')" | jq '.choices[0].message.content'
 
-# 2. Negative control (the one most guides skip): a schema the model would NOT satisfy unprompted --
-#    an enum of nonsense values it has no reason to pick on its own. If the response still "conforms"
-#    (picks one of the listed nonsense values), the constraint is genuinely enforced. If it answers with
-#    something else entirely (ignores the schema) or the call errors out, the backend is failing open or
-#    rejecting the schema -- do NOT enable structured_output_mode for it.
+# 2. Positive check, 40-file schema (gateway.structured.max-files-per-chunk's default): the LARGEST real
+#    schema this Gateway ever sends for one chunk. This is the one that actually exercises repetition-
+#    site accounting across many files -- see P-1/P-3 in the architecture doc's §6 empirical release gate
+#    if this ever fails while the 1-file schema above passes (file count IS a factor on this build).
+SCHEMA_40=$(cat schema-40-files.json)
+curl -sS "http://192.168.1.101:8000/v1/chat/completions" \
+  -H "Content-Type: application/json" \
+  -d "$(jq -n --argjson schema "$SCHEMA_40" '{
+        model: "qwen2.5-coder",
+        messages: [{role: "user", content: "Reply with a JSON object matching the schema."}],
+        response_format: { type: "json_schema", json_schema: { name: "review_chunk_40_files", schema: $schema } }
+      }')" | jq '.choices[0].message.content'
+
+# 3. Negative control (the one most guides skip): a schema the model would NOT satisfy unprompted --
+#    an enum of nonsense values it has no reason to pick on its own. This is testing a DIFFERENT property
+#    than checks 1/2 above (fail-open under an adversarial prompt, not grammar-compile budget), so a
+#    small schema is fine here -- it still needs its own repetition-free shape to isolate that property.
+#    If the response still "conforms" (picks one of the listed nonsense values), the constraint is
+#    genuinely enforced. If it answers with something else entirely (ignores the schema) or the call
+#    errors out, the backend is failing open or rejecting the schema -- do NOT enable
+#    structured_output_mode for it.
 curl -sS "http://192.168.1.101:8000/v1/chat/completions" \
   -H "Content-Type: application/json" \
   -d '{
@@ -253,13 +286,16 @@ curl -sS "http://192.168.1.101:8000/v1/chat/completions" \
       }' | jq '.choices[0].message.content'
 ```
 
-Also check the `llama-server` process's own log output for `failed to parse grammar` (or similar) around
-the time of either call — this is the only client-visible symptom of the fail-open bug on some builds,
-and it can appear even when the HTTP response still looks superficially fine. If either check fails, or
-the log line appears, leave that backend's `structured_output_mode` at `OFF` (or `NULL`, which uses
-`gateway.structured.default-mode`, itself `OFF` by default) — the feature still works for that backend,
-just without a decoder-level guarantee (the coverage list in the prompt and the Gateway's own strict
-response validation are unaffected either way).
+Also check the `llama-server` process's own log output for `failed to parse grammar` (or similar, e.g.
+`Failed to initialize samplers`) around the time of **every** call above — this is the only client-visible
+symptom of the fail-open bug on some builds, and it can appear even when the HTTP response still looks
+superficially fine (`GET /props`'s `build_info` is worth recording alongside the result, per the
+architecture doc's §6 empirical release gate). If any check fails, or the log line appears, leave that
+backend's `structured_output_mode` at `OFF` (or `NULL`, which uses `gateway.structured.default-mode`,
+itself `OFF` by default) — the feature still works for that backend, just without a decoder-level
+guarantee (the coverage list in the prompt and the Gateway's own strict response validation are
+unaffected either way, and an over-length `comment`/`suggestion` is truncated on receipt regardless of
+whether the decoder ever constrained anything).
 
 ## 3. Step 1: PostgreSQL
 
@@ -921,8 +957,8 @@ prompts/*.yml` (`maxTokens` на шаблон). Эта таблица — еди
 | `gateway.structured.max-path-chars` | Gateway | 256 | Максимальная длина одного пути-ключа схемы | Входит в формулу `coverageReserveTokens`; должен быть ≤ 300 |
 | `gateway.structured.max-schema-bytes` | Gateway | 65536 | Backstop-потолок размера самой JSON-схемы | Должен быть **меньше** `worker.limits.max-constraint-bytes` с запасом на wire-обёртку |
 | `gateway.structured.max-findings-per-file` | Gateway | 20 | Потолок числа находок на файл | Влияет на реальный размер ответа v3 (не входит в формулу бюджета напрямую) |
-| `gateway.structured.max-comment-chars` | Gateway | 1200 | `maxLength` поля `comment` одной находки | Влияет на реальный размер ответа v3 |
-| `gateway.structured.max-suggestion-chars` | Gateway | 2000 | `maxLength` поля `suggestion` одной находки | Влияет на реальный размер ответа v3 |
+| `gateway.structured.max-comment-chars` | Gateway | 1200 | **Receipt-side** потолок длины поля `comment` одной находки (НЕ `maxLength` схемы — Structured Output Grammar Budget fix убрал `maxLength` из схемы целиком, см. `docs/structured-output-grammar-budget-architecture.md` §1); превышение — truncate + `structuredFieldTruncated` счётчик, никогда не `SCHEMA_MISMATCH` | Влияет на реальный размер ответа v3 |
+| `gateway.structured.max-suggestion-chars` | Gateway | 2000 | То же самое для поля `suggestion` — truncate, а не decoder-`maxLength` | Влияет на реальный размер ответа v3 |
 | `llama.max-tokens` | Worker | 4096 | Глобальный дефолт `max_tokens`, если конкретный шаблон промпта его не переопределяет | Используется `v1.yml`/`v2.yml` (своего значения не задают) |
 | `v3.yml` → `maxTokens` | Worker (файл шаблона) | 8192 | Реальный потолок токенов, которые модель может сгенерировать для v3-ответа | Должен быть ≥ `gateway.diff.answer-reserve` — иначе Gateway резервирует бюджет под ответ длиннее, чем Worker реально позволит модели сгенерировать |
 | `worker.limits.max-diff-bytes` | Worker | 262144 | Байтовый потолок на diff + chunkContext + systemMessages суммарно | Независим от токен-формулы Gateway'я, отдельная защита на стороне Worker'а (WSR-03) |
