@@ -43,11 +43,6 @@ public class ReviewSchemaBuilder {
     /** SRO-20/9.3.2: array-of-enum was rejected as the coverage mechanism — see the class/architecture doc. */
     private static final String[] SEVERITY_VALUES = {"critical", "major", "minor", "info"};
 
-    /** Per-file summary cap (SRO-25) — not independently configurable, unlike the finding-level caps. */
-    private static final int PER_FILE_SUMMARY_MAX_LENGTH = 200;
-    /** Chunk-level summary cap (SRO-26) — populates {@code review_results.summary}. */
-    private static final int CHUNK_SUMMARY_MAX_LENGTH = 500;
-
     private final ObjectMapper objectMapper = new ObjectMapper();
 
     /**
@@ -94,7 +89,7 @@ public class ReviewSchemaBuilder {
         // SRO-03: "files" before "summary" -- chunk-level findings-bearing content before the summary
         // that describes it, matching the per-file findings-before-summary rule one level down.
         properties.set("files", buildFilesNode(filePaths, options));
-        properties.set("summary", stringSchema(CHUNK_SUMMARY_MAX_LENGTH));
+        properties.set("summary", stringSchema());
 
         try {
             return objectMapper.writeValueAsString(root);
@@ -132,7 +127,7 @@ public class ReviewSchemaBuilder {
         properties.set("findings", buildFindingsArrayNode(options));
         if (options.perFileSummary()) {
             required.add("summary");
-            properties.set("summary", stringSchema(PER_FILE_SUMMARY_MAX_LENGTH));
+            properties.set("summary", stringSchema());
         }
         return fileEntry;
     }
@@ -169,15 +164,25 @@ public class ReviewSchemaBuilder {
         }
         properties.set("severity", severityNode);
 
-        properties.set("comment", stringSchema(options.maxCommentChars()));
-        properties.set("suggestion", stringSchema(options.maxSuggestionChars()));
+        properties.set("comment", stringSchema());
+        properties.set("suggestion", stringSchema());
         return item;
     }
 
-    private ObjectNode stringSchema(int maxLength) {
+    /**
+     * SGB-01 (Structured Output Grammar Budget): deliberately emits NO {@code maxLength}. A bounded
+     * string ({@code maxLength: N}) compiles to a GBNF {@code char{0,N}} repetition -- llama.cpp's
+     * grammar-parser complexity guard ({@code MAX_REPETITION_THRESHOLD = 2000}) throws when a single
+     * repetition site's rule count reaches that threshold, and {@code N=2000} (the shipped
+     * {@code max-suggestion-chars} default) hits it on its own, in a single-file chunk, before a single
+     * token is generated. A plain {@code {"type":"string"}} routes to the converter's shared {@code
+     * string} primitive ({@code char*}, unbounded repetition), which costs zero budget. Length is
+     * enforced instead on receipt, by {@code StructuredResponseParser} (SGB-03) -- a presentation bound,
+     * not a decoder bound; see {@code gateway.structured.max-comment-chars}/{@code max-suggestion-chars}.
+     */
+    private ObjectNode stringSchema() {
         ObjectNode node = objectMapper.createObjectNode();
         node.put("type", "string");
-        node.put("maxLength", Math.max(0, maxLength));
         return node;
     }
 

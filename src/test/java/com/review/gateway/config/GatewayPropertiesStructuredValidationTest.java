@@ -70,6 +70,32 @@ class GatewayPropertiesStructuredValidationTest {
                 .hasMessageContaining("max-files-per-chunk");
     }
 
+    /**
+     * T-2.9 (Structured Output Grammar Budget, SGB-02/SOGB-09): fails fast, naming the property, its
+     * configured value, and llama.cpp's grammar-parser complexity guard as the reason -- rather than a
+     * runtime, fleet-wide, 250ms grammar-compile rejection the operator would otherwise only see in the
+     * llama-server log on another host.
+     */
+    @Test
+    void maxFindingsPerFileMustBeAtMost200() {
+        GatewayProperties properties = validProperties();
+        properties.getStructured().setMaxFindingsPerFile(201);
+
+        assertThatThrownBy(properties::validateOnStartup)
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("gateway.structured.max-findings-per-file")
+                .hasMessageContaining("201")
+                .hasMessageContaining("MAX_REPETITION_THRESHOLD");
+    }
+
+    @Test
+    void maxFindingsPerFileOfExactly200Passes() {
+        GatewayProperties properties = validProperties();
+        properties.getStructured().setMaxFindingsPerFile(200);
+
+        assertThatCode(properties::validateOnStartup).doesNotThrowAnyException();
+    }
+
     // structuredAnswerReserveMustBeAtLeastDiffAnswerReserve (Point 3) removed:
     // chore/answer-reserve-consolidation merged gateway.structured.answer-reserve into
     // gateway.diff.answer-reserve -- there is no longer a second value to compare against.

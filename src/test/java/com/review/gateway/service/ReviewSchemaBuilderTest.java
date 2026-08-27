@@ -111,15 +111,24 @@ class ReviewSchemaBuilderTest {
         assertThat(toList(severityEnum)).containsExactly("critical", "major", "minor", "info");
     }
 
+    /**
+     * T-1.4 inverted (Structured Output Grammar Budget, SGB-01): {@code maxLength} used to be asserted
+     * here; it is now asserted ABSENT at every level, and {@code maxItems} is the only structural bound
+     * left. A bounded string (a GBNF {@code char{0,N}} repetition) is what tripped llama.cpp's grammar-
+     * parser complexity guard in production (architecture doc §1) -- {@code maxItems} on {@code findings}
+     * is a much smaller repetition site (~20 of a 2000 budget) and is the one bound this feature actually
+     * needs at the decoder.
+     */
     @Test
-    void maxLengthAndMaxItemsReflectTheSuppliedOptions() throws Exception {
+    void maxItemsReflectsTheSuppliedOptionsAndMaxLengthIsNeverEmittedAnywhere() throws Exception {
         ReviewSchemaBuilder.SchemaOptions options = new ReviewSchemaBuilder.SchemaOptions(7, 111, 222, true);
         String schema = builder.build(List.of("A.java"), options);
         JsonNode findings = mapper.readTree(schema).at("/properties/files/properties/A.java/properties/findings");
 
         assertThat(findings.get("maxItems").asInt()).isEqualTo(7);
-        assertThat(findings.at("/items/properties/comment/maxLength").asInt()).isEqualTo(111);
-        assertThat(findings.at("/items/properties/suggestion/maxLength").asInt()).isEqualTo(222);
+        assertThat(schema).as("SGB-01: maxLength must never be emitted -- it is what compiles to the "
+                        + "GBNF repetition that tripped llama.cpp's MAX_REPETITION_THRESHOLD in production")
+                .doesNotContain("maxLength");
     }
 
     @Test
@@ -150,6 +159,48 @@ class ReviewSchemaBuilderTest {
         String second = builder.build(paths, defaultOptions());
 
         assertThat(first).isEqualTo(second);
+    }
+
+    /**
+     * T-1.10 / SGB-07 (Structured Output Grammar Budget): golden fixtures for {@code DEPLOYMENT.md}'s
+     * capability-verification recipe. A "two-field toy schema" (the recipe's previous {@code {"ok":
+     * boolean}}/{@code {"verdict": enum}} bodies) has no repetition site and therefore cannot detect this
+     * failure class by construction -- see architecture doc §1.2. These fixtures are the ACTUAL schema
+     * {@code ReviewSchemaBuilder} emits at production config defaults (from {@code application.yml}:
+     * {@code max-findings-per-file=20}, {@code max-files-per-chunk=40}), for a 1-file chunk and a
+     * {@code max-files-per-chunk}-file (40) chunk, so the deployment recipe can post the SAME document
+     * this Gateway would actually send and cannot silently drift from the builder.
+     */
+    @Test
+    void oneFileAndFortyFileSchemaFixturesMatchProductionDefaultsAndTheCommittedGoldenFiles() throws Exception {
+        ReviewSchemaBuilder.SchemaOptions productionDefaults = new ReviewSchemaBuilder.SchemaOptions(20, 1200, 2000, true);
+        ObjectMapper pretty = new ObjectMapper();
+
+        String oneFileSchema = builder.build(List.of("src/main/java/com/example/Service.java"), productionDefaults);
+        assertThat(prettyPrint(pretty, oneFileSchema)).isEqualToNormalizingNewlines(readFixture("schema-1-file.json"));
+
+        List<String> fortyFiles = new ArrayList<>();
+        for (int i = 1; i <= 40; i++) {
+            fortyFiles.add(String.format("src/main/java/com/example/File%02d.java", i));
+        }
+        String fortyFileSchema = builder.build(fortyFiles, productionDefaults);
+        assertThat(prettyPrint(pretty, fortyFileSchema)).isEqualToNormalizingNewlines(readFixture("schema-40-files.json"));
+    }
+
+    private String prettyPrint(ObjectMapper mapper, String compactJson) throws Exception {
+        JsonNode tree = mapper.readTree(compactJson);
+        return mapper.writerWithDefaultPrettyPrinter().writeValueAsString(tree);
+    }
+
+    private String readFixture(String name) throws java.io.IOException {
+        try (var in = getClass().getResourceAsStream(
+                "/fixtures/structured-output-grammar-budget/" + name)) {
+            if (in == null) {
+                throw new java.io.FileNotFoundException(
+                        "Missing fixture: fixtures/structured-output-grammar-budget/" + name);
+            }
+            return new String(in.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+        }
     }
 
     private List<String> toList(JsonNode arrayNode) {

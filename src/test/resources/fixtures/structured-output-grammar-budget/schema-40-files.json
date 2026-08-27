@@ -1,0 +1,1377 @@
+{
+  "type" : "object",
+  "additionalProperties" : false,
+  "required" : [ "files", "summary" ],
+  "properties" : {
+    "files" : {
+      "type" : "object",
+      "additionalProperties" : false,
+      "required" : [ "src/main/java/com/example/File01.java", "src/main/java/com/example/File02.java", "src/main/java/com/example/File03.java", "src/main/java/com/example/File04.java", "src/main/java/com/example/File05.java", "src/main/java/com/example/File06.java", "src/main/java/com/example/File07.java", "src/main/java/com/example/File08.java", "src/main/java/com/example/File09.java", "src/main/java/com/example/File10.java", "src/main/java/com/example/File11.java", "src/main/java/com/example/File12.java", "src/main/java/com/example/File13.java", "src/main/java/com/example/File14.java", "src/main/java/com/example/File15.java", "src/main/java/com/example/File16.java", "src/main/java/com/example/File17.java", "src/main/java/com/example/File18.java", "src/main/java/com/example/File19.java", "src/main/java/com/example/File20.java", "src/main/java/com/example/File21.java", "src/main/java/com/example/File22.java", "src/main/java/com/example/File23.java", "src/main/java/com/example/File24.java", "src/main/java/com/example/File25.java", "src/main/java/com/example/File26.java", "src/main/java/com/example/File27.java", "src/main/java/com/example/File28.java", "src/main/java/com/example/File29.java", "src/main/java/com/example/File30.java", "src/main/java/com/example/File31.java", "src/main/java/com/example/File32.java", "src/main/java/com/example/File33.java", "src/main/java/com/example/File34.java", "src/main/java/com/example/File35.java", "src/main/java/com/example/File36.java", "src/main/java/com/example/File37.java", "src/main/java/com/example/File38.java", "src/main/java/com/example/File39.java", "src/main/java/com/example/File40.java" ],
+      "properties" : {
+        "src/main/java/com/example/File01.java" : {
+          "type" : "object",
+          "additionalProperties" : false,
+          "required" : [ "findings", "summary" ],
+          "properties" : {
+            "findings" : {
+              "type" : "array",
+              "maxItems" : 20,
+              "items" : {
+                "type" : "object",
+                "additionalProperties" : false,
+                "required" : [ "line", "severity", "comment", "suggestion" ],
+                "properties" : {
+                  "line" : {
+                    "type" : "integer"
+                  },
+                  "severity" : {
+                    "type" : "string",
+                    "enum" : [ "critical", "major", "minor", "info" ]
+                  },
+                  "comment" : {
+                    "type" : "string"
+                  },
+                  "suggestion" : {
+                    "type" : "string"
+                  }
+                }
+              }
+            },
+            "summary" : {
+              "type" : "string"
+            }
+          }
+        },
+        "src/main/java/com/example/File02.java" : {
+          "type" : "object",
+          "additionalProperties" : false,
+          "required" : [ "findings", "summary" ],
+          "properties" : {
+            "findings" : {
+              "type" : "array",
+              "maxItems" : 20,
+              "items" : {
+                "type" : "object",
+                "additionalProperties" : false,
+                "required" : [ "line", "severity", "comment", "suggestion" ],
+                "properties" : {
+                  "line" : {
+                    "type" : "integer"
+                  },
+                  "severity" : {
+                    "type" : "string",
+                    "enum" : [ "critical", "major", "minor", "info" ]
+                  },
+                  "comment" : {
+                    "type" : "string"
+                  },
+                  "suggestion" : {
+                    "type" : "string"
+                  }
+                }
+              }
+            },
+            "summary" : {
+              "type" : "string"
+            }
+          }
+        },
+        "src/main/java/com/example/File03.java" : {
+          "type" : "object",
+          "additionalProperties" : false,
+          "required" : [ "findings", "summary" ],
+          "properties" : {
+            "findings" : {
+              "type" : "array",
+              "maxItems" : 20,
+              "items" : {
+                "type" : "object",
+                "additionalProperties" : false,
+                "required" : [ "line", "severity", "comment", "suggestion" ],
+                "properties" : {
+                  "line" : {
+                    "type" : "integer"
+                  },
+                  "severity" : {
+                    "type" : "string",
+                    "enum" : [ "critical", "major", "minor", "info" ]
+                  },
+                  "comment" : {
+                    "type" : "string"
+                  },
+                  "suggestion" : {
+                    "type" : "string"
+                  }
+                }
+              }
+            },
+            "summary" : {
+              "type" : "string"
+            }
+          }
+        },
+        "src/main/java/com/example/File04.java" : {
+          "type" : "object",
+          "additionalProperties" : false,
+          "required" : [ "findings", "summary" ],
+          "properties" : {
+            "findings" : {
+              "type" : "array",
+              "maxItems" : 20,
+              "items" : {
+                "type" : "object",
+                "additionalProperties" : false,
+                "required" : [ "line", "severity", "comment", "suggestion" ],
+                "properties" : {
+                  "line" : {
+                    "type" : "integer"
+                  },
+                  "severity" : {
+                    "type" : "string",
+                    "enum" : [ "critical", "major", "minor", "info" ]
+                  },
+                  "comment" : {
+                    "type" : "string"
+                  },
+                  "suggestion" : {
+                    "type" : "string"
+                  }
+                }
+              }
+            },
+            "summary" : {
+              "type" : "string"
+            }
+          }
+        },
+        "src/main/java/com/example/File05.java" : {
+          "type" : "object",
+          "additionalProperties" : false,
+          "required" : [ "findings", "summary" ],
+          "properties" : {
+            "findings" : {
+              "type" : "array",
+              "maxItems" : 20,
+              "items" : {
+                "type" : "object",
+                "additionalProperties" : false,
+                "required" : [ "line", "severity", "comment", "suggestion" ],
+                "properties" : {
+                  "line" : {
+                    "type" : "integer"
+                  },
+                  "severity" : {
+                    "type" : "string",
+                    "enum" : [ "critical", "major", "minor", "info" ]
+                  },
+                  "comment" : {
+                    "type" : "string"
+                  },
+                  "suggestion" : {
+                    "type" : "string"
+                  }
+                }
+              }
+            },
+            "summary" : {
+              "type" : "string"
+            }
+          }
+        },
+        "src/main/java/com/example/File06.java" : {
+          "type" : "object",
+          "additionalProperties" : false,
+          "required" : [ "findings", "summary" ],
+          "properties" : {
+            "findings" : {
+              "type" : "array",
+              "maxItems" : 20,
+              "items" : {
+                "type" : "object",
+                "additionalProperties" : false,
+                "required" : [ "line", "severity", "comment", "suggestion" ],
+                "properties" : {
+                  "line" : {
+                    "type" : "integer"
+                  },
+                  "severity" : {
+                    "type" : "string",
+                    "enum" : [ "critical", "major", "minor", "info" ]
+                  },
+                  "comment" : {
+                    "type" : "string"
+                  },
+                  "suggestion" : {
+                    "type" : "string"
+                  }
+                }
+              }
+            },
+            "summary" : {
+              "type" : "string"
+            }
+          }
+        },
+        "src/main/java/com/example/File07.java" : {
+          "type" : "object",
+          "additionalProperties" : false,
+          "required" : [ "findings", "summary" ],
+          "properties" : {
+            "findings" : {
+              "type" : "array",
+              "maxItems" : 20,
+              "items" : {
+                "type" : "object",
+                "additionalProperties" : false,
+                "required" : [ "line", "severity", "comment", "suggestion" ],
+                "properties" : {
+                  "line" : {
+                    "type" : "integer"
+                  },
+                  "severity" : {
+                    "type" : "string",
+                    "enum" : [ "critical", "major", "minor", "info" ]
+                  },
+                  "comment" : {
+                    "type" : "string"
+                  },
+                  "suggestion" : {
+                    "type" : "string"
+                  }
+                }
+              }
+            },
+            "summary" : {
+              "type" : "string"
+            }
+          }
+        },
+        "src/main/java/com/example/File08.java" : {
+          "type" : "object",
+          "additionalProperties" : false,
+          "required" : [ "findings", "summary" ],
+          "properties" : {
+            "findings" : {
+              "type" : "array",
+              "maxItems" : 20,
+              "items" : {
+                "type" : "object",
+                "additionalProperties" : false,
+                "required" : [ "line", "severity", "comment", "suggestion" ],
+                "properties" : {
+                  "line" : {
+                    "type" : "integer"
+                  },
+                  "severity" : {
+                    "type" : "string",
+                    "enum" : [ "critical", "major", "minor", "info" ]
+                  },
+                  "comment" : {
+                    "type" : "string"
+                  },
+                  "suggestion" : {
+                    "type" : "string"
+                  }
+                }
+              }
+            },
+            "summary" : {
+              "type" : "string"
+            }
+          }
+        },
+        "src/main/java/com/example/File09.java" : {
+          "type" : "object",
+          "additionalProperties" : false,
+          "required" : [ "findings", "summary" ],
+          "properties" : {
+            "findings" : {
+              "type" : "array",
+              "maxItems" : 20,
+              "items" : {
+                "type" : "object",
+                "additionalProperties" : false,
+                "required" : [ "line", "severity", "comment", "suggestion" ],
+                "properties" : {
+                  "line" : {
+                    "type" : "integer"
+                  },
+                  "severity" : {
+                    "type" : "string",
+                    "enum" : [ "critical", "major", "minor", "info" ]
+                  },
+                  "comment" : {
+                    "type" : "string"
+                  },
+                  "suggestion" : {
+                    "type" : "string"
+                  }
+                }
+              }
+            },
+            "summary" : {
+              "type" : "string"
+            }
+          }
+        },
+        "src/main/java/com/example/File10.java" : {
+          "type" : "object",
+          "additionalProperties" : false,
+          "required" : [ "findings", "summary" ],
+          "properties" : {
+            "findings" : {
+              "type" : "array",
+              "maxItems" : 20,
+              "items" : {
+                "type" : "object",
+                "additionalProperties" : false,
+                "required" : [ "line", "severity", "comment", "suggestion" ],
+                "properties" : {
+                  "line" : {
+                    "type" : "integer"
+                  },
+                  "severity" : {
+                    "type" : "string",
+                    "enum" : [ "critical", "major", "minor", "info" ]
+                  },
+                  "comment" : {
+                    "type" : "string"
+                  },
+                  "suggestion" : {
+                    "type" : "string"
+                  }
+                }
+              }
+            },
+            "summary" : {
+              "type" : "string"
+            }
+          }
+        },
+        "src/main/java/com/example/File11.java" : {
+          "type" : "object",
+          "additionalProperties" : false,
+          "required" : [ "findings", "summary" ],
+          "properties" : {
+            "findings" : {
+              "type" : "array",
+              "maxItems" : 20,
+              "items" : {
+                "type" : "object",
+                "additionalProperties" : false,
+                "required" : [ "line", "severity", "comment", "suggestion" ],
+                "properties" : {
+                  "line" : {
+                    "type" : "integer"
+                  },
+                  "severity" : {
+                    "type" : "string",
+                    "enum" : [ "critical", "major", "minor", "info" ]
+                  },
+                  "comment" : {
+                    "type" : "string"
+                  },
+                  "suggestion" : {
+                    "type" : "string"
+                  }
+                }
+              }
+            },
+            "summary" : {
+              "type" : "string"
+            }
+          }
+        },
+        "src/main/java/com/example/File12.java" : {
+          "type" : "object",
+          "additionalProperties" : false,
+          "required" : [ "findings", "summary" ],
+          "properties" : {
+            "findings" : {
+              "type" : "array",
+              "maxItems" : 20,
+              "items" : {
+                "type" : "object",
+                "additionalProperties" : false,
+                "required" : [ "line", "severity", "comment", "suggestion" ],
+                "properties" : {
+                  "line" : {
+                    "type" : "integer"
+                  },
+                  "severity" : {
+                    "type" : "string",
+                    "enum" : [ "critical", "major", "minor", "info" ]
+                  },
+                  "comment" : {
+                    "type" : "string"
+                  },
+                  "suggestion" : {
+                    "type" : "string"
+                  }
+                }
+              }
+            },
+            "summary" : {
+              "type" : "string"
+            }
+          }
+        },
+        "src/main/java/com/example/File13.java" : {
+          "type" : "object",
+          "additionalProperties" : false,
+          "required" : [ "findings", "summary" ],
+          "properties" : {
+            "findings" : {
+              "type" : "array",
+              "maxItems" : 20,
+              "items" : {
+                "type" : "object",
+                "additionalProperties" : false,
+                "required" : [ "line", "severity", "comment", "suggestion" ],
+                "properties" : {
+                  "line" : {
+                    "type" : "integer"
+                  },
+                  "severity" : {
+                    "type" : "string",
+                    "enum" : [ "critical", "major", "minor", "info" ]
+                  },
+                  "comment" : {
+                    "type" : "string"
+                  },
+                  "suggestion" : {
+                    "type" : "string"
+                  }
+                }
+              }
+            },
+            "summary" : {
+              "type" : "string"
+            }
+          }
+        },
+        "src/main/java/com/example/File14.java" : {
+          "type" : "object",
+          "additionalProperties" : false,
+          "required" : [ "findings", "summary" ],
+          "properties" : {
+            "findings" : {
+              "type" : "array",
+              "maxItems" : 20,
+              "items" : {
+                "type" : "object",
+                "additionalProperties" : false,
+                "required" : [ "line", "severity", "comment", "suggestion" ],
+                "properties" : {
+                  "line" : {
+                    "type" : "integer"
+                  },
+                  "severity" : {
+                    "type" : "string",
+                    "enum" : [ "critical", "major", "minor", "info" ]
+                  },
+                  "comment" : {
+                    "type" : "string"
+                  },
+                  "suggestion" : {
+                    "type" : "string"
+                  }
+                }
+              }
+            },
+            "summary" : {
+              "type" : "string"
+            }
+          }
+        },
+        "src/main/java/com/example/File15.java" : {
+          "type" : "object",
+          "additionalProperties" : false,
+          "required" : [ "findings", "summary" ],
+          "properties" : {
+            "findings" : {
+              "type" : "array",
+              "maxItems" : 20,
+              "items" : {
+                "type" : "object",
+                "additionalProperties" : false,
+                "required" : [ "line", "severity", "comment", "suggestion" ],
+                "properties" : {
+                  "line" : {
+                    "type" : "integer"
+                  },
+                  "severity" : {
+                    "type" : "string",
+                    "enum" : [ "critical", "major", "minor", "info" ]
+                  },
+                  "comment" : {
+                    "type" : "string"
+                  },
+                  "suggestion" : {
+                    "type" : "string"
+                  }
+                }
+              }
+            },
+            "summary" : {
+              "type" : "string"
+            }
+          }
+        },
+        "src/main/java/com/example/File16.java" : {
+          "type" : "object",
+          "additionalProperties" : false,
+          "required" : [ "findings", "summary" ],
+          "properties" : {
+            "findings" : {
+              "type" : "array",
+              "maxItems" : 20,
+              "items" : {
+                "type" : "object",
+                "additionalProperties" : false,
+                "required" : [ "line", "severity", "comment", "suggestion" ],
+                "properties" : {
+                  "line" : {
+                    "type" : "integer"
+                  },
+                  "severity" : {
+                    "type" : "string",
+                    "enum" : [ "critical", "major", "minor", "info" ]
+                  },
+                  "comment" : {
+                    "type" : "string"
+                  },
+                  "suggestion" : {
+                    "type" : "string"
+                  }
+                }
+              }
+            },
+            "summary" : {
+              "type" : "string"
+            }
+          }
+        },
+        "src/main/java/com/example/File17.java" : {
+          "type" : "object",
+          "additionalProperties" : false,
+          "required" : [ "findings", "summary" ],
+          "properties" : {
+            "findings" : {
+              "type" : "array",
+              "maxItems" : 20,
+              "items" : {
+                "type" : "object",
+                "additionalProperties" : false,
+                "required" : [ "line", "severity", "comment", "suggestion" ],
+                "properties" : {
+                  "line" : {
+                    "type" : "integer"
+                  },
+                  "severity" : {
+                    "type" : "string",
+                    "enum" : [ "critical", "major", "minor", "info" ]
+                  },
+                  "comment" : {
+                    "type" : "string"
+                  },
+                  "suggestion" : {
+                    "type" : "string"
+                  }
+                }
+              }
+            },
+            "summary" : {
+              "type" : "string"
+            }
+          }
+        },
+        "src/main/java/com/example/File18.java" : {
+          "type" : "object",
+          "additionalProperties" : false,
+          "required" : [ "findings", "summary" ],
+          "properties" : {
+            "findings" : {
+              "type" : "array",
+              "maxItems" : 20,
+              "items" : {
+                "type" : "object",
+                "additionalProperties" : false,
+                "required" : [ "line", "severity", "comment", "suggestion" ],
+                "properties" : {
+                  "line" : {
+                    "type" : "integer"
+                  },
+                  "severity" : {
+                    "type" : "string",
+                    "enum" : [ "critical", "major", "minor", "info" ]
+                  },
+                  "comment" : {
+                    "type" : "string"
+                  },
+                  "suggestion" : {
+                    "type" : "string"
+                  }
+                }
+              }
+            },
+            "summary" : {
+              "type" : "string"
+            }
+          }
+        },
+        "src/main/java/com/example/File19.java" : {
+          "type" : "object",
+          "additionalProperties" : false,
+          "required" : [ "findings", "summary" ],
+          "properties" : {
+            "findings" : {
+              "type" : "array",
+              "maxItems" : 20,
+              "items" : {
+                "type" : "object",
+                "additionalProperties" : false,
+                "required" : [ "line", "severity", "comment", "suggestion" ],
+                "properties" : {
+                  "line" : {
+                    "type" : "integer"
+                  },
+                  "severity" : {
+                    "type" : "string",
+                    "enum" : [ "critical", "major", "minor", "info" ]
+                  },
+                  "comment" : {
+                    "type" : "string"
+                  },
+                  "suggestion" : {
+                    "type" : "string"
+                  }
+                }
+              }
+            },
+            "summary" : {
+              "type" : "string"
+            }
+          }
+        },
+        "src/main/java/com/example/File20.java" : {
+          "type" : "object",
+          "additionalProperties" : false,
+          "required" : [ "findings", "summary" ],
+          "properties" : {
+            "findings" : {
+              "type" : "array",
+              "maxItems" : 20,
+              "items" : {
+                "type" : "object",
+                "additionalProperties" : false,
+                "required" : [ "line", "severity", "comment", "suggestion" ],
+                "properties" : {
+                  "line" : {
+                    "type" : "integer"
+                  },
+                  "severity" : {
+                    "type" : "string",
+                    "enum" : [ "critical", "major", "minor", "info" ]
+                  },
+                  "comment" : {
+                    "type" : "string"
+                  },
+                  "suggestion" : {
+                    "type" : "string"
+                  }
+                }
+              }
+            },
+            "summary" : {
+              "type" : "string"
+            }
+          }
+        },
+        "src/main/java/com/example/File21.java" : {
+          "type" : "object",
+          "additionalProperties" : false,
+          "required" : [ "findings", "summary" ],
+          "properties" : {
+            "findings" : {
+              "type" : "array",
+              "maxItems" : 20,
+              "items" : {
+                "type" : "object",
+                "additionalProperties" : false,
+                "required" : [ "line", "severity", "comment", "suggestion" ],
+                "properties" : {
+                  "line" : {
+                    "type" : "integer"
+                  },
+                  "severity" : {
+                    "type" : "string",
+                    "enum" : [ "critical", "major", "minor", "info" ]
+                  },
+                  "comment" : {
+                    "type" : "string"
+                  },
+                  "suggestion" : {
+                    "type" : "string"
+                  }
+                }
+              }
+            },
+            "summary" : {
+              "type" : "string"
+            }
+          }
+        },
+        "src/main/java/com/example/File22.java" : {
+          "type" : "object",
+          "additionalProperties" : false,
+          "required" : [ "findings", "summary" ],
+          "properties" : {
+            "findings" : {
+              "type" : "array",
+              "maxItems" : 20,
+              "items" : {
+                "type" : "object",
+                "additionalProperties" : false,
+                "required" : [ "line", "severity", "comment", "suggestion" ],
+                "properties" : {
+                  "line" : {
+                    "type" : "integer"
+                  },
+                  "severity" : {
+                    "type" : "string",
+                    "enum" : [ "critical", "major", "minor", "info" ]
+                  },
+                  "comment" : {
+                    "type" : "string"
+                  },
+                  "suggestion" : {
+                    "type" : "string"
+                  }
+                }
+              }
+            },
+            "summary" : {
+              "type" : "string"
+            }
+          }
+        },
+        "src/main/java/com/example/File23.java" : {
+          "type" : "object",
+          "additionalProperties" : false,
+          "required" : [ "findings", "summary" ],
+          "properties" : {
+            "findings" : {
+              "type" : "array",
+              "maxItems" : 20,
+              "items" : {
+                "type" : "object",
+                "additionalProperties" : false,
+                "required" : [ "line", "severity", "comment", "suggestion" ],
+                "properties" : {
+                  "line" : {
+                    "type" : "integer"
+                  },
+                  "severity" : {
+                    "type" : "string",
+                    "enum" : [ "critical", "major", "minor", "info" ]
+                  },
+                  "comment" : {
+                    "type" : "string"
+                  },
+                  "suggestion" : {
+                    "type" : "string"
+                  }
+                }
+              }
+            },
+            "summary" : {
+              "type" : "string"
+            }
+          }
+        },
+        "src/main/java/com/example/File24.java" : {
+          "type" : "object",
+          "additionalProperties" : false,
+          "required" : [ "findings", "summary" ],
+          "properties" : {
+            "findings" : {
+              "type" : "array",
+              "maxItems" : 20,
+              "items" : {
+                "type" : "object",
+                "additionalProperties" : false,
+                "required" : [ "line", "severity", "comment", "suggestion" ],
+                "properties" : {
+                  "line" : {
+                    "type" : "integer"
+                  },
+                  "severity" : {
+                    "type" : "string",
+                    "enum" : [ "critical", "major", "minor", "info" ]
+                  },
+                  "comment" : {
+                    "type" : "string"
+                  },
+                  "suggestion" : {
+                    "type" : "string"
+                  }
+                }
+              }
+            },
+            "summary" : {
+              "type" : "string"
+            }
+          }
+        },
+        "src/main/java/com/example/File25.java" : {
+          "type" : "object",
+          "additionalProperties" : false,
+          "required" : [ "findings", "summary" ],
+          "properties" : {
+            "findings" : {
+              "type" : "array",
+              "maxItems" : 20,
+              "items" : {
+                "type" : "object",
+                "additionalProperties" : false,
+                "required" : [ "line", "severity", "comment", "suggestion" ],
+                "properties" : {
+                  "line" : {
+                    "type" : "integer"
+                  },
+                  "severity" : {
+                    "type" : "string",
+                    "enum" : [ "critical", "major", "minor", "info" ]
+                  },
+                  "comment" : {
+                    "type" : "string"
+                  },
+                  "suggestion" : {
+                    "type" : "string"
+                  }
+                }
+              }
+            },
+            "summary" : {
+              "type" : "string"
+            }
+          }
+        },
+        "src/main/java/com/example/File26.java" : {
+          "type" : "object",
+          "additionalProperties" : false,
+          "required" : [ "findings", "summary" ],
+          "properties" : {
+            "findings" : {
+              "type" : "array",
+              "maxItems" : 20,
+              "items" : {
+                "type" : "object",
+                "additionalProperties" : false,
+                "required" : [ "line", "severity", "comment", "suggestion" ],
+                "properties" : {
+                  "line" : {
+                    "type" : "integer"
+                  },
+                  "severity" : {
+                    "type" : "string",
+                    "enum" : [ "critical", "major", "minor", "info" ]
+                  },
+                  "comment" : {
+                    "type" : "string"
+                  },
+                  "suggestion" : {
+                    "type" : "string"
+                  }
+                }
+              }
+            },
+            "summary" : {
+              "type" : "string"
+            }
+          }
+        },
+        "src/main/java/com/example/File27.java" : {
+          "type" : "object",
+          "additionalProperties" : false,
+          "required" : [ "findings", "summary" ],
+          "properties" : {
+            "findings" : {
+              "type" : "array",
+              "maxItems" : 20,
+              "items" : {
+                "type" : "object",
+                "additionalProperties" : false,
+                "required" : [ "line", "severity", "comment", "suggestion" ],
+                "properties" : {
+                  "line" : {
+                    "type" : "integer"
+                  },
+                  "severity" : {
+                    "type" : "string",
+                    "enum" : [ "critical", "major", "minor", "info" ]
+                  },
+                  "comment" : {
+                    "type" : "string"
+                  },
+                  "suggestion" : {
+                    "type" : "string"
+                  }
+                }
+              }
+            },
+            "summary" : {
+              "type" : "string"
+            }
+          }
+        },
+        "src/main/java/com/example/File28.java" : {
+          "type" : "object",
+          "additionalProperties" : false,
+          "required" : [ "findings", "summary" ],
+          "properties" : {
+            "findings" : {
+              "type" : "array",
+              "maxItems" : 20,
+              "items" : {
+                "type" : "object",
+                "additionalProperties" : false,
+                "required" : [ "line", "severity", "comment", "suggestion" ],
+                "properties" : {
+                  "line" : {
+                    "type" : "integer"
+                  },
+                  "severity" : {
+                    "type" : "string",
+                    "enum" : [ "critical", "major", "minor", "info" ]
+                  },
+                  "comment" : {
+                    "type" : "string"
+                  },
+                  "suggestion" : {
+                    "type" : "string"
+                  }
+                }
+              }
+            },
+            "summary" : {
+              "type" : "string"
+            }
+          }
+        },
+        "src/main/java/com/example/File29.java" : {
+          "type" : "object",
+          "additionalProperties" : false,
+          "required" : [ "findings", "summary" ],
+          "properties" : {
+            "findings" : {
+              "type" : "array",
+              "maxItems" : 20,
+              "items" : {
+                "type" : "object",
+                "additionalProperties" : false,
+                "required" : [ "line", "severity", "comment", "suggestion" ],
+                "properties" : {
+                  "line" : {
+                    "type" : "integer"
+                  },
+                  "severity" : {
+                    "type" : "string",
+                    "enum" : [ "critical", "major", "minor", "info" ]
+                  },
+                  "comment" : {
+                    "type" : "string"
+                  },
+                  "suggestion" : {
+                    "type" : "string"
+                  }
+                }
+              }
+            },
+            "summary" : {
+              "type" : "string"
+            }
+          }
+        },
+        "src/main/java/com/example/File30.java" : {
+          "type" : "object",
+          "additionalProperties" : false,
+          "required" : [ "findings", "summary" ],
+          "properties" : {
+            "findings" : {
+              "type" : "array",
+              "maxItems" : 20,
+              "items" : {
+                "type" : "object",
+                "additionalProperties" : false,
+                "required" : [ "line", "severity", "comment", "suggestion" ],
+                "properties" : {
+                  "line" : {
+                    "type" : "integer"
+                  },
+                  "severity" : {
+                    "type" : "string",
+                    "enum" : [ "critical", "major", "minor", "info" ]
+                  },
+                  "comment" : {
+                    "type" : "string"
+                  },
+                  "suggestion" : {
+                    "type" : "string"
+                  }
+                }
+              }
+            },
+            "summary" : {
+              "type" : "string"
+            }
+          }
+        },
+        "src/main/java/com/example/File31.java" : {
+          "type" : "object",
+          "additionalProperties" : false,
+          "required" : [ "findings", "summary" ],
+          "properties" : {
+            "findings" : {
+              "type" : "array",
+              "maxItems" : 20,
+              "items" : {
+                "type" : "object",
+                "additionalProperties" : false,
+                "required" : [ "line", "severity", "comment", "suggestion" ],
+                "properties" : {
+                  "line" : {
+                    "type" : "integer"
+                  },
+                  "severity" : {
+                    "type" : "string",
+                    "enum" : [ "critical", "major", "minor", "info" ]
+                  },
+                  "comment" : {
+                    "type" : "string"
+                  },
+                  "suggestion" : {
+                    "type" : "string"
+                  }
+                }
+              }
+            },
+            "summary" : {
+              "type" : "string"
+            }
+          }
+        },
+        "src/main/java/com/example/File32.java" : {
+          "type" : "object",
+          "additionalProperties" : false,
+          "required" : [ "findings", "summary" ],
+          "properties" : {
+            "findings" : {
+              "type" : "array",
+              "maxItems" : 20,
+              "items" : {
+                "type" : "object",
+                "additionalProperties" : false,
+                "required" : [ "line", "severity", "comment", "suggestion" ],
+                "properties" : {
+                  "line" : {
+                    "type" : "integer"
+                  },
+                  "severity" : {
+                    "type" : "string",
+                    "enum" : [ "critical", "major", "minor", "info" ]
+                  },
+                  "comment" : {
+                    "type" : "string"
+                  },
+                  "suggestion" : {
+                    "type" : "string"
+                  }
+                }
+              }
+            },
+            "summary" : {
+              "type" : "string"
+            }
+          }
+        },
+        "src/main/java/com/example/File33.java" : {
+          "type" : "object",
+          "additionalProperties" : false,
+          "required" : [ "findings", "summary" ],
+          "properties" : {
+            "findings" : {
+              "type" : "array",
+              "maxItems" : 20,
+              "items" : {
+                "type" : "object",
+                "additionalProperties" : false,
+                "required" : [ "line", "severity", "comment", "suggestion" ],
+                "properties" : {
+                  "line" : {
+                    "type" : "integer"
+                  },
+                  "severity" : {
+                    "type" : "string",
+                    "enum" : [ "critical", "major", "minor", "info" ]
+                  },
+                  "comment" : {
+                    "type" : "string"
+                  },
+                  "suggestion" : {
+                    "type" : "string"
+                  }
+                }
+              }
+            },
+            "summary" : {
+              "type" : "string"
+            }
+          }
+        },
+        "src/main/java/com/example/File34.java" : {
+          "type" : "object",
+          "additionalProperties" : false,
+          "required" : [ "findings", "summary" ],
+          "properties" : {
+            "findings" : {
+              "type" : "array",
+              "maxItems" : 20,
+              "items" : {
+                "type" : "object",
+                "additionalProperties" : false,
+                "required" : [ "line", "severity", "comment", "suggestion" ],
+                "properties" : {
+                  "line" : {
+                    "type" : "integer"
+                  },
+                  "severity" : {
+                    "type" : "string",
+                    "enum" : [ "critical", "major", "minor", "info" ]
+                  },
+                  "comment" : {
+                    "type" : "string"
+                  },
+                  "suggestion" : {
+                    "type" : "string"
+                  }
+                }
+              }
+            },
+            "summary" : {
+              "type" : "string"
+            }
+          }
+        },
+        "src/main/java/com/example/File35.java" : {
+          "type" : "object",
+          "additionalProperties" : false,
+          "required" : [ "findings", "summary" ],
+          "properties" : {
+            "findings" : {
+              "type" : "array",
+              "maxItems" : 20,
+              "items" : {
+                "type" : "object",
+                "additionalProperties" : false,
+                "required" : [ "line", "severity", "comment", "suggestion" ],
+                "properties" : {
+                  "line" : {
+                    "type" : "integer"
+                  },
+                  "severity" : {
+                    "type" : "string",
+                    "enum" : [ "critical", "major", "minor", "info" ]
+                  },
+                  "comment" : {
+                    "type" : "string"
+                  },
+                  "suggestion" : {
+                    "type" : "string"
+                  }
+                }
+              }
+            },
+            "summary" : {
+              "type" : "string"
+            }
+          }
+        },
+        "src/main/java/com/example/File36.java" : {
+          "type" : "object",
+          "additionalProperties" : false,
+          "required" : [ "findings", "summary" ],
+          "properties" : {
+            "findings" : {
+              "type" : "array",
+              "maxItems" : 20,
+              "items" : {
+                "type" : "object",
+                "additionalProperties" : false,
+                "required" : [ "line", "severity", "comment", "suggestion" ],
+                "properties" : {
+                  "line" : {
+                    "type" : "integer"
+                  },
+                  "severity" : {
+                    "type" : "string",
+                    "enum" : [ "critical", "major", "minor", "info" ]
+                  },
+                  "comment" : {
+                    "type" : "string"
+                  },
+                  "suggestion" : {
+                    "type" : "string"
+                  }
+                }
+              }
+            },
+            "summary" : {
+              "type" : "string"
+            }
+          }
+        },
+        "src/main/java/com/example/File37.java" : {
+          "type" : "object",
+          "additionalProperties" : false,
+          "required" : [ "findings", "summary" ],
+          "properties" : {
+            "findings" : {
+              "type" : "array",
+              "maxItems" : 20,
+              "items" : {
+                "type" : "object",
+                "additionalProperties" : false,
+                "required" : [ "line", "severity", "comment", "suggestion" ],
+                "properties" : {
+                  "line" : {
+                    "type" : "integer"
+                  },
+                  "severity" : {
+                    "type" : "string",
+                    "enum" : [ "critical", "major", "minor", "info" ]
+                  },
+                  "comment" : {
+                    "type" : "string"
+                  },
+                  "suggestion" : {
+                    "type" : "string"
+                  }
+                }
+              }
+            },
+            "summary" : {
+              "type" : "string"
+            }
+          }
+        },
+        "src/main/java/com/example/File38.java" : {
+          "type" : "object",
+          "additionalProperties" : false,
+          "required" : [ "findings", "summary" ],
+          "properties" : {
+            "findings" : {
+              "type" : "array",
+              "maxItems" : 20,
+              "items" : {
+                "type" : "object",
+                "additionalProperties" : false,
+                "required" : [ "line", "severity", "comment", "suggestion" ],
+                "properties" : {
+                  "line" : {
+                    "type" : "integer"
+                  },
+                  "severity" : {
+                    "type" : "string",
+                    "enum" : [ "critical", "major", "minor", "info" ]
+                  },
+                  "comment" : {
+                    "type" : "string"
+                  },
+                  "suggestion" : {
+                    "type" : "string"
+                  }
+                }
+              }
+            },
+            "summary" : {
+              "type" : "string"
+            }
+          }
+        },
+        "src/main/java/com/example/File39.java" : {
+          "type" : "object",
+          "additionalProperties" : false,
+          "required" : [ "findings", "summary" ],
+          "properties" : {
+            "findings" : {
+              "type" : "array",
+              "maxItems" : 20,
+              "items" : {
+                "type" : "object",
+                "additionalProperties" : false,
+                "required" : [ "line", "severity", "comment", "suggestion" ],
+                "properties" : {
+                  "line" : {
+                    "type" : "integer"
+                  },
+                  "severity" : {
+                    "type" : "string",
+                    "enum" : [ "critical", "major", "minor", "info" ]
+                  },
+                  "comment" : {
+                    "type" : "string"
+                  },
+                  "suggestion" : {
+                    "type" : "string"
+                  }
+                }
+              }
+            },
+            "summary" : {
+              "type" : "string"
+            }
+          }
+        },
+        "src/main/java/com/example/File40.java" : {
+          "type" : "object",
+          "additionalProperties" : false,
+          "required" : [ "findings", "summary" ],
+          "properties" : {
+            "findings" : {
+              "type" : "array",
+              "maxItems" : 20,
+              "items" : {
+                "type" : "object",
+                "additionalProperties" : false,
+                "required" : [ "line", "severity", "comment", "suggestion" ],
+                "properties" : {
+                  "line" : {
+                    "type" : "integer"
+                  },
+                  "severity" : {
+                    "type" : "string",
+                    "enum" : [ "critical", "major", "minor", "info" ]
+                  },
+                  "comment" : {
+                    "type" : "string"
+                  },
+                  "suggestion" : {
+                    "type" : "string"
+                  }
+                }
+              }
+            },
+            "summary" : {
+              "type" : "string"
+            }
+          }
+        }
+      }
+    },
+    "summary" : {
+      "type" : "string"
+    }
+  }
+}

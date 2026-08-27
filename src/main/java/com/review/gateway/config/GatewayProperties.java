@@ -212,6 +212,23 @@ public class GatewayProperties {
                             + "max-paths-per-section=" + diff.getMaxPathsPerSection() + ", max-files-per-chunk="
                             + structured.getMaxFilesPerChunk());
         }
+        // SGB-02 (Structured Output Grammar Budget, threat model SOGB-09): llama.cpp's grammar-parser
+        // complexity guard (src/llama-grammar.cpp, MAX_REPETITION_THRESHOLD = 2000) throws when a single
+        // repetition site's expanded rule count reaches that threshold. The "findings" array's maxItems
+        // is exactly such a site, once per file per chunk -- this bounds only that PER-SITE cost (a
+        // deliberate ~10x margin below 2000, not a tuned number), never the files x findings product,
+        // which is bounded empirically instead (gateway.structured.max-files-per-chunk, left at its
+        // current default pending the probe in docs/structured-output-grammar-budget-architecture.md §6).
+        if (structured.getMaxFindingsPerFile() > 200) {
+            throw new IllegalStateException(
+                    "gateway.structured.max-findings-per-file must be <= 200; got: "
+                            + structured.getMaxFindingsPerFile() + " -- above this, the 'findings' array's "
+                            + "maxItems repetition site risks tripping llama.cpp's grammar-parser complexity "
+                            + "guard (MAX_REPETITION_THRESHOLD = 2000; this check bounds only the per-file, "
+                            + "per-site cost, not gateway.structured.max-files-per-chunk x max-findings-per-file) "
+                            + "-- refusing to start");
+        }
+
         // SRO-38: fail fast on a typo'd on-invalid-response value rather than degrading it silently at
         // claim/result time -- ResultProcessor itself still defends via OnInvalidResponse.fromNullable
         // (never Enum.valueOf), but a bad *configured* value should never reach production unnoticed.
