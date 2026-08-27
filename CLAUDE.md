@@ -5,26 +5,42 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Repository state
 
 The staged build-out described below is **complete**. This is a working Java 21 / Spring Boot 3.2 repo,
-not a planning-only one:
+not a planning-only one. All of the following is merged into `master` (not living on an unmerged feature
+branch):
 
 - `src/main/java/com/review/gateway/` — the Gateway (this repo's root Maven module): entities, Flyway
   migrations, repositories, services, REST controllers, security config. Diff chunking (V2), Prompt
   Manager (V3, feature-flagged off by default), and Structured Review Output (V5, `promptVersion: v3`,
   not allowlisted by default) are all implemented on top of the original build-out. A `v3` Review is
-  decoder-constrained (on a capable, opted-in backend) and coverage-enforced (a per-file coverage list
-  is always rendered into the prompt, regardless of chunk count or constraint mode) — every response is
-  strictly parsed and validated against that coverage list on receipt, never trusting the decoder
-  constraint, the backend's mode, or `finish_reason` (see `README.md` §4.5/§6.1c).
+  coverage-enforced (a per-file coverage list is always rendered into the prompt, regardless of chunk
+  count or constraint mode) — every response is strictly parsed and validated against that coverage list
+  on receipt, never trusting the decoder constraint, the backend's mode, or `finish_reason` (see
+  `README.md` §4.5/§6.1c). Decoder-constrained mode (`backends.structured_output_mode`) is a *separate*,
+  currently-off-by-default opt-in on top of `v3` — see "Structured Output Grammar Budget" below before
+  ever turning it on.
+- **Structured Output Grammar Budget fix** (`docs/structured-output-grammar-budget-architecture.md` +
+  its threat model + SAST report): the JSON Schema `ReviewSchemaBuilder` builds for `v3` no longer emits
+  `maxLength` on any field — a bounded string repetition is what tripped llama.cpp's grammar-parser
+  complexity guard and made decoder-constrained mode fail 100% of the time in production before this fix.
+  Length is now a **receipt-side truncation bound** (`gateway.structured.max-comment-chars`/
+  `max-suggestion-chars`), never a schema constraint. Both backends currently ship with
+  `structured_output_mode = OFF`; re-enabling either one requires the empirical probes in that
+  architecture doc's §6 first (a schema that merely *looks* fine is not evidence it compiles).
 - `worker/` — a separate Maven module, the stateless LLM Worker (Executor) that claims jobs and calls
   `llama-server`. See `worker/README.md`.
-- `README.md` (root) — the authoritative deployment/integration guide: every endpoint, config property,
-  and error code actually implemented. **Read this, not the original spec docs, for current behavior.**
+- `README.md` (root) — the authoritative integration guide: every endpoint, feature flag, and error code
+  actually implemented, in plain language. **Read this, not the original spec docs, for current
+  behavior**; read `DEPLOYMENT.md` (below) for the exhaustive parameter-by-parameter reference.
 - `DEPLOYMENT.md` — step-by-step production deployment guide (secrets, PostgreSQL grants, systemd,
-  Docker Compose).
+  Docker Compose) **and the full grouped configuration/environment-variable reference** — read its
+  "Конфигурация: полный справочник параметров" section before touching any `.env`/`docker-compose.yml`/
+  `application.yml` value; several parameters look interchangeable but are not (documented there with the
+  incidents that found each one).
 - `docs/` — architecture and security artifacts per feature: `implementation-architecture.md`,
   `threat-model.md`/`worker-threat-model.md` (baseline), `prompt-manager-architecture.md`/
   `prompt-manager-threat-model.md` (V3), `structured-review-output-architecture.md`/
-  `structured-review-output-threat-model.md` (V5), and per-feature SAST reports under `docs/security/`.
+  `structured-review-output-threat-model.md` (V5), `structured-output-grammar-budget-architecture.md`/
+  `-threat-model.md` (the grammar-budget fix above), and per-feature SAST reports under `docs/security/`.
 
 The original spec docs are still present at the repo root (`Требования_Review_Gateway_v2.md`, `#
 Итоговая архитектура AI Code Review Platform.md`, `Системный промт для генерации кода Review
@@ -34,10 +50,12 @@ the code itself are authoritative — they get updated as features land; the spe
 
 ## Build toolchain
 
-No system-wide Java/Maven — use the local installs (export these in every shell before building):
+No system-wide Java/Maven — use a local JDK 21 install (export these in every shell before building). The
+exact path is machine-specific and has drifted before (`~/tools/jdk-21.0.11+10` doesn't exist on every
+checkout of this repo) — verify with `ls` before trusting either line blindly; on this machine it's:
 
 ```bash
-export JAVA_HOME="$HOME/tools/jdk-21.0.11+10"
+export JAVA_HOME="/c/Users/dmitr/.jdks/corretto-21.0.8"
 export PATH="$JAVA_HOME/bin:$HOME/tools/apache-maven-3.9.9/bin:$PATH"
 ```
 
@@ -127,11 +145,13 @@ user does not want the main assistant writing code itself for this project):
    `docs/worker-threat-model.md`; a feature gets its own `docs/<feature>-threat-model.md` if it's
    substantial, e.g. `docs/prompt-manager-threat-model.md`).
 3. `backend-developer` — implementation, on `feature/<slug>` (see prior branches:
-   `feature/diff-chunking`, `feature/prompt-manager`). Commit regularly, in logical chunks.
+   `feature/diff-chunking`, `feature/prompt-manager`, `feature/structured-review-output`) or `fix/<slug>`
+   for a bug/hardening pass against already-shipped behavior (e.g. `fix/structured-output-grammar-budget`,
+   `fix/worker-observability-and-claim-latency`). Commit regularly, in logical chunks.
 4. `qa-engineer` — functional/integration testing, beyond the developer's own unit tests.
 5. `appsec-engineer` — SAST/verification round; findings get their own
    `docs/security/feature-<slug>-sast-report.md` (see the existing ones for format/numbering
-   convention — each feature gets its own prefix, e.g. `F-DC-`/`F-PM-`).
+   convention — each feature/fix gets its own prefix, e.g. `F-DC-`/`F-PM-`/`F-SOGB-`).
 6. `backend-developer` — fix round against the SAST findings.
 7. `appsec-engineer` — final verification; merge to `master` only after this passes.
 

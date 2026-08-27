@@ -31,6 +31,7 @@ illustrative hostnames chosen for this runbook, not values baked into the code.
    - [8a. Upgrading to V2 (diff chunking)](#8a-upgrading-to-v2-diff-chunking)
    - [8b. Upgrading to V4 (Worker Observability & Claim Latency)](#8b-upgrading-to-v4-worker-observability--claim-latency)
    - [8c. Upgrading to V5 (Structured Review Output)](#8c-upgrading-to-v5-structured-review-output)
+   - [8d. Конфигурация: полный справочник параметров](#8d-конфигурация-полный-справочник-параметров)
 9. [Operations quick reference](#9-operations-quick-reference)
 10. [Config file appendix](#10-config-file-appendix)
 11. [Docker deployment (verified, both images)](#11-docker-deployment-verified-both-images)
@@ -959,7 +960,7 @@ prompts/*.yml` (`maxTokens` на шаблон). Эта таблица — еди
 | `gateway.structured.max-findings-per-file` | Gateway | 20 | Потолок числа находок на файл | Влияет на реальный размер ответа v3 (не входит в формулу бюджета напрямую) |
 | `gateway.structured.max-comment-chars` | Gateway | 1200 | **Receipt-side** потолок длины поля `comment` одной находки (НЕ `maxLength` схемы — Structured Output Grammar Budget fix убрал `maxLength` из схемы целиком, см. `docs/structured-output-grammar-budget-architecture.md` §1); превышение — truncate + `structuredFieldTruncated` счётчик, никогда не `SCHEMA_MISMATCH` | Влияет на реальный размер ответа v3 |
 | `gateway.structured.max-suggestion-chars` | Gateway | 2000 | То же самое для поля `suggestion` — truncate, а не decoder-`maxLength` | Влияет на реальный размер ответа v3 |
-| `llama.max-tokens` | Worker | 4096 | Глобальный дефолт `max_tokens`, если конкретный шаблон промпта его не переопределяет | Используется `v1.yml`/`v2.yml` (своего значения не задают) |
+| `llama.max-tokens` (`LLAMA_MAX_TOKENS`) | Worker | 12000 | Глобальный дефолт `max_tokens`, если конкретный шаблон промпта его не переопределяет | Используется `v1.yml`/`v2.yml` (своего значения не задают). **Три места должны совпадать**, см. "Проброс переменных" ниже |
 | `v3.yml` → `maxTokens` | Worker (файл шаблона) | 12000 | Реальный потолок токенов, которые модель может сгенерировать для v3-ответа | Должен быть ≥ `gateway.diff.answer-reserve` — иначе Gateway резервирует бюджет под ответ длиннее, чем Worker реально позволит модели сгенерировать |
 | `worker.limits.max-diff-bytes` | Worker | 262144 | Байтовый потолок на diff + chunkContext + systemMessages суммарно | Независим от токен-формулы Gateway'я, отдельная защита на стороне Worker'а (WSR-03) |
 | `worker.limits.max-response-bytes` | Worker | 200000 | Байтовый потолок на ответ LLM, который Worker готов принять | Тот же порядок величины, что и `gateway.publish.max-raw-response-length` (200000, §E в `application.yml`) — оба независимо ограничивают одно и то же на разных концах |
@@ -1001,6 +1002,186 @@ repeatedly, ask that project to resubmit with `promptVersion: v2` while investig
   fail-open `llama-server` build looks identical to a working one on a single happy-path request.
 - Do not relax `ck_backends_structured_output_mode` casually — only when actually adding a fifth mode,
   in its own migration.
+
+## 8d. Конфигурация: полный справочник параметров
+
+Три независимых слоя решают, какое значение реально увидит процесс: **дефолт в `application.yml`**
+(`${VAR:default}`, зашивается в jar на этапе сборки) → **дефолт в `Dockerfile`** (`ENV VAR="..."`,
+только у Worker'а, для голого `docker run` без compose) → **проброс в `docker-compose.yml`**
+(`VAR: ${VAR:-default}` в `environment:` конкретного сервиса). Все три реальных инцидента этой сессии
+были на стыке этих слоёв, а не в бизнес-логике — см. ниже.
+
+### Правило: Compose не пробрасывает `.env` автоматически
+
+`docker-compose.yml` подставляет `${VAR}` только там, где `VAR` **явно написан** в самом файле. Значение
+из `.env`, для которого нет соответствующей строки в `environment:` нужного сервиса, никуда не попадает —
+контейнер тихо использует то, что запечено в образ на момент сборки (`Dockerfile ENV` для Worker'а, или
+дефолт из `application.yml`, если `ENV` тоже не задан).
+
+**Инцидент этой сессии:** `LLAMA_MAX_TOKENS=12000` был в `.env`, но отсутствовал в `environment:` обоих
+`worker1`/`worker2`. Контейнеры молча брали `Dockerfile`'вский `ENV LLAMA_MAX_TOKENS="4096"` — что и
+вызывало пустые ответы модели (весь бюджет токенов уходил на "размышления" reasoning-модели, до
+финального ответа очередь не доходила). Правка — три строки, по одной на каждый слой:
+`docker-compose.yml`'s `environment:`, `worker/Dockerfile`'s `ENV`, и `application.yml`'s дефолт — все
+три должны совпадать (сейчас у всех троих `12000`).
+
+**Чек-лист при добавлении новой настраиваемой переменной:**
+1. Дефолт в `application.yml` (Gateway или Worker) — источник истины для локального запуска jar'а напрямую.
+2. Если это Worker и переменная должна работать без compose (`docker run`) — тот же дефолт в `worker/Dockerfile`'s `ENV`.
+3. Явная строка `VAR: ${VAR:-default}` в `environment:` **каждого** сервиса `docker-compose.yml`, которому она нужна (`worker1` и `worker2` — отдельно, копипаста, не общий блок).
+4. Дефолты во всех трёх местах — **одно и то же число**, иначе один из слоёв "выигрывает" молча.
+
+### Правило: параметр, которого нет в Java-классе, не крашит — он просто исчезает
+
+`GatewayProperties`/`WorkerProperties` игнорируют неизвестные ключи (Spring `ignoreUnknownFields`).
+Если из Java-класса убрали поле, а строку в `application.yml` не убрали — YAML не упадёт с ошибкой,
+конфиг выглядит рабочим, но значение никуда не биндится и ни на что не влияет.
+
+**Инцидент этой сессии:** `gateway.structured.answer-reserve: 8000` пережил рефакторинг, который объединил
+его с `gateway.diff.answer-reserve` и удалил поле `Structured.answerReserve` из кода. Ключ остался в
+`application.yml` с комментарием "заменяет `gateway.diff.answer-reserve`" — оператор, поменявший это
+значение, не увидел бы никакого эффекта. Проверка при подозрении на такое: `grep` имени свойства
+одновременно по `application.yml` **и** по классу `*Properties.java` — если совпадение только в первом,
+это мёртвый ключ.
+
+### Правило: два места с одним и тем же дефолтом могут разъехаться
+
+Когда один и тот же концептуальный дефолт задан в двух файлах (например, дефолт в `docker-compose.yml`'s
+`${VAR:-X}` и дефолт в `application.yml`'s `${VAR:Y}`), их никто не обязывает совпадать — обновили один,
+забыли другой.
+
+**Инцидент этой сессии:** `gateway.review.allowed-prompt-versions` — намеренно **не** должен включать
+`v3` по умолчанию (см. §2/§8c выше), но в какой-то момент `application.yml`'s дефолт стал `v1,v2,v3`, а
+`docker-compose.yml`'s — `v1,v2`, и они несколько раз расходились в разные стороны в процессе правок.
+Держите такие пары дефолтов равными; если это возможно, определяйте дефолт **только в одном** месте
+(`application.yml`) и в остальных ссылайтесь через `${VAR:-}` без второго литерала.
+
+### Группы параметров
+
+Группировка ниже совпадает с блоками `§A`–`§G` прямо в `src/main/resources/application.yml` и
+`§A`–`§C` в `worker/src/main/resources/application.yml` — те же буквы, тот же порядок.
+
+**Gateway, §A — секреты и подключение:**
+
+| Переменная | Свойство | Обязательна | Назначение |
+|---|---|---|---|
+| `CI_TOKEN` | `gateway.security.ci-token` | да | Bearer-токен GitLab CI для `POST/GET /reviews` |
+| `WORKER_TOKEN` | `gateway.security.worker-token` | да | Тот же токен передаётся Worker'у как `GATEWAY_API_KEY` — **должен совпадать буквально** между Gateway и каждым Worker'ом |
+| `ADMIN_TOKEN` | `gateway.security.admin-token` | да | `DELETE /reviews/{id}` |
+| `GITLAB_BASE_URL` | `gateway.gitlab.base-url` | нет (`https://gitlab.example.com/api/v4`) | Обязан быть `https://` (SR-15) |
+| `GITLAB_TOKEN` | `gateway.gitlab.token` | да | Токен с правом записи (публикация комментариев) |
+| `GITLAB_PROMPT_TOKEN` | `gateway.gitlab.prompt-token` | только если `PROMPT_MANAGER_ENABLED=true` | Отдельный **read-only** токен — никогда не тот же, что `GITLAB_TOKEN` |
+| `BACKEND_ALLOWED_HOST_PATTERN` | `gateway.backend.allowed-host-pattern` | нет (`.*`) | Сузить до реальной сети `llama-server` (защита от SSRF) |
+
+**Gateway, §B — бюджет LLM-токенов:** см. таблицу "Бюджет LLM-токенов: сводная таблица" в §8c выше —
+там же весь список `gateway.diff.*`/`gateway.structured.*` вместе с Worker-стороной и формулой.
+
+**Gateway, §C — Prompt Manager (опционально, выключено по умолчанию):**
+
+| Переменная | Свойство | Назначение |
+|---|---|---|
+| `PROMPT_MANAGER_ENABLED` | `gateway.prompt.enabled` | Kill-switch, по умолчанию `false` |
+| `PROMPT_CORPORATE_PROJECT` | `gateway.prompt.corporate.project` | `group/project` или числовой id — **никогда URL** |
+| `PROMPT_CORPORATE_REF` | `gateway.prompt.corporate.ref` | git-ref (по умолчанию `main`) |
+| `PROMPT_CORPORATE_BASE_PROMPT_PATH` | `gateway.prompt.corporate.base-prompt-path` | путь к базовому промпту в репозитории |
+| `PROMPT_CORPORATE_REVIEW_RULES_PATH` | `gateway.prompt.corporate.review-rules-path` | путь к правилам ревью |
+| `PROMPT_ON_ERROR` | `gateway.prompt.error-handling.on-error` | `FAIL` (по умолчанию) \| `SKIP_OPTIONAL` |
+
+**Gateway, §D–§F — очередь/публикация/планировщик:** без переменных окружения — только литералы в
+`application.yml` (`gateway.heartbeat.*`, `gateway.retry.*`, `gateway.job.*`, `gateway.publish.*`,
+`gateway.scheduler.*`). Меняются правкой файла, не `.env`.
+
+**Gateway, §G — allowlist промптов и Structured Output:**
+
+| Переменная | Свойство | Дефолт | Назначение |
+|---|---|---|---|
+| `ALLOWED_PROMPT_VERSIONS` | `gateway.review.allowed-prompt-versions` | `v1,v2` | `v3` добавляется явно, только когда весь парк Worker'ов уже несёт `v3.yml` |
+| `STRUCTURED_OUTPUT_ENABLED` | `gateway.structured.enabled` | `true` | Kill-switch: `false` — `v3` парсится как v1/v2, без decoder-constraint |
+| `STRUCTURED_OUTPUT_DEFAULT_MODE` | `gateway.structured.default-mode` | `OFF` | Дефолт для backend'ов с `structured_output_mode IS NULL` |
+| — | `backends.structured_output_mode` (столбец БД, не `.env`) | `NULL`→`OFF` | Включается точечно через `UPDATE backends SET ...` для одного backend'а, см. §8c |
+
+**Worker, §A — подключение:**
+
+| Переменная | Свойство | Обязательна | Назначение |
+|---|---|---|---|
+| `GATEWAY_URL` | `gateway.url` | да | Базовый URL Gateway |
+| `GATEWAY_API_KEY` | `gateway.api-key` | да | = Gateway'ю `WORKER_TOKEN`, буквально |
+| `BACKEND_ID` | `backend.id` | да | Должен совпадать со строкой `name` в таблице `backends` |
+| `WORKER_ID` | `worker.id` | да | Уникален на весь парк Worker'ов |
+| `WORKER_POLL_INTERVAL_MS` | `network.poll-interval-ms` | нет (`3000`) | Пауза между попытками `/jobs/claim`, когда очередь пуста |
+| `WORKER_REQUEST_TIMEOUT_SEC` | `network.request-timeout-sec` | нет (`1800`) | Таймаут ответа `llama-server` (один completion — десятки минут) |
+| `WORKER_GATEWAY_TIMEOUT_SEC` | `network.gateway-timeout-sec` | нет (`10`) | Таймаут запросов к Gateway (короткий, не должен ждать LLM) |
+| `WORKER_HEARTBEAT_INTERVAL_SEC` | `heartbeat.interval-sec` | нет (`60`) | Должен оставаться заметно ниже Gateway'вского `heartbeat.timeout` (180s) |
+
+**Worker, §B — модель и бюджет токенов:** `LLAMA_URL`, `LLAMA_MODEL`, `LLAMA_TEMPERATURE`,
+`LLAMA_MAX_TOKENS`, `LLAMA_ALLOW_NON_LOOPBACK`, `WORKER_MAX_DIFF_BYTES`, `WORKER_MAX_RESPONSE_BYTES`,
+`WORKER_MAX_SYSTEM_MESSAGES`, `WORKER_MAX_CONSTRAINT_BYTES` — все в общей сводной таблице бюджета
+токенов в §8c выше, вместе с Gateway-стороной.
+
+**Worker, §B — управление "размышлениями" модели (`LLAMA_ENABLE_THINKING`):** отдельный от бюджета
+токенов рубильник, но связан с ним по последствиям — reasoning-модель (Qwen3-подобная) тратит часть
+`max_tokens` на скрытый блок рассуждений до финального ответа; на большом diff'е это может съесть весь
+бюджет и оставить `content` пустым (`LLM_EMPTY_RESPONSE`, хотя backend исправен).
+
+| Переменная | Свойство | Дефолт | Эффект |
+|---|---|---|---|
+| `LLAMA_ENABLE_THINKING` | `llama.enable-thinking` | `true` | `true` — Worker не шлёт `chat_template_kwargs` вообще, поведение не меняется. `false` — на каждый запрос уходит `chat_template_kwargs: {"enable_thinking": false}`, безусловно отключая размышления для любой модели |
+
+**Это НЕ то же самое, что `--chat-template-kwargs` у самого `llama-server`** (флаг запуска процесса,
+задаёт дефолт для *всех* запросов, которые сами ничего не прислали). Если Worker явно посылает
+`chat_template_kwargs` (т.е. `LLAMA_ENABLE_THINKING=false`), это значение приходит от клиента и
+подменяет дефолт сервера целиком, а не сливается с ним. Рекомендуемый порядок опробования:
+1. Сначала настройте `reasoning_effort` (например `"low"`) через `--chat-template-kwargs` на самом
+   `llama-server` — ограничивает размышления, не убирая их совсем, и не требует трогать Worker вообще.
+2. `LLAMA_ENABLE_THINKING=false` — грубый резервный вариант, если backend не даёт так настроить, или
+   если reasoning нужно исключить полностью (не рекомендуется без причины — модель иногда находит более
+   тонкие баги именно "размышляя вслух").
+
+**Worker, §C — расположение промпт-шаблонов:** `prompt.location` — не через переменную окружения,
+жёстко `classpath:prompts/` (WSR-07: шаблоны только внутри jar, никогда с файловой системы, доступной
+оператору на запись).
+
+### Примеры `.env` для разных сценариев
+
+**1. Минимум — только v1/v2, без опциональных фич:**
+```dotenv
+DB_PASSWORD=...
+CI_TOKEN=...
+WORKER_TOKEN=...
+ADMIN_TOKEN=...
+GITLAB_TOKEN=...
+GITLAB_BASE_URL=https://gitlab.example.com/api/v4
+LLAMA_MODEL=qwen2.5-coder
+LLAMA_URL_1=http://192.168.1.101:8000
+LLAMA_URL_2=http://192.168.1.102:8000
+```
+`ALLOWED_PROMPT_VERSIONS` не задан → дефолт `v1,v2`, этого достаточно.
+
+**2. + Prompt Manager (промпт из корпоративного Git-репозитория вместо промпта из jar'а):**
+```dotenv
+# ...всё из сценария 1, плюс:
+PROMPT_MANAGER_ENABLED=true
+GITLAB_PROMPT_TOKEN=<отдельный read-only токен>
+PROMPT_CORPORATE_PROJECT=group/ai-review-prompts
+```
+
+**3. + Structured Output v3, БЕЗ decoder-constraint (безопасный дефолт — рекомендуется начинать отсюда):**
+```dotenv
+# ...всё из сценария 1/2, плюс:
+ALLOWED_PROMPT_VERSIONS=v1,v2,v3
+# STRUCTURED_OUTPUT_ENABLED/STRUCTURED_OUTPUT_DEFAULT_MODE оставить дефолтными (true/OFF) —
+# v3 работает по коверидж-списку и строгой пост-валидации, но без грамматики на стороне decoder'а.
+```
+CI (`.gitlab-ci.yml`) должен слать `promptVersion: "v3"`. `v3.yml` у **каждого** Worker'а уже должен
+быть задеплоен ("workers-first", см. §2).
+
+**4. + decoder-constraint (только после проб P-0…P-4 из
+`docs/structured-output-grammar-budget-architecture.md` §6 — НЕ включать вслепую, там же объяснено,
+почему это раньше валило llama-server на 100% запросов):**
+```sql
+-- на одном backend'е, канарейкой, не через .env:
+UPDATE backends SET structured_output_mode = 'RESPONSE_FORMAT_JSON_SCHEMA' WHERE name = 'llama-01';
+```
 
 ## 9. Operations quick reference
 

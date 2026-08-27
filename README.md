@@ -108,81 +108,53 @@ no Docker, and no manual setup is required to run the full suite locally.
 
 ## 4. Configuration
 
-All configuration lives in `src/main/resources/application.yml`. Every `${VAR}` / `${VAR:default}`
-placeholder below is read from an environment variable at startup (Spring's standard property
-resolution — no custom secrets manager).
+Every setting is an environment variable, read once at startup — there is no admin UI and no config
+reload. This section covers what's required to get running and what each optional feature turns on.
+**For the complete list of every setting (both the Gateway's and the Worker's), how they're wired
+through Docker, and which ones must be kept in sync with each other, see `DEPLOYMENT.md`'s "Конфигурация:
+полный справочник параметров"** — that's the file to check before changing any value, since several
+settings look independent but aren't.
 
 ### 4.1 Required secrets (no default — startup fails without them)
 
-`GatewayProperties.validateOnStartup()` (a `@PostConstruct` hook) refuses to let the application start
-if any of the following is missing or blank, and separately refuses to start if the GitLab base URL is
-not `https://`. The three bearer tokens (`CI_TOKEN`/`WORKER_TOKEN`/`ADMIN_TOKEN`) additionally must be
-**at least 32 characters** — `GITLAB_TOKEN` is checked for presence only, not length, since it is issued
-by GitLab itself in a fixed format (a project/group access token is exactly 26 characters, `glpat-` + 20)
-that the operator does not control; applying the same 32-character floor to it would reject every real
-GitLab token. The exception message never echoes the actual secret value, only the property name and,
-for the URL check, the scheme.
+The Gateway refuses to start if any of these is missing, blank, or (for the three tokens) shorter than
+32 characters. Error messages never repeat the secret's value back, only which one is missing.
 
-| Environment variable | Bound property | Purpose |
-|---|---|---|
-| `CI_TOKEN` | `gateway.security.ci-token` | Bearer token for GitLab-CI-facing endpoints (`POST /reviews`, `GET /reviews/{id}`). **≥32 chars.** |
-| `WORKER_TOKEN` | `gateway.security.worker-token` | Bearer token for Worker-facing endpoints (`POST /jobs/**`). **≥32 chars.** |
-| `ADMIN_TOKEN` | `gateway.security.admin-token` | Bearer token for admin endpoints (`DELETE /reviews/{id}`, `GET /backends`, `GET /metrics`). **≥32 chars.** |
-| `GITLAB_TOKEN` | `gateway.gitlab.token` | Token the Gateway itself uses to call the GitLab API when publishing comments (`PRIVATE-TOKEN` header). Never exposed to CI or Workers. **Presence-only check — a real `glpat-...` token (26 chars) is expected and accepted.** |
-| `DB_USER` | `spring.datasource.username` | PostgreSQL username. No default. |
-| `DB_PASSWORD` | `spring.datasource.password` | PostgreSQL password. No default. |
+| Environment variable | Purpose |
+|---|---|
+| `CI_TOKEN` | Bearer token GitLab CI uses to create/check reviews. |
+| `WORKER_TOKEN` | Bearer token a Worker uses to talk to the Gateway. **Must be the exact same value** you give every Worker's own `GATEWAY_API_KEY`. |
+| `ADMIN_TOKEN` | Bearer token for admin actions (cancel a review, view metrics). |
+| `GITLAB_TOKEN` | Token the Gateway itself uses to post comments back to GitLab. Never shared with CI or Workers. |
+| `DB_USER` / `DB_PASSWORD` | PostgreSQL credentials. |
 
-The three bearer/API tokens above should be random, high-entropy values (e.g. `openssl rand -hex 32`). The
-threat model recommends a least-privilege, expiring GitLab **project or group access token** scoped
-only to the projects under review for `GITLAB_TOKEN` — this is an operational choice made when the
-token is issued in GitLab, not something the application enforces.
+Generate the three bearer tokens as random values, e.g. `openssl rand -hex 32`. For `GITLAB_TOKEN`, use a
+GitLab project or group access token scoped only to the repositories under review, not a personal token
+with broad access.
 
-**A conditional fifth secret, `GITLAB_PROMPT_TOKEN`, only if you opt into Prompt Manager** (V3,
-`gateway.prompt.enabled`, default `false`) — see [§4.4](#44-prompt-manager-v3-optional). With the
-kill-switch at its default, this token is never required and `validatePromptOnStartup()` skips all
-`gateway.prompt.*` validation entirely.
+**One more secret, `GITLAB_PROMPT_TOKEN`, only if you turn on Prompt Manager** — see 4.4 below. Leave
+Prompt Manager off and this token is never checked or required.
 
 ### 4.2 Everything else (has a working default)
 
-| Property | Default | Purpose |
-|---|---|---|
-| `spring.datasource.url` (`DB_URL`) | `jdbc:postgresql://localhost:5432/review_gateway` | JDBC URL. See [§4.3](#43-deployment-must-dos-from-the-sast-report) for the non-loopback TLS note. |
-| `spring.datasource.hikari.maximum-pool-size` | `20` | Connection pool size. |
-| `server.port` | `8080` | HTTP listen port. |
-| `server.max-http-request-header-size` | `16KB` | Hard cap on request header size. |
-| `management.endpoints.web.exposure.include` | `health` | Only `/actuator/health` is exposed; no `/actuator/env`, `/actuator/beans`, etc. Business metrics are the custom `GET /metrics` endpoint, not an actuator/Prometheus endpoint (there is no Micrometer Prometheus registry in this project). |
-| `gateway.diff.context-window` | `16384` | Assumed LLM context window, in tokens, for the diff-size budget heuristic. |
-| `gateway.diff.prompt-reserve` | `2000` | Tokens reserved for prompt scaffolding. |
-| `gateway.diff.answer-reserve` | `4000` | Tokens reserved for the model's answer. |
-| `gateway.diff.max-diff-tokens` | `10000` | Explicit cap; the enforced budget is `min(max-diff-tokens, context-window - prompt-reserve - answer-reserve)` — 10000 with the stock defaults. **As of diff chunking (V2), this is the per-chunk budget**, not a whole-diff reject threshold — see [§6.1a](#61a-diff-chunking). |
-| `gateway.diff.chars-per-token` | `4` | Heuristic characters-per-token ratio (no real tokenizer is used); diff size is estimated as `ceil(chars / chars-per-token)`. |
-| `gateway.diff.max-chunks` | `5` | **V2.** Maximum number of chunks `DiffChunker` may split one diff into; a diff needing more is rejected with `422 DIFF_TOO_LARGE` rather than dispatched. Deliberately conservative (see the javadoc on `GatewayProperties.Diff.maxChunks` for the pool-starvation compute-cost math: `max-chunks × job.max-duration × retry.max-attempts` is the worst-case aggregate Worker time one MR can occupy). |
-| `gateway.diff.chunk-header-reserve-tokens` | `256` | **V2.** Tokens reserved per chunk for the injected cross-chunk context header (§6.1a); subtracted from the per-chunk budget during bin-packing. |
-| `gateway.diff.max-chunk-context-chars` | `1000` | **V2.** Hard cap (characters) on the rendered cross-chunk context header text; excess other-file paths collapse to `"... and N more"`. |
-| `gateway.diff.max-request-body-bytes` | `320000` | Hard byte cap on the whole `POST /reviews` body, enforced by a servlet filter **before** Spring/Jackson reads it (see [§6.9](#69-body-size-limits)). **V2:** derived from `max-chunks × max-diff-tokens × chars-per-token × 1.5 (JSON-escaping safety factor) + 20000 (fixed overhead)` — see `GatewayProperties.Diff.maxRequestBodyBytes` javadoc (CSR-02); if you change `max-chunks`/`max-diff-tokens`/`chars-per-token`, recompute and update this value too, it is not auto-derived. |
-| `gateway.heartbeat.timeout` | `180s` | A `RUNNING` job is considered stale if `now - heartbeat_at` exceeds this; it is then requeued or failed. |
-| `gateway.heartbeat.interval` | `60s` | **Documents** the expected Worker heartbeat cadence; as of this codebase it is not bound to any `GatewayProperties` field (only `gateway.heartbeat.timeout` is read by the application), so changing it has no runtime effect — it exists purely as the value Worker implementations should target for `POST /jobs/{id}/heartbeat` frequency. |
-| `gateway.retry.max-attempts` | `3` | Max claim attempts before a Review is marked `FAILED` instead of requeued. |
-| `gateway.retry.requeue-delay` | `90s` | **Worker Observability & Claim Latency.** Delay before a requeued job becomes claimable again (`review_jobs.not_before`). **90s, not the more obvious-looking 30s** — a startup check enforces `requeue-delay × (max-attempts − 1) ≥ gateway.backend.failure-grace`, so a dead/restarting backend's attempt budget can never be exhausted faster than it can be detected and demoted (see §10). `0` disables the mechanism entirely (immediate requeue, today's pre-this-feature behavior) and **must** be paired with `gateway.backend.failure-grace: 0` — neither may be zeroed alone. |
-| `gateway.job.max-duration` | `45m` | Hard backstop: a `RUNNING` job older than this is requeued/failed even if heartbeats are still arriving. |
-| `gateway.job.max-fail-body-bytes` | `4096` | Hard byte cap on the whole `POST /jobs/{id}/fail` body (edge filter, see [§6.9](#69-body-size-limits)). |
-| `gateway.publish.max-comment-count` | `50` | Max parsed comments kept per Review; excess is dropped. |
-| `gateway.publish.max-comment-length` | `4000` | Max characters per parsed comment; excess is truncated. |
-| `gateway.publish.max-raw-response-length` | `200000` | Max characters of the raw LLM response actually persisted; oversized responses are truncated (not rejected) before storage and parsing. |
-| `gateway.publish.max-request-body-bytes` | `500000` | Hard byte cap on the whole `POST /jobs/{id}/result` body (edge filter, see [§6.9](#69-body-size-limits)). |
-| `gateway.scheduler.heartbeat-check-interval` | `30s` | Tick interval for the stale-heartbeat sweep and the max-duration sweep. |
-| `gateway.scheduler.backend-health-interval` | `60s` | Tick interval for the backend health probe. |
-| `gateway.scheduler.publish-retry-interval` | `60s` | Tick interval for retrying publication of `COMPLETED` reviews. |
-| `gateway.gitlab.base-url` (`GITLAB_BASE_URL`) | `https://gitlab.example.com/api/v4` | GitLab API base URL. **Must** start with `https://` or the application refuses to start. |
-| `gateway.gitlab.connect-timeout` / `read-timeout` | `5s` / `30s` | Timeouts for the GitLab HTTP client. |
-| `gateway.backend.connect-timeout` / `read-timeout` | `3s` / `10s` | Timeouts for the backend `/health` probe client (which also disables following redirects). `read-timeout` was raised from `5s` — safe because the probe's HTTP call no longer runs inside a database transaction (see §10). |
-| `gateway.backend.allowed-host-pattern` (`BACKEND_ALLOWED_HOST_PATTERN`) | `.*` (matches any host) | Regex a backend's URL host must match before it is probed, on top of an always-on block of loopback/link-local/any-local/multicast addresses. **See the deployment must-do below — the default is permissive.** |
-| `gateway.backend.failure-grace` | `180s` | **Worker Observability & Claim Latency.** A backend flips `ACTIVE → SUSPECT` only after this many seconds of *continuous* failed health probes (fail-slow); recovery (`SUSPECT → ACTIVE`) stays single-success (recover-fast). Must be `≥ gateway.scheduler.backend-health-interval`; see the `requeue-delay` coupling above. |
-| `gateway.backend.defer-demotion-while-busy` | `true` | A failed probe does not demote a backend that is at capacity with at least one `RUNNING` job whose heartbeat is still fresh (dispatch-neutral: an at-capacity backend is already unclaimable). |
-| `gateway.backend.defer-demotion-max` | `45m` | Upper bound on how long the deferral above may postpone a demotion; past it, demotion proceeds regardless of capacity/heartbeat freshness. |
-| `worker.log.idle-summary-interval-sec` (`WORKER_IDLE_SUMMARY_INTERVAL_SEC`, **Worker module**) | `300` | At most one INFO idle-liveness summary line per this many seconds while a Worker finds no job to claim; `0` disables it. See [§9](#9-worker-protocol). |
-| `gateway.diff.max-paths-per-section` | `64` | **Structured Review Output (V5).** Unconditional (every `promptVersion`) memory-safety bound on the number of distinct file paths `DiffChunker` extracts from **one** `diff --git` section, regardless of whether that section is ever used for coverage — never fires on real `git diff` output (one section = one file); only reachable via a crafted diff. |
-| `gateway.review.allowed-prompt-versions` (`ALLOWED_PROMPT_VERSIONS`) | `v1,v2` | **Structured Review Output (V5, threat model SOR-08, CRITICAL).** Allowlist of `promptVersion` values accepted at `POST /reviews`; any other value is rejected immediately with `422 STRUCTURED_OUTPUT_UNSUPPORTED` (see [§6.1](#61-post-reviews--create-a-review)) — checked before any other work, including the cheap diff-size guard. `v3` is deliberately **absent** from the shipped default: an operator adds it explicitly, only after every Worker in the fleet already serves `v3.yml` (see [§4.5](#45-structured-review-output-v5-optional)). |
+Every other setting ships with a sensible default and doesn't need to be touched to get a working
+system. The two groups worth knowing about up front:
+
+- **Token budget** (how big a diff/prompt/answer can be): `gateway.diff.*` on the Gateway side, plus
+  matching settings on the Worker and in its prompt templates. These have to agree with each other
+  across two separate processes — see the full breakdown and worked example in `DEPLOYMENT.md`.
+- **Timeouts and retry** (heartbeats, stale-job cleanup, backend health checks): sensible out of the
+  box; only worth changing if your hardware is much slower/faster than typical, or your network has
+  unusual latency. Full list in `DEPLOYMENT.md`.
+
+Two settings deserve a mention here because getting them wrong fails silently rather than loudly:
+
+- **`BACKEND_ALLOWED_HOST_PATTERN`** — restricts which network the Gateway is allowed to send health
+  checks to. Ships permissive (`.*`, any host); tighten it to your actual backend network in production
+  (see the deployment must-dos right below).
+- **`ALLOWED_PROMPT_VERSIONS`** — which review formats (`v1`/`v2`/`v3`) the Gateway accepts. `v3`
+  (Structured Review Output, §4.5) is deliberately left out of the default until every Worker is ready
+  for it.
 
 ### 4.3 Deployment must-dos (from `docs/security/feature-03-sast-report.md`)
 
@@ -204,91 +176,52 @@ operational prerequisites called out by the SAST review before going to producti
 
 ### 4.4 Prompt Manager (V3, optional)
 
-**Off by default** (`gateway.prompt.enabled: ${PROMPT_MANAGER_ENABLED:false}`) — a stock or freshly
-upgraded Gateway keeps booting with today's Worker-JAR-only system prompt and never touches GitLab for
-prompts, byte-identical to pre-V3 behavior. This is a deliberate safe-by-default choice (see
-`docs/security/feature-prompt-manager-sast-report.md`, finding F-PM-02): defaulting to `true` would have
-broken every existing deployment's restart until it was fully configured.
+**Off by default.** Out of the box, the system prompt sent to the model is the one bundled inside the
+Worker's own build. Turning this feature on instead pulls that prompt from a Git repository — a shared
+"corporate" prompt everyone gets, plus optional per-project add-ons (an architecture note, coding-rules
+file) read from the project actually being reviewed. Nothing changes for anyone until you set
+`PROMPT_MANAGER_ENABLED=true` and point it at a repository — see `DEPLOYMENT.md` for every setting this
+unlocks (which files it reads, how to override the source repo per project, timeouts, size limits) and
+[`docs/prompt-manager-architecture.md`](docs/prompt-manager-architecture.md) for the full design.
 
-When enabled, the Gateway assembles the LLM's system prompt from Git-hosted content instead of the
-Worker's own bundled template, resolved once per Review at `POST /reviews` and persisted immutably —
-see [§6.1b](#61b-prompt-manager-and-system-prompt-assembly) for the full model. Full design docs:
-[`docs/prompt-manager-architecture.md`](docs/prompt-manager-architecture.md) and
-[`docs/prompt-manager-threat-model.md`](docs/prompt-manager-threat-model.md) (PMT-01..25/PMR-01..30).
-
-| Property | Env var | Default | Purpose |
-|---|---|---|---|
-| `gateway.prompt.enabled` | `PROMPT_MANAGER_ENABLED` | `false` | Master kill-switch. `false` = zero GitLab calls for prompts, exactly today's behavior. |
-| `gateway.gitlab.prompt-token` | `GITLAB_PROMPT_TOKEN` | none — required only if enabled | Separate, **read-only** GitLab token (`read_api`/`read_repository`, never `api`/write) used exclusively for prompt fetches, via a dedicated `gitLabPromptRestClient` — never shares a request with the write-scoped `GITLAB_TOKEN`. Presence-only check, same rationale as `GITLAB_TOKEN`. |
-| `gateway.prompt.corporate.project` | `PROMPT_CORPORATE_PROJECT` | none — required if enabled | Numeric id or `group/project` path of the **one**, org-wide corporate prompt repo. Always a project reference on the existing `gateway.gitlab.base-url` host — never a URL field (no SSRF sink). |
-| `gateway.prompt.corporate.ref` | `PROMPT_CORPORATE_REF` | `main` | Branch of the corporate repo. |
-| `gateway.prompt.corporate.base-prompt-path` | `PROMPT_CORPORATE_BASE_PROMPT_PATH` | `prompts/base-system-prompt.md` | Mandatory: task/rules/response-format section. |
-| `gateway.prompt.corporate.review-rules-path` | `PROMPT_CORPORATE_REVIEW_RULES_PATH` | `prompts/review-rules.md` | Mandatory: issue-classification/verdict rules section. |
-| `gateway.prompt.project.enabled` | — | `true` | Whether to also look for optional per-project sections at all. |
-| `gateway.prompt.project.architecture-path` | — | `.ai-review/architecture.md` | Optional: read from the **reviewed project's own default branch** (never the MR's own branch — see [§6.1b](#61b-prompt-manager-and-system-prompt-assembly)), unless overridden per-project. |
-| `gateway.prompt.project.code-rules-path` | — | `.ai-review/code-rules.md` | Optional, same sourcing rule. |
-| `gateway.prompt.project.overrides.<project_id>` | — | *(empty map)* | Per-project override: point a specific `project_id` at a different repo/ref/paths (e.g. a dedicated subteam prompt repo). Centrally administered in this YAML — not self-declared by the project being reviewed. Several `project_id`s may point at the same override repo. |
-| `gateway.prompt.error-handling.on-error` | `PROMPT_ON_ERROR` | `FAIL` | `FAIL` \| `SKIP_OPTIONAL`. Applies only to *optional* project-section failures (network/oversize/invalid content) — corporate-section failures are **always** `FAIL`, not configurable. A missing optional file at a *default* path (plain `404`) is never an error either way. |
-| `gateway.prompt.message-format` | — | `MULTI` | `MULTI` (one `ChatMessage` per section) \| `SINGLE` (all sections concatenated). Per-backend override via the `backends.prompt_message_format` column. |
-| `gateway.prompt.limits.max-system-prompt-tokens` | — | `6000` | Aggregate cap over all assembled sections; exceeding it is `422 PROMPT_TOO_LARGE`, distinct from `DIFF_TOO_LARGE`. Subtracted from the diff's own token budget dynamically, per Review — `gateway.diff.prompt-reserve` no longer covers the whole system prompt, only the Worker's fixed `user`-template wrapper text. |
-| `gateway.prompt.limits.max-file-bytes` | — | `262144` | Per-file streaming read bound (enforced while reading, not after buffering). |
-| `gateway.prompt.total-timeout` | — | `20s` | Wall-clock deadline across all GitLab calls for one Review's resolution; a bounded concurrency permit (`max-concurrent-resolutions`, default `4`) additionally caps how many resolutions run at once, so a slow/unavailable GitLab can never exhaust the Gateway's request-handling threads. |
+The one thing worth knowing before turning it on: this needs its own GitLab token
+(`GITLAB_PROMPT_TOKEN`), separate from the one the Gateway uses to post comments, and it should be
+**read-only** — it only ever reads prompt files, never writes anything.
 
 ### 4.5 Structured Review Output (V5, optional)
 
-**`promptVersion: "v3"`, not a global switch** — everything below is additive and per-Review; `v1`/`v2`
-Reviews are byte-for-byte unaffected. `v3` is **not** in the shipped default allowlist
-(`gateway.review.allowed-prompt-versions`, [§4.2](#42-everything-else-has-a-working-default)); an
-operator adds it explicitly, and only after **every Worker in the fleet already ships `v3.yml`**
-(Workers-first, Gateway second — see `worker/README.md` §10 and `DEPLOYMENT.md`'s upgrade section). Full
-design docs: [`docs/structured-review-output-architecture.md`](docs/structured-review-output-architecture.md)
-and [`docs/structured-review-output-threat-model.md`](docs/structured-review-output-threat-model.md)
-(SOR-01..23, SOR-INH-1/2/3).
+**A response *format*, chosen per review via `promptVersion: "v3"`** — not a global switch. Reviews
+using `v1`/`v2` are completely unaffected. `v3` isn't accepted until an operator explicitly adds it to
+`ALLOWED_PROMPT_VERSIONS`, and only after every Worker already has the `v3` prompt template deployed
+(Workers first, Gateway second). Full design in
+[`docs/structured-review-output-architecture.md`](docs/structured-review-output-architecture.md).
 
-For a `v3` Review, the Gateway computes a per-chunk **coverage list** (every changed file path) and
-renders it into the prompt whether or not a decoder constraint is used — this is what makes the feature
-work at all under the shipped `default-mode: OFF`. On a backend whose `structured_output_mode` is not
-`OFF`, the Gateway additionally attaches a JSON Schema (built from the same coverage list, never
-string-templated) to the outbound `/v1/chat/completions` call, so the model's response shape is
-constrained at decode time, not just requested in prose. Either way, the response is **strictly
-validated** against the coverage list on receipt (`StructuredResponseParser`) — a response that omits or
-invents a file, isn't valid JSON, or violates a length/count bound is a retryable validation failure, not
-a silently-accepted partial review. See [§6.1c](#61c-structured-review-output-and-response-validation)
-for the full validation/retry/failure-kind model.
+**What it changes:** a `v1`/`v2` review just asks the model to reply with a JSON list of comments and
+trusts whatever comes back — one malformed character anywhere in that list, and the whole response
+becomes unreadable and gets dumped into the MR as one ugly comment instead of being split up properly. A
+`v3` review instead tells the model exactly which files it must cover and checks the response against
+that list on arrival: a response that skips a file, isn't valid, or breaks a size limit is treated as a
+failure and retried, rather than silently accepted or dumped as garbage.
 
-| Property | Env var | Default | Purpose |
-|---|---|---|---|
-| `gateway.structured.enabled` | `STRUCTURED_OUTPUT_ENABLED` | `true` | Kill switch. `false` = no decoder constraint is ever sent (the coverage list is still rendered in the prompt and the response is still strictly validated) — a `v3` Review behaves exactly like `v2`, parsed by the same legacy `CommentParser`. The correct incident response to a structured-output-related production issue is this flag, not `on-invalid-response` below. |
-| `gateway.structured.default-mode` | `STRUCTURED_OUTPUT_DEFAULT_MODE` | `OFF` | Used whenever a backend's own `backends.structured_output_mode` column is `NULL`. `OFF` means "nothing about the bytes sent to llama-server changes" until an operator opts a specific backend in — see the rollout ladder below. |
-| `gateway.structured.max-files-per-chunk` | — | `40` | Upper bound on distinct files in one structured chunk; also bounds the coverage list/schema/response size. Coupled with `gateway.diff.max-paths-per-section` (must be `≥` this value) and with `gateway.diff.max-chunks` (a diff needing more than `max-chunks × max-files-per-chunk` distinct files is rejected at the edge with `422 DIFF_TOO_LARGE`). |
-| `gateway.structured.max-path-chars` | — | `256` | Max length of a file path accepted as a schema key (after sanitization); longer is `422 STRUCTURED_OUTPUT_UNSUPPORTED`. Must stay `≤ 300` (`ChunkContextRenderer`'s own, more generous path-length cap) — enforced at startup. |
-| `gateway.structured.max-schema-bytes` | — | `65536` | Backstop only — with the edge validation above in force, this should never fire; if it does, it is logged as a bug and the job fails closed with `SCHEMA_TOO_LARGE`. **Coupled with the Worker's `worker.limits.max-constraint-bytes` (default `69632`)** — the Worker's bound must stay comfortably above this one, since the wire-level `response_format`/`json_schema` wrapper llama-server expects adds bytes on top of the raw schema; see `worker/README.md` §5.2. |
-| `gateway.structured.max-findings-per-file` | — | `20` | Schema's `maxItems` for one file's `findings` array; re-checked on the received response too (never trusts the decoder constraint alone). **Must stay `≤ 200`** — enforced at startup (Structured Output Grammar Budget, SGB-02): above that, this repetition site risks tripping llama.cpp's grammar-parser complexity guard (`MAX_REPETITION_THRESHOLD = 2000`). |
-| `gateway.structured.max-comment-chars` / `max-suggestion-chars` | — | `1200` / `2000` | **Receipt-side truncation bounds only** — as of the Structured Output Grammar Budget fix, `ReviewSchemaBuilder` no longer emits `maxLength` in the schema at all (a bounded string repetition is exactly what tripped llama.cpp's grammar-parser complexity guard in production — see `docs/structured-output-grammar-budget-architecture.md` §1). An over-length `comment`/`suggestion` is truncated to this cap on receipt and published (never a `SCHEMA_MISMATCH`), with a `structuredFieldTruncated{field}` metrics counter and, for a truncated suggestion, the same `ALTERED_CODE_MARKER` a sanitizer-altered block gets. |
-| `gateway.structured.per-file-summary` | — | `true` | Requires a non-empty per-file `summary` field — an anti-skip device (a model that silently drops a file is more likely to also skip its summary). `false` saves tokens at the cost of a weaker signal. |
-| `gateway.structured.on-invalid-response` | — | `RETRY_THEN_FAIL` | `RETRY_THEN_FAIL` (default) or `RETRY_THEN_FALLBACK`. **`RETRY_THEN_FALLBACK` is a documented risk re-acceptance, not a quality knob** — see the callout below. |
-| `gateway.structured.include-diff-context` / `diff-context-lines` | — | `true` / `3` | Whether a rendered finding includes a fenced `diff`-language excerpt (±N lines) around its line, taken only from that finding's own file section of the **locked job row's own chunk diff** — never from anything in the model's response. |
+There's a second, optional layer on top: for a specific, opted-in backend, the Gateway can also make the
+underlying model server itself incapable of producing anything but the expected shape (a "decoder
+constraint"), instead of just asking nicely. This is off by default for every backend
+(`backends.structured_output_mode = OFF`) and should stay off until you've run the compatibility checks
+in `DEPLOYMENT.md` — some model-server builds silently ignore this setting rather than rejecting it,
+which is worse than not using it at all if nobody notices.
 
-`gateway.diff.answer-reserve` (default `4000`) sizes the diff-chunking budget for **both** v1/v2 and
-structured (`v3`) Reviews — there is no separate `structured.answer-reserve` (a formerly-separate
-property was merged into this one, `chore/answer-reserve-consolidation`, after repeatedly causing an
-operator to raise one and forget the other). **Must match `v3.yml`'s `maxTokens` (`8192`)** — the two
-are read by different processes (Gateway budgeting vs. the Worker's actual `llama-server` request) and a
-mismatch is silent: nothing fails loudly, a too-small `answer-reserve` just risks a truncated completion
-under a large chunk. See `DEPLOYMENT.md`'s "Бюджет LLM-токенов: сводная таблица" for the full
-cross-process picture.
+**Two settings you might reasonably want to change; everything else has a fine default and is covered
+in `DEPLOYMENT.md`:**
 
-**`RETRY_THEN_FALLBACK` re-accepts a residual, on an attacker-reachable path.** When the attempt budget
-is exhausted, this setting makes the Gateway fall back to the legacy `CommentParser`'s genuine
-JSON-array branch (never the raw-transcript placeholder — the published comment is always prefixed with
-a fixed `**UNVALIDATED**` line) rather than ending the Review `FAILED`. That fallback comment goes
-through the same prose pipeline v1/v2 always has, which does **not** strip control/format characters
-(the SR-08/SR-09 residual documented in the baseline threat model) — and reaching the fallback at all
-can be forced by an MR author (a crafted diff that deterministically fails structured validation). Treat
-enabling this as accepting that residual on a now-reachable path, not merely as "publish more often". If
-an incident traces back to this fallback, the correct response is `gateway.structured.enabled=false`
-(which stops the fallback from ever firing, since there is no structured validation left to fall back
-*from*), not toggling this setting off in isolation.
+- `STRUCTURED_OUTPUT_ENABLED` — the kill switch. Turn it off and `v3` reviews behave exactly like `v2`
+  (same parsing, same tolerance for a slightly malformed response) with no code change or redeploy. This
+  is the right lever to pull first if a `v3`-related problem shows up in production.
+- `gateway.structured.on-invalid-response` — what happens when a `v3` response keeps failing validation
+  after every retry. The default, `RETRY_THEN_FAIL`, ends that review as failed. The alternative,
+  `RETRY_THEN_FALLBACK`, publishes the model's answer anyway (clearly labeled "unvalidated") rather than
+  giving up — a deliberate trade-off, not a free quality improvement, since it reintroduces some of the
+  malformed-response risk `v3` exists to remove. Treat flipping it back to the default as the fix for an
+  incident traced to this fallback, not `STRUCTURED_OUTPUT_ENABLED`.
 
 **Rollout ladder** (from the architecture doc §11 — every stage past the initial deploy is a data/CI
 change, never a redeploy):
