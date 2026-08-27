@@ -80,12 +80,19 @@ llama:
   url: ${LLAMA_URL:http://127.0.0.1:8000}   # URL локального (или разрешённого нелокального, см. allow-non-loopback) llama-server, к которому Worker отправляет запросы на инференс
   model: ${LLAMA_MODEL}            # имя/идентификатор модели, которое передаётся в запросе к llama-server
   temperature: ${LLAMA_TEMPERATURE:0.1}   # параметр temperature для генерации LLM — степень случайности/творчества ответа (ниже — более детерминированный ответ)
-  max-tokens: ${LLAMA_MAX_TOKENS:12000}    # максимальное число токенов в ответе, которое Worker запрашивает у llama-server, если шаблон промпта (prompts/*.yml) не переопределяет своё значение maxTokens (например, v3.yml -> 8192) — ЧАСТЬ ОБЩЕГО БЮДЖЕТА ТОКЕНОВ, должна расти вместе с gateway.structured.answer-reserve для v3 (см. сводную таблицу в DEPLOYMENT.md)
+  max-tokens: ${LLAMA_MAX_TOKENS:12000}    # максимальное число токенов в ответе, которое Worker запрашивает у llama-server, если шаблон промпта (prompts/*.yml) не переопределяет своё значение maxTokens (v3.yml -> 12000) — ЧАСТЬ ОБЩЕГО БЮДЖЕТА ТОКЕНОВ, должна расти вместе с gateway.diff.answer-reserve (см. сводную таблицу в DEPLOYMENT.md)
   # WSR-06 (SHOULD): a non-loopback llama.url only warns at startup unless this is set, since the
   # llama-server socket is unauthenticated by design.
   # WSR-06 (рекомендация): если llama.url указывает не на loopback-адрес, при старте выводится только
   # предупреждение, если этот флаг не установлен — сокет llama-server по замыслу не аутентифицирован.
   allow-non-loopback: ${LLAMA_ALLOW_NON_LOOPBACK:false}   # явно подтверждает, что llama.url намеренно указывает на нелокальный (не loopback) адрес — убирает предупреждение при старте, но не отменяет риск незащищённого сокета llama-server
+  # true (по умолчанию) — Worker не шлёт chat_template_kwargs вообще, поведение запроса не меняется.
+  # false — на КАЖДЫЙ запрос уходит chat_template_kwargs: {"enable_thinking": false}, безусловно
+  # отключая "размышления" reasoning-модели (Qwen3-подобные). Грубый, безусловный рубильник — если backend
+  # поддерживает собственный флаг запуска --chat-template-kwargs, предпочтительнее настроить там
+  # reasoning_effort (например "low"): это ограничивает размышления, а не убирает их совсем, и не требует
+  # трогать Worker. См. DEPLOYMENT.md "Управление reasoning/thinking у модели".
+  enable-thinking: ${LLAMA_ENABLE_THINKING:true}
 
 # worker.limits.* ниже — тоже часть общего бюджета токенов (см. банер выше). worker.id/version/
 # allow-insecure-gateway/log в этом же блоке к бюджету не относятся, но остаются здесь же: это все

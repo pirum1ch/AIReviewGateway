@@ -7,12 +7,14 @@ import org.springframework.http.client.JdkClientHttpRequestFactory;
 import org.springframework.web.client.RestClient;
 
 import java.net.http.HttpClient;
+import java.util.function.Supplier;
 
 /**
  * Two {@code RestClient} beans (not the deprecated {@code RestTemplate}), per architecture §11/§7:
  * {@code gitLabRestClient} (fixed, admin-configured base URL + token) and
- * {@code backendProbeRestClient} (per-backend URL supplied at call time by
- * {@code BackendProberImpl}, SSRF-hardened at the transport layer — SR-10: redirects are disabled here
+ * {@code backendProbeRestClientFactory} (a {@code Supplier}, not a shared instance — see its own javadoc;
+ * per-backend URL supplied at call time by {@code BackendProberImpl}), SSRF-hardened at the transport
+ * layer — SR-10: redirects are disabled here
  * so a compromised/malicious backend cannot redirect the probe to an internal target the allowlist
  * would otherwise reject).
  */
@@ -75,19 +77,31 @@ public class RestClientConfig {
                 .build();
     }
 
+    /**
+     * A <b>factory</b>, not a shared client: {@code BackendProberImpl} calls {@code .get()} for a fresh
+     * {@code RestClient} on every single probe. A pooled/shared client's keep-alive connection can
+     * survive a remote {@code llama-server} restart and come back silently poisoned (the OS-level socket
+     * looks fine to the JDK's connection pool but the process on the other end is new) — and unlike a
+     * genuinely dead connection, that failure mode does not reliably surface as an exception, so a
+     * shared client can under-report backend health indefinitely. A fresh client per probe costs one
+     * extra TCP handshake per health check (`gateway.backend.*-interval`, tens of seconds apart) in
+     * exchange for never trusting a stale connection's silence.
+     */
     @Bean
-    public RestClient backendProbeRestClient() {
-        HttpClient httpClient = HttpClient.newBuilder()
-                .connectTimeout(properties.getBackend().getConnectTimeout())
-                // SR-10: never follow a redirect on the probe client -- a malicious/compromised backend
-                // must not be able to redirect this call to an internal target.
-                .followRedirects(HttpClient.Redirect.NEVER)
-                .build();
-        JdkClientHttpRequestFactory requestFactory = new JdkClientHttpRequestFactory(httpClient);
-        requestFactory.setReadTimeout(properties.getBackend().getReadTimeout());
+    public Supplier<RestClient> backendProbeRestClientFactory() {
+        return () -> {
+            HttpClient httpClient = HttpClient.newBuilder()
+                    .connectTimeout(properties.getBackend().getConnectTimeout())
+                    // SR-10: never follow a redirect on the probe client -- a malicious/compromised backend
+                    // must not be able to redirect this call to an internal target.
+                    .followRedirects(HttpClient.Redirect.NEVER)
+                    .build();
+            JdkClientHttpRequestFactory requestFactory = new JdkClientHttpRequestFactory(httpClient);
+            requestFactory.setReadTimeout(properties.getBackend().getReadTimeout());
 
-        return RestClient.builder()
-                .requestFactory(requestFactory)
-                .build();
+            return RestClient.builder()
+                    .requestFactory(requestFactory)
+                    .build();
+        };
     }
 }

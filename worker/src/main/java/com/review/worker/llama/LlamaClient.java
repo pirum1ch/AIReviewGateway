@@ -1,5 +1,6 @@
 package com.review.worker.llama;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.review.worker.config.WorkerProperties;
 import com.review.worker.core.LlamaResult;
@@ -28,6 +29,7 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
@@ -89,6 +91,13 @@ public class LlamaClient {
     private final HttpClient sharedHttpClient;
     private final ObjectMapper objectMapper;
     private final WorkerProperties properties;
+    /**
+     * {@code worker.llama.enable-thinking} (default {@code true}) computed once at startup, never
+     * per-request: {@code null} unless the operator explicitly opts out of thinking mode, in which case
+     * every request carries {@code chat_template_kwargs: {"enable_thinking": false}}. See
+     * {@code WorkerProperties.Llama#isEnableThinking} and {@link ChatCompletionRequest}'s javadoc.
+     */
+    private final JsonNode chatTemplateKwargs;
 
     public LlamaClient(@Qualifier("llamaRestClient") RestClient llamaRestClient,
                         HttpClient sharedHttpClient,
@@ -98,6 +107,9 @@ public class LlamaClient {
         this.sharedHttpClient = sharedHttpClient;
         this.objectMapper = objectMapper;
         this.properties = properties;
+        this.chatTemplateKwargs = properties.getLlama().isEnableThinking()
+                ? null
+                : objectMapper.valueToTree(Map.of("enable_thinking", false));
     }
 
     /**
@@ -107,7 +119,8 @@ public class LlamaClient {
      *                         abandon the job, never submit a synthetic/partial result).
      */
     public LlamaResult chatCompletion(List<ChatMessage> messages, String model, double temperature, int maxTokens) {
-        ChatCompletionRequest request = new ChatCompletionRequest(model, messages, temperature, maxTokens);
+        ChatCompletionRequest request = new ChatCompletionRequest(model, messages, temperature, maxTokens,
+                null, null, chatTemplateKwargs);
         long startedAt = System.currentTimeMillis();
         ChatCompletionResponse response;
         try {
@@ -159,7 +172,7 @@ public class LlamaClient {
     public AsyncCompletion startChatCompletion(List<ChatMessage> messages, String model, double temperature,
                                                 int maxTokens, DecoderConstraint constraint) {
         ChatCompletionRequest requestBody = new ChatCompletionRequest(model, messages, temperature, maxTokens,
-                constraint.responseFormat(), constraint.jsonSchema());
+                constraint.responseFormat(), constraint.jsonSchema(), chatTemplateKwargs);
         byte[] payload;
         try {
             payload = objectMapper.writeValueAsBytes(requestBody);

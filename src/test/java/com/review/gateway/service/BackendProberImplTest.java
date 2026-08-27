@@ -25,7 +25,7 @@ class BackendProberImplTest {
         RestClient.Builder builder = RestClient.builder();
         mockServer = MockRestServiceServer.bindTo(builder).build();
         properties = new GatewayProperties();
-        prober = new BackendProberImpl(builder.build(), properties);
+        prober = new BackendProberImpl(builder::build, properties);
     }
 
     private Backend backendWithUrl(String url) {

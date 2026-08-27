@@ -487,6 +487,20 @@ public class WorkerProperties {
         private int maxTokens = 4096;
         /** WSR-06: suppresses the non-loopback warning for an intentional non-loopback deployment. */
         private boolean allowNonLoopback = false;
+        /**
+         * {@code true} (default) sends no {@code chat_template_kwargs} at all -- byte-identical to every
+         * existing request, no behavior change without an explicit operator opt-in. {@code false} sends
+         * {@code chat_template_kwargs: {"enable_thinking": false}} on every request, unconditionally
+         * suppressing a reasoning model's hidden "thinking" pass (a Qwen3-family build otherwise spends
+         * part of {@code max_tokens} on a hidden {@code reasoning_content} block before the actual answer,
+         * which can exhaust the whole budget on a large diff and leave {@code message.content} empty --
+         * surfaces as {@code LLM_EMPTY_RESPONSE} even though the backend is healthy). Prefer tuning
+         * {@code reasoning_effort} via the backend's own {@code --chat-template-kwargs} startup flag
+         * first (bounds thinking without removing it); this flag is the blunt, always-off fallback for a
+         * backend where that isn't available. llama-server ignores the field for chat templates that
+         * don't support it.
+         */
+        private boolean enableThinking = true;
 
         public String getUrl() {
             return url;
@@ -526,6 +540,14 @@ public class WorkerProperties {
 
         public void setAllowNonLoopback(boolean allowNonLoopback) {
             this.allowNonLoopback = allowNonLoopback;
+        }
+
+        public boolean isEnableThinking() {
+            return enableThinking;
+        }
+
+        public void setEnableThinking(boolean enableThinking) {
+            this.enableThinking = enableThinking;
         }
     }
 

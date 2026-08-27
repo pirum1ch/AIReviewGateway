@@ -32,19 +32,20 @@ class ChatCompletionRequestSerializationTest {
     }
 
     @Test
-    void nullResponseFormatAndJsonSchemaAreOmittedViaTheSixArgConstructorToo() throws Exception {
-        ChatCompletionRequest request = new ChatCompletionRequest("model-x", List.of(), 0.2, 100, null, null);
+    void nullResponseFormatAndJsonSchemaAreOmittedViaTheSevenArgConstructorToo() throws Exception {
+        ChatCompletionRequest request = new ChatCompletionRequest("model-x", List.of(), 0.2, 100, null, null, null);
 
         String json = mapper.writeValueAsString(request);
 
         assertThat(json).doesNotContain("response_format");
         assertThat(json).doesNotContain("json_schema");
+        assertThat(json).doesNotContain("chat_template_kwargs");
     }
 
     @Test
     void responseFormatIsIncludedWhenSet() throws Exception {
         JsonNode schema = mapper.readTree("{\"type\":\"json_schema\"}");
-        ChatCompletionRequest request = new ChatCompletionRequest("model-x", List.of(), 0.2, 100, schema, null);
+        ChatCompletionRequest request = new ChatCompletionRequest("model-x", List.of(), 0.2, 100, schema, null, null);
 
         JsonNode root = mapper.readTree(mapper.writeValueAsString(request));
 
@@ -56,12 +57,22 @@ class ChatCompletionRequestSerializationTest {
     @Test
     void jsonSchemaIsIncludedWhenSet() throws Exception {
         JsonNode schema = mapper.readTree("{\"type\":\"object\"}");
-        ChatCompletionRequest request = new ChatCompletionRequest("model-x", List.of(), 0.2, 100, null, schema);
+        ChatCompletionRequest request = new ChatCompletionRequest("model-x", List.of(), 0.2, 100, null, schema, null);
 
         JsonNode root = mapper.readTree(mapper.writeValueAsString(request));
 
         assertThat(root.has("json_schema")).isTrue();
         assertThat(root.at("/json_schema/type").asText()).isEqualTo("object");
         assertThat(root.has("response_format")).isFalse();
+    }
+
+    @Test
+    void chatTemplateKwargsIsIncludedOnlyWhenSet() throws Exception {
+        JsonNode noThinking = mapper.valueToTree(java.util.Map.of("enable_thinking", false));
+        ChatCompletionRequest request = new ChatCompletionRequest("model-x", List.of(), 0.2, 100, null, null, noThinking);
+
+        JsonNode root = mapper.readTree(mapper.writeValueAsString(request));
+
+        assertThat(root.at("/chat_template_kwargs/enable_thinking").asBoolean()).isFalse();
     }
 }
