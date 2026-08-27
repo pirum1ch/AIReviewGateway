@@ -121,9 +121,11 @@ public class TextSanitizer {
      * {@code String} that is not encodable (SOGT-02) -- Jackson's UTF-8 writer and the JDBC driver are
      * not obliged to accept a lone surrogate. This backs the cut off by one {@code char} whenever the
      * character immediately before it is a high surrogate, so the result always ends on a whole code
-     * point. Deliberately a distinct helper from {@link #capLength}/{@code CommentRenderer.capLength}
-     * (both pre-existing, both plain {@code substring} -- SOGT-02 flagged them as a general observation,
-     * out of scope for this fix) rather than a third re-implementation of the same cut.
+     * point. Deliberately a distinct helper from this class's own {@link #capLength} (pre-existing,
+     * appends {@code TRUNCATION_SUFFIX} and is not surrogate-safe -- SOGT-02 flagged it as a general
+     * observation, out of scope for this fix) rather than a third re-implementation of the same cut.
+     * {@code CommentRenderer.capLength} no longer has this problem: as of the QA fix round (commit
+     * {@code 2ae6d61}) it delegates to this very method instead of cutting on its own.
      *
      * @return {@link Truncation#truncated()} {@code false} with the original text unchanged if it
      *         already fits; otherwise the safely-cut prefix and {@code true}. {@code null} in, {@code

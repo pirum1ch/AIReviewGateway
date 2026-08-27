@@ -109,8 +109,8 @@ gateway:
     max-path-chars: 256          # SRO-65: максимальная длина пути, допустимого в качестве ключа схемы (после sanitizePath); длиннее -- 422 STRUCTURED_OUTPUT_UNSUPPORTED
     max-schema-bytes: 65536      # SRO-15: backstop -- при исправных SRO-65/66 не должен срабатывать никогда
     max-findings-per-file: 20    # SRO-27 -> maxItems массива findings
-    max-comment-chars: 1200      # SRO-27 -> maxLength поля comment одного finding
-    max-suggestion-chars: 2000   # SRO-27 -> maxLength поля suggestion одного finding
+    max-comment-chars: 1200      # SGB-01/SOGB-12: receipt-side truncation bound only -- schema больше не эмитит maxLength (см. docs/structured-output-grammar-budget-architecture.md §1); over-length comment усекается на приёме и публикуется, а не отклоняется как SCHEMA_MISMATCH
+    max-suggestion-chars: 2000   # SGB-01/SOGB-12: то же самое для suggestion -- см. комментарий выше
     per-file-summary: true       # SRO-25: включает обязательное поле summary на уровне файла (anti-skip device); false экономит токены ценой более слабой защиты от пропуска файла
     on-invalid-response: RETRY_THEN_FAIL   # SRO-38/68: RETRY_THEN_FAIL (по умолчанию) | RETRY_THEN_FALLBACK (emergency escape hatch, публикует только генуинный JSON-массив с меткой "UNVALIDATED")
     include-diff-context: true   # SRO-51: включает извлечение и рендер блока ```diff с контекстом вокруг строки finding

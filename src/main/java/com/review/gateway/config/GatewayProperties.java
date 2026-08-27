@@ -1356,9 +1356,9 @@ public class GatewayProperties {
         private int maxSchemaBytes = 65536;
         /** SRO-27 -&gt; {@code maxItems} on the {@code findings} array. */
         private int maxFindingsPerFile = 20;
-        /** SRO-27 -&gt; finding {@code comment} {@code maxLength}. */
+        /** SGB-01/SOGB-12: receipt-side truncation bound only — the schema no longer emits {@code maxLength} for finding {@code comment} (Structured Output Grammar Budget); over-length values are truncated on receipt and published, never {@code SCHEMA_MISMATCH}. */
         private int maxCommentChars = 1200;
-        /** SRO-27 -&gt; finding {@code suggestion} {@code maxLength}. */
+        /** SGB-01/SOGB-12: same as {@link #maxCommentChars}, for finding {@code suggestion}. */
         private int maxSuggestionChars = 2000;
         /** SRO-25: token-budget lever — {@code false} omits the per-file {@code summary} property entirely. */
         private boolean perFileSummary = true;
