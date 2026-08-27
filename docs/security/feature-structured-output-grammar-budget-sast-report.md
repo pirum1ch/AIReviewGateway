@@ -494,3 +494,160 @@ correct and unblocked on the production-code side; `SOGB-02`'s probes gate the s
 `SOGB-04` — corrected the "…and its own DTO/**enum** set" wording that produced `F-SOGB-01`, marked
 `[appsec SAST-round correction, F-SOGB-01]`, per the same inline-correction convention the
 pre-implementation round used on the architecture doc. No production code was modified by this round.
+
+---
+
+## 8. Final verification (step 7 — merge gate)
+
+Round: **step 7 of CLAUDE.md's feature workflow**, following a `backend-developer` fix round (`63806d0`,
+`f5b4edc`) that closed every finding in §1 above. Scope: `chore/config-consolidation..HEAD` (7 commits,
+`af620fd..f5b4edc`), independently re-derived against shipped code — no finding from this section was
+accepted on the strength of a prior round's own report.
+
+### Verdict: **PASS.** 0 Critical, 0 High, 0 Medium. Branch is ready to merge into `chore/config-consolidation`.
+
+Four Info-level carry-forwards remain (§8.4), none merge-blocking.
+
+### 8.1 Test suites — independently reproduced
+
+| Module | Command | Result |
+|---|---|---|
+| Gateway (`.`) | `JAVA_HOME=/c/Users/dmitr/.jdks/corretto-21.0.8 mvn -o test` | **853 run, 0 failures, 0 errors — BUILD SUCCESS** |
+| Worker (`worker/`) | same | **163 run, 0 failures, 0 errors — BUILD SUCCESS** |
+
+Matches the fix round's own reported counts exactly. Two temporary probe tests
+(`src/test/java/com/review/gateway/service/ZzAppsecProbeTest.java` and one ad-hoc reflection probe) were
+written, run, and deleted; `git status` confirmed identical before and after. No production code was
+modified by this round.
+
+### 8.2 §1 findings — re-verified closed against current code, not against commit messages
+
+- **`F-SOGB-01` — CLOSED, and stronger than specified.** `StructuredResponseParserTest.java:563-630`: the
+  package-prefix leak and the fields-only scan are both gone — the replacement is an exact-`Class<?>`
+  allow-list covering fields, constructor parameters, method parameters, and return types, plus explicit
+  named `isNotEqualTo(StructuredOutputMode.class)`/`isNotEqualTo(Backend.class)` deny assertions. A
+  reflection probe diffing the allow-list against every type actually declared on the class today found
+  **zero dead entries** — every permission is load-bearing, which is a stronger property than the SAST
+  round asked for (a list that can quietly accumulate unused permissions was part of the original defect's
+  shape).
+
+  **New finding V-01 (Info) — the mechanism's ceiling, demonstrated, not hypothesised.** A reflection-based
+  allow-list cannot see everything. Five ways to add a `StructuredOutputMode` dependency that this (or any)
+  reflection scan would miss were constructed and run against the test's own `assertAllowed` logic — all
+  five went undetected: generic erasure (`Set<StructuredOutputMode>` → `Set.class`), a `String`-typed wire
+  value, a `boolean` shortcut flag (no signature footprint at all — the shape §4.2's `SOGB-04` names
+  explicitly, `structuredConstraintSent`), a branch added to an existing DTO field (`SchemaOptions`) rather
+  than the parser's own signature, and a fully-qualified **static** reference with no signature footprint
+  at all — which is not theoretical: `StructuredResponseParser.java:184-185` already does exactly this
+  shape today, with the sibling enum `FinishReason` (`FinishReason.fromWireValue(...) == FinishReason.LENGTH`).
+  That specific use is safe — it fails *closed* to `TRUNCATED`, the opposite of a shortcut — cited only as
+  live proof that the blind spot is real, not as a second finding. Not a blocker: no production behaviour
+  is wrong, the new test is strictly better than both the deny-list it replaced and the allow-list SAST
+  rejected, and the ceiling is inherent to reflection-based testing, not a drafting error. Durable upgrade,
+  for a future round: a plain source-text scan of `StructuredResponseParser.java` asserting the absence of
+  the literal tokens `StructuredOutputMode`, `structuredConstraintSent`, `Backend` outside the javadoc
+  block — the same structural grep this round performed by hand — would catch all five shapes at once.
+
+- **`F-SOGB-02` — CLOSED, at four sites, verified by trace, not by name.** Full-tree grep for
+  `.substring(0,` across `src/main/java` and `worker/src/main/java` returns zero remaining bare
+  truncations of model- or backend-derived text. `ResultProcessor.java:340`
+  (`withUnvalidatedPrefix`, the cited site) and `:398-400` (`capRawResponseIfNeeded`, an extra site the
+  developer found on their own) now delegate to `TextSanitizer.truncateSafely`; `CommentParser.java:340-348`
+  (`capLength`) got an inline high-surrogate back-off instead, deliberately not delegated — per this
+  round's own §1 guidance not to touch that call site's `"..."`-suffix output shape (would regress
+  `SRO-54`/`SR-09`). Both back-off implementations were traced character-by-character, not assumed
+  equivalent: `TextSanitizer.truncateSafely:142-146` and `CommentParser.capLength:345-347` apply the
+  identical `if (cut > 0 && Character.isHighSurrogate(text.charAt(cut - 1))) cut--;` guard to differently-
+  derived `cut` values. **Duplication approved** — a shared helper would need to conditionally append a
+  suffix depending on caller, which is more surface than the three-token guard it replaces. An end-to-end
+  probe (60 non-BMP code points through the full `renderIndexed` path at every `maxCommentLength` from 5 to
+  140) produced no lone surrogate at any budget.
+
+- **`F-SOGB-03` — CLOSED for the Gateway-appended marker; re-derived by hand and by test.**
+  `CommentRenderer.assembleWithTruncatedProse:456-478` now caps `base` (marker-free) once the budget is
+  too small even for the marker, so the marker is genuinely all-or-nothing — hand-derived at this round's
+  own repro values (`maxLength` 37 → marker dropped whole; `maxLength` 38 → marker intact whole). The new
+  `truncatedProseMarkerIsNeverPartiallySliced` test (parameterized 32..40) is a real trap, not decorative:
+  its detector starts at a one-character marker prefix, which the pre-fix output would have tripped.
+
+  **New finding V-02 (Info) — one residual the fix does not cover.** If the *model's own* prose already
+  ends with the literal marker text, `prose.endsWith(marker)` peels one copy and the base string still
+  carries a second copy, which can then be sliced by the same downstream cap. Confirmed reachable at
+  `maxCommentLength` 26..37 with a constructed input. Strictly narrower than the original `F-SOGB-03`
+  (needs a small comment-length budget **and** the model echoing a Gateway constant verbatim) and
+  non-exploitable — worst case is a cosmetically mangled note, no encoding risk, no injection. The
+  single change that would close V-02, the original `F-SOGB-03` class, and a related pre-existing
+  over-length-body case (the assembled body can exceed `max-comment-length` at very small budgets because
+  the header itself is never truncated) is one startup floor under `gateway.publish.max-comment-length` in
+  `GatewayProperties.validateStructuredOnStartup`, alongside the floors already present for
+  `max-path-chars`/`max-findings-per-file`. Not present yet; default is `4000`, so nothing is reachable in
+  any sane deployment. Non-gating.
+
+- **`F-SOGB-04`/`F-SOGB-07` — CLOSED, values spot-checked against source of truth, not against the diff.**
+  All four stale surfaces corrected: `application.yml:112-113` and `GatewayProperties.java:1359,1361` no
+  longer claim `-> maxLength`; `TextSanitizer.java:124-128`'s javadoc now correctly scopes itself to this
+  class's own `capLength` and records that `CommentRenderer.capLength` delegates here as of `2ae6d61`
+  (re-checked: `TextSanitizer.capLength:105-111` genuinely is still a bare substring, so the residual
+  claim it makes is accurate — see `V-03` below); `DEPLOYMENT.md:963` now reads `12000`, cross-checked
+  directly against `worker/src/main/resources/prompts/v3.yml:14` (`maxTokens: 12000`) rather than trusted.
+  `git ls-files` confirms `docs/structured-output-grammar-budget-architecture.md`,
+  `docs/structured-output-grammar-budget-threat-model.md`, and this SAST report are now all tracked —
+  every citation-by-path from `README`/`DEPLOYMENT`/`ReviewSchemaBuilder`/both `JobFailureReason` enums
+  will resolve post-merge.
+
+- **`F-SOGB-05`/`F-SOGB-06`** — `F-SOGB-05`: both trapdoor comments present
+  (`ResultProcessor.java:411-413`, `StructuredResponseParser.java:297-299`), naming `truncateSafely` as the
+  routing point if `SRO-26` is ever wired. `F-SOGB-06`: no action taken, correct per this report's own
+  original "No action required" verdict.
+
+### 8.3 Threat-model §5 release gate — satisfied end to end (not just this round's own findings)
+
+| Gate | Verdict |
+|---|---|
+| `SOGB-01` (truncation visible) | **MET.** Flag threaded through the 8-arg `renderIndexed` into the suggestion block's `altered` decision and the prose marker. `V-02` above is a cosmetic residual at misconfigured budgets only. |
+| `SOGB-02` (P-0..P-4 probes) | **Correctly deferred** — gates backend re-enablement, not this merge. No probe run, no `structured_output_mode` value touched, no `## Grammar probe results` section added to `DEPLOYMENT.md` — the right state to be in. |
+| `SOGB-03` (code-point boundaries) | **MET globally now**, not just at the one site this report originally checked — see §8.2. |
+| `SOGB-04` (unconditional; `SOR-11` guard) | **MET.** Unconditional half re-confirmed by tracing `validateFindingAndCollect`; guard-test half now closed, ceiling recorded as `V-01`. |
+| `SOGB-05`/`06`/`07`/`08` (Worker error-body bounds, inertness, enum) | **MET, unchanged** — neither fix-round commit touches `worker/` (confirmed via `git show --stat`); independently re-read the byte bound (existing `BoundedInputStream`, 8 KB constant), the time bound (daemon thread + 2 s join, independent of `request-timeout-sec`, on the async path `WorkerLoop.java:352` actually calls), and confirmed every failure mode (timeout, IOException, RuntimeException, oversize, non-UTF-8, empty, and even an `Error` on the reader thread) degrades to `LLM_ERROR` rather than hanging or misclassifying. |
+| `SOGB-09`/`11` (startup wording; closed counter vocabulary) | **MET, unchanged.** |
+| `SOGB-10`/`12` (trapdoor note; doc corrections) | **NOW MET** — were this report's own `FAIL`/`PARTIAL`. |
+| §5 non-regression set (`SOR-09/11/21/22`, `F-SRO-03/06/07`, `WOR-04/05`, `WOC-23/24`, `WSR-04`, `SR-21`, `SRO-18`/`SOR-05a`) | **All PASS.** `SOR-11` was the sole `FAIL` in §4 above and is the one item this fix round changed in that set. |
+| Accepted residuals `SOGB-INH-1/2/3`, `SOR-INH-2` | Unchanged; conditions of acceptance intact. |
+
+Advisory, non-gating, not done: the two Semgrep rules §5 suggests adding "while this is in flight" (flag
+`substring(0,` on model-derived text outside the approved helper; flag response-body-derived arguments in
+`worker/.../llama`) were not added to CI. Worth doing as the natural companion to `V-01`'s suggested
+source-scan test, but the release gate itself does not require them.
+
+### 8.4 Carry-forward register — all Info, none gating
+
+| # | Where | Why it is not a blocker | Cheapest durable fix |
+|---|---|---|---|
+| **V-01** | `StructuredResponseParserTest.java:563-630` | Test-only ceiling inherent to reflection-based scanning; strictly stronger than what it replaced; no wrong production behaviour today | 5-line source-text scan of `StructuredResponseParser.java` asserting absence of `StructuredOutputMode`/`structuredConstraintSent`/`Backend` outside the javadoc |
+| **V-02** | `CommentRenderer.java:470-473` | Needs `max-comment-length < ~50` **and** the model echoing a Gateway constant verbatim; cosmetic only, no encoding/injection risk | Startup floor on `gateway.publish.max-comment-length` — also closes a related pre-existing case where the assembled body can exceed the configured length at very small budgets because the header is never truncated |
+| **V-03** | `TextSanitizer.java:105-111` (`capLength`) | Last remaining non-surrogate-safe cut in the Gateway; reached only via `sanitizeSingleLine(detail, 200)` on Worker-supplied `detail` text on its way to `review_jobs.last_error`; pre-existing, explicitly scoped out by `SOGT-02`; requires an authenticated Worker sending deliberately malformed UTF-16 | The same three-token high-surrogate back-off `CommentParser.capLength` just received |
+| **V-04** | `application.yml:118`, on the **merge target** `chore/config-consolidation`, not this branch | `gateway.structured.answer-reserve: 8000` is a dead key — `chore/config-consolidation`'s own commit `23ca526` deleted the `Structured.answerReserve` field it used to bind to (`GatewayProperties.java:1371-1376`), and Spring's default `ignoreUnknownFields=true` swallows it silently. An operator tuning v3's answer budget by editing this line would observe zero effect, while its own comment claims it overrides `gateway.diff.answer-reserve`. This is the exact operator-facing-lie class `SOGB-12`/`F-SOGB-04` exist to prevent, introduced by the target branch, one line below the two lines this branch's own fix round corrected. Does not block this merge; `chore/config-consolidation` should not reach `master` carrying it | Delete the dead key, or restore the field it was meant to bind to |
+
+### 8.5 Working-tree hygiene — clean
+
+Unrelated pre-existing WIP is still uncommitted and untouched by all 7 branch commits: `docker-compose.yml`
+(`LLAMA_MAX_TOKENS` on both workers), `worker/Dockerfile` (`LLAMA_MAX_TOKENS` `4096`→`12000`), and
+`application.yml:190` (`allowed-prompt-versions` `v1,v2,v3`→`v1,v2`). `f5b4edc` did touch `application.yml`,
+but a line-level diff confirms it touched only lines 112-113 (the `F-SOGB-04` doc fix) — the unrelated
+`:190` hunk was not swept in.
+
+### 8.6 Merge target — confirmed current
+
+`chore/config-consolidation` (`e01715e`) is a direct ancestor of `HEAD`; `HEAD` is exactly these 7 commits
+ahead of it; `chore/config-consolidation` has not itself merged into `master` (still ahead of it) — the
+target is current, not stale, and this is a fast-forward.
+
+**Merge target confirmed: `fix/structured-output-grammar-budget` → `chore/config-consolidation`.**
+
+### 8.7 Status
+
+**Counts this round: Critical 0 | High 0 | Medium 0 | Low 0 | Info 4 (`V-01..V-04`, none gating).**
+
+No blocker. **No further `backend-developer` round is required for this branch.** `V-01`/`V-02`/`V-03` are
+optional hardening a maintainer can schedule at will; `V-04` belongs to `chore/config-consolidation`'s own
+path to `master`, not to this merge. `fix/structured-output-grammar-budget` is **ready to merge**.
