@@ -30,6 +30,7 @@ illustrative hostnames chosen for this runbook, not values baked into the code.
 8. [Step 6: End-to-end smoke test](#8-step-6-end-to-end-smoke-test)
    - [8a. Upgrading to V2 (diff chunking)](#8a-upgrading-to-v2-diff-chunking)
    - [8b. Upgrading to V4 (Worker Observability & Claim Latency)](#8b-upgrading-to-v4-worker-observability--claim-latency)
+   - [8c. Upgrading to V5 (Structured Review Output)](#8c-upgrading-to-v5-structured-review-output)
 9. [Operations quick reference](#9-operations-quick-reference)
 10. [Config file appendix](#10-config-file-appendix)
 11. [Docker deployment (verified, both images)](#11-docker-deployment-verified-both-images)
@@ -190,6 +191,111 @@ To opt in, set `PROMPT_MANAGER_ENABLED=true` and provision:
 With the kill-switch at its default (`false`), `GatewayProperties.validateOnStartup()` skips all
 `gateway.prompt.*` validation, including `GITLAB_PROMPT_TOKEN`'s presence check, and behavior is
 byte-identical to pre-V3.
+
+**Structured Review Output (V5): no new secret, but a hard deployment-order prerequisite.** `v3` support
+adds no credential of its own — it reuses the existing `CI_TOKEN`/`WORKER_TOKEN` and three optional,
+purely additive env vars (`ALLOWED_PROMPT_VERSIONS`, `STRUCTURED_OUTPUT_ENABLED`,
+`STRUCTURED_OUTPUT_DEFAULT_MODE`, all with working defaults — see [§10](#10-config-file-appendix)). What
+it does add is an ordering requirement: **every Worker in the fleet must already be running a build that
+ships `worker/src/main/resources/prompts/v3.yml` before `v3` is ever added to
+`gateway.review.allowed-prompt-versions`** (Workers first, Gateway second — the same precedent as
+Prompt Manager's own template rollout). An old Worker that claims a `v3` job it doesn't recognize
+abandons it immediately (`POST /jobs/{id}/fail`, `PROMPT_INVALID`) and the Review burns its retry budget
+for nothing — allowlisting `v3` before the fleet is ready turns every `v3` submission into a guaranteed,
+avoidable failure. See [§8c](#8c-upgrading-to-v5-structured-review-output) for the full upgrade
+procedure and the rollout ladder.
+
+**Capability verification: does a given `llama-server` build actually honor a JSON Schema constraint?**
+Before setting a backend's `structured_output_mode` to anything but `OFF`
+([§8c](#8c-upgrading-to-v5-structured-review-output)), verify it directly against **that** backend — this
+repository pins no `llama.cpp`/`llama-server` version, and structured-output support (and, worse, silent
+*fail-open* on an unparseable grammar — a documented `llama.cpp` behavior, not a bug in this codebase) is
+a per-build capability, not something safe to assume from a version number.
+
+**This recipe posts the Gateway's REAL, production-shaped schema, not a toy one.** An earlier revision of
+this recipe used a two-field toy schema (`{"ok": boolean}` / an enum of nonsense values) for the positive
+check. That was wrong: a toy schema has **no repetition site** and cannot detect the actual failure class
+this platform hit in production — a `2026-08` canary where `structured_output_mode` was rejected 100% of
+the time because the schema's `maxLength` bounds compiled to a GBNF repetition that tripped llama.cpp's
+grammar-parser complexity guard (`MAX_REPETITION_THRESHOLD = 2000`; see
+`docs/structured-output-grammar-budget-architecture.md` §1 for the full incident). The fix
+(`ReviewSchemaBuilder` no longer emits `maxLength` at all) means the schema below is smaller than it used
+to be, but the check still needs to compile the REAL schema shape, at the REAL `maxItems`/file-count the
+Gateway actually sends — a toy schema would have looked fine throughout that entire incident.
+
+The two schema fixtures below are committed, golden output of `ReviewSchemaBuilderTest` (`src/test/
+resources/fixtures/structured-output-grammar-budget/schema-1-file.json` / `schema-40-files.json`) at this
+repository's production config defaults (`max-findings-per-file=20`, `max-files-per-chunk=40`) — copy
+them to the backend host (or generate your own via `jq` if your deployment's `gateway.structured.*`
+values differ from the defaults) so this check never drifts from what `ReviewSchemaBuilder` actually
+builds. The recipe still needs **two** calls, not one — a schema the model conforms to easily proves
+nothing about a fail-open backend, which passes that call by luck:
+
+```bash
+# 0. Copy (or scp) the two committed schema fixtures onto the backend host first:
+#    src/test/resources/fixtures/structured-output-grammar-budget/schema-1-file.json
+#    src/test/resources/fixtures/structured-output-grammar-budget/schema-40-files.json
+
+# 1. Positive check, 1-file schema: the SMALLEST real schema this Gateway ever sends. Must compile AND
+#    the model's response must conform. A conforming response alone does NOT prove the constraint is
+#    enforced -- see the negative check below.
+SCHEMA_1=$(cat schema-1-file.json)
+curl -sS "http://192.168.1.101:8000/v1/chat/completions" \
+  -H "Content-Type: application/json" \
+  -d "$(jq -n --argjson schema "$SCHEMA_1" '{
+        model: "qwen2.5-coder",
+        messages: [{role: "user", content: "Reply with a JSON object matching the schema."}],
+        response_format: { type: "json_schema", json_schema: { name: "review_chunk_1_file", schema: $schema } }
+      }')" | jq '.choices[0].message.content'
+
+# 2. Positive check, 40-file schema (gateway.structured.max-files-per-chunk's default): the LARGEST real
+#    schema this Gateway ever sends for one chunk. This is the one that actually exercises repetition-
+#    site accounting across many files -- see P-1/P-3 in the architecture doc's §6 empirical release gate
+#    if this ever fails while the 1-file schema above passes (file count IS a factor on this build).
+SCHEMA_40=$(cat schema-40-files.json)
+curl -sS "http://192.168.1.101:8000/v1/chat/completions" \
+  -H "Content-Type: application/json" \
+  -d "$(jq -n --argjson schema "$SCHEMA_40" '{
+        model: "qwen2.5-coder",
+        messages: [{role: "user", content: "Reply with a JSON object matching the schema."}],
+        response_format: { type: "json_schema", json_schema: { name: "review_chunk_40_files", schema: $schema } }
+      }')" | jq '.choices[0].message.content'
+
+# 3. Negative control (the one most guides skip): a schema the model would NOT satisfy unprompted --
+#    an enum of nonsense values it has no reason to pick on its own. This is testing a DIFFERENT property
+#    than checks 1/2 above (fail-open under an adversarial prompt, not grammar-compile budget), so a
+#    small schema is fine here -- it still needs its own repetition-free shape to isolate that property.
+#    If the response still "conforms" (picks one of the listed nonsense values), the constraint is
+#    genuinely enforced. If it answers with something else entirely (ignores the schema) or the call
+#    errors out, the backend is failing open or rejecting the schema -- do NOT enable
+#    structured_output_mode for it.
+curl -sS "http://192.168.1.101:8000/v1/chat/completions" \
+  -H "Content-Type: application/json" \
+  -d '{
+        "model": "qwen2.5-coder",
+        "messages": [{"role": "user", "content": "Reply with a JSON object."}],
+        "response_format": {
+          "type": "json_schema",
+          "json_schema": { "name": "negative_control", "schema": {
+            "type": "object", "additionalProperties": false,
+            "required": ["verdict"], "properties": {
+              "verdict": { "type": "string", "enum": ["xqzplorf", "zbrknarv", "qwyzfelt"] }
+            }
+          }}
+        }
+      }' | jq '.choices[0].message.content'
+```
+
+Also check the `llama-server` process's own log output for `failed to parse grammar` (or similar, e.g.
+`Failed to initialize samplers`) around the time of **every** call above — this is the only client-visible
+symptom of the fail-open bug on some builds, and it can appear even when the HTTP response still looks
+superficially fine (`GET /props`'s `build_info` is worth recording alongside the result, per the
+architecture doc's §6 empirical release gate). If any check fails, or the log line appears, leave that
+backend's `structured_output_mode` at `OFF` (or `NULL`, which uses `gateway.structured.default-mode`,
+itself `OFF` by default) — the feature still works for that backend, just without a decoder-level
+guarantee (the coverage list in the prompt and the Gateway's own strict response validation are
+unaffected either way, and an over-length `comment`/`suggestion` is truncated on receipt regardless of
+whether the decoder ever constrained anything).
 
 ## 3. Step 1: PostgreSQL
 
@@ -753,6 +859,149 @@ to today's (pre-V4) behavior.
 - Do not manually edit `review_jobs.not_before`/`backends.probe_failed_since` outside the application —
   both are written exclusively by `RetryManager`/`BackendHealthChecker` under their own lock discipline.
 
+## 8c. Upgrading to V5 (Structured Review Output)
+
+`V5__structured_review_output.sql` adds two additive, nullable columns — `backends.structured_output_mode`
+and `review_results.finish_reason` — plus one `CHECK` constraint on the new `backends` column. Like V4
+(and unlike V2), this migration is **rollback-tolerant**: an older Gateway JAR simply ignores both new
+columns and degrades to today's (pre-V5) behavior — it never reads or writes either one, so the `CHECK`
+can never be violated by old code, and `v3` traffic is impossible before this migration anyway (the
+allowlist gate is application-level, not a schema constraint).
+
+### Rollback tolerance
+
+- An older Gateway JAR ignoring `backends.structured_output_mode` never attaches a decoder constraint —
+  exactly today's (pre-V5) behavior, safe.
+- An older Gateway JAR ignoring `review_results.finish_reason` never classifies a `TRUNCATED` structured
+  failure from it — moot, since an old JAR also has no `StructuredResponseParser` to classify anything
+  for in the first place.
+- Rolling back **does not** un-allowlist `v3` by itself — `gateway.review.allowed-prompt-versions` is a
+  Gateway config value, not a DB row. If you roll back the JAR, also remove `v3` from that allowlist (or
+  set `ALLOWED_PROMPT_VERSIONS` back to `v1,v2`), or `POST /reviews` with `promptVersion: v3` will 500 on
+  the old JAR (it has no code path for that value at all) instead of failing cleanly.
+
+### Deployment notes
+
+- `ALTER TABLE review_results ADD COLUMN finish_reason ...` takes an `ACCESS EXCLUSIVE` lock on
+  `review_results` — the largest table in the schema — for the (metadata-only, sub-second) duration of the
+  `ALTER`. The migration sets an explicit `lock_timeout = '5s'` so a stuck `ALTER` fails fast instead of
+  silently blocking every result submission behind it. As with V4, this runs at Gateway startup while it
+  is the only writer and is momentarily down; the Worker fleet is not affected (`RUNNING` jobs survive
+  Gateway restarts) and simply sees `204`/retries until the new Gateway is up.
+- **`ck_backends_structured_output_mode` and a future fifth mode.** The `CHECK` constraint enumerates the
+  four `StructuredOutputMode` values (`OFF`, `RESPONSE_FORMAT_JSON_SCHEMA`, `RESPONSE_FORMAT_SCHEMA`,
+  `TOP_LEVEL_JSON_SCHEMA`). If a future release adds a fifth wire mode, the constraint **must be relaxed
+  first**, in its own migration, before any row can be set to the new value:
+  ```sql
+  ALTER TABLE backends DROP CONSTRAINT ck_backends_structured_output_mode;
+  ALTER TABLE backends ADD CONSTRAINT ck_backends_structured_output_mode
+      CHECK (structured_output_mode IS NULL OR structured_output_mode IN
+          ('OFF', 'RESPONSE_FORMAT_JSON_SCHEMA', 'RESPONSE_FORMAT_SCHEMA', 'TOP_LEVEL_JSON_SCHEMA', '<NEW_MODE>'));
+  ```
+- **Enabling a backend, once its capability is verified** ([§2](#2-prerequisites)'s `curl` recipe):
+  ```sql
+  UPDATE backends SET structured_output_mode = 'RESPONSE_FORMAT_JSON_SCHEMA' WHERE name = 'mac-mini-01';
+  -- Rollback for one backend:
+  UPDATE backends SET structured_output_mode = 'OFF' WHERE name = 'mac-mini-01';
+  ```
+  A single `UPDATE`, no restart — this is deliberately a data change, not a config/redeploy, so a canary
+  rollout (see the rollout ladder below) never needs a Gateway restart between stages.
+- **Cross-module coupling, both silent on mismatch (no startup check spans both processes):**
+  - `gateway.diff.answer-reserve` (Gateway — used for both v1/v2 and structured/v3 since
+    `chore/answer-reserve-consolidation`, see the table below) must stay `≥` `v3.yml`'s `maxTokens`
+    minus some margin, ideally equal to it — a mismatch doesn't fail startup on either side; it just
+    risks a truncated completion under a large chunk if the Gateway's budget assumption is smaller than
+    what the Worker actually requests.
+  - `gateway.structured.max-schema-bytes` (Gateway, default `65536`) must stay **below**
+    `worker.limits.max-constraint-bytes` (Worker, default `69632`) by at least the largest wire-wrapper
+    overhead — the shipped defaults already satisfy this (69632 = 65536 + 4096 headroom). If you change
+    one, recompute the other; a mismatch here doesn't fail startup on either process, it produces a
+    fleet-wide `CONSTRAINT_INVALID` abandonment loop the first time a schema near the Gateway's own limit
+    is claimed.
+- **Workers-first is a hard prerequisite, not a suggestion** ([§2](#2-prerequisites)) — deploy every Worker
+  with `v3.yml` before adding `v3` to `gateway.review.allowed-prompt-versions`, never the other way round.
+- No new grant is needed (§3) — the existing `review_gateway` role already has `UPDATE` on `backends` and
+  `INSERT` on `review_results`.
+
+### Бюджет LLM-токенов: сводная таблица
+
+Gateway и Worker — два независимых процесса (`chore/config-consolidation`: не обязательно даже на одной
+машине — см. [§1](#1-architecture-overview)), поэтому у них физически не может быть одного общего файла
+конфигурации. Все параметры ниже вместе формируют **один** бюджет контекстного окна модели, но живут в
+разных файлах: `src/main/resources/application.yml` (Gateway, блок `gateway.diff.*`/`gateway.structured.*`/
+`gateway.prompt.limits.*` — секция "§B Бюджет LLM-токенов" в файле), `worker/src/main/resources/
+application.yml` (блок `llama.*`/`worker.limits.*` — секция "§B" там же) и `worker/src/main/resources/
+prompts/*.yml` (`maxTokens` на шаблон). Эта таблица — единственное место, где вся картина собрана вместе;
+при изменении любого значения ниже сверяйтесь с ней целиком, а не только с локальным комментарием в
+одном файле.
+
+**Нет автоматической проверки, которая охватывала бы оба процесса сразу** — Gateway не знает во время
+своего старта, какой `maxTokens` реально настроен на удалённых Worker'ах (и наоборот). Единственный способ
+свериться сегодня — сравнить два независимых лога:
+- Gateway при каждом успешном старте пишет INFO-строку `"Structured Review Output budget check passed:
+  ..."` (`GatewayProperties.validateStructuredOnStartup`) с разбивкой всей формулы бюджета.
+- Worker при каждом старте пишет по одной INFO-строке `"Prompt template '<version>': effective
+  maxTokens=..."` на каждый найденный шаблон (`PromptTemplateService.logResolvedTemplateBudgetsOnStartup`).
+
+| Параметр | Процесс / файл | Дефолт | За что отвечает | С чем связан |
+|---|---|---|---|---|
+| `gateway.diff.context-window` | Gateway | 16384 | Общий размер контекстного окна модели — база для всех расчётов ниже | Должен совпадать с реальным контекстным окном модели на `llama-server` |
+| `gateway.diff.prompt-reserve` | Gateway | 2000 | Резерв под системный промпт для v1/v2 (и как база, когда Prompt Manager выключен) | Вычитается из `context-window` |
+| `gateway.diff.answer-reserve` | Gateway | 4000 | Резерв под ответ модели — ОДНО значение для v1/v2 И для structured (v3); раньше был отдельный `gateway.structured.answer-reserve`, объединены (`chore/answer-reserve-consolidation`) после повторных ошибок рассинхрона между ними | Должен расти вместе с `v3.yml`'s `maxTokens` (Worker) |
+| `gateway.diff.max-diff-tokens` | Gateway | 10000 | Потолок на diff в одном чанке | Независимый potолок поверх расчёта по окну (см. CSR-02 в комментарии рядом с параметром) |
+| `gateway.diff.chars-per-token` | Gateway | 4 | Эвристика перевода символов diff'а в токены (нет настоящего токенизатора) | Используется во всех формулах ниже, включая `coverageReserveTokens` |
+| `gateway.diff.max-paths-per-section` | Gateway | 64 | Верхняя граница путей, извлекаемых из ОДНОЙ секции diff (memory-safety, SRO-66a) | Должен быть ≥ `gateway.structured.max-files-per-chunk` (проверяется на старте) |
+| `gateway.prompt.limits.max-system-prompt-tokens` | Gateway | 6000 | Потолок размера промпта, собираемого Prompt Manager'ом из Git | Учитывается в формуле бюджета, только если `gateway.prompt.enabled=true` |
+| `gateway.prompt.limits.min-diff-budget-tokens` | Gateway | 1000 | Минимальный порог остатка бюджета под сам diff — если меньше, Gateway отказывается стартовать | Правая часть неравенства формулы бюджета (см. §8c выше) |
+| `gateway.structured.max-files-per-chunk` | Gateway | 40 | Верхняя граница файлов в одном структурированном чанке | Входит в формулу `coverageReserveTokens` |
+| `gateway.structured.max-path-chars` | Gateway | 256 | Максимальная длина одного пути-ключа схемы | Входит в формулу `coverageReserveTokens`; должен быть ≤ 300 |
+| `gateway.structured.max-schema-bytes` | Gateway | 65536 | Backstop-потолок размера самой JSON-схемы | Должен быть **меньше** `worker.limits.max-constraint-bytes` с запасом на wire-обёртку |
+| `gateway.structured.max-findings-per-file` | Gateway | 20 | Потолок числа находок на файл | Влияет на реальный размер ответа v3 (не входит в формулу бюджета напрямую) |
+| `gateway.structured.max-comment-chars` | Gateway | 1200 | **Receipt-side** потолок длины поля `comment` одной находки (НЕ `maxLength` схемы — Structured Output Grammar Budget fix убрал `maxLength` из схемы целиком, см. `docs/structured-output-grammar-budget-architecture.md` §1); превышение — truncate + `structuredFieldTruncated` счётчик, никогда не `SCHEMA_MISMATCH` | Влияет на реальный размер ответа v3 |
+| `gateway.structured.max-suggestion-chars` | Gateway | 2000 | То же самое для поля `suggestion` — truncate, а не decoder-`maxLength` | Влияет на реальный размер ответа v3 |
+| `llama.max-tokens` | Worker | 4096 | Глобальный дефолт `max_tokens`, если конкретный шаблон промпта его не переопределяет | Используется `v1.yml`/`v2.yml` (своего значения не задают) |
+| `v3.yml` → `maxTokens` | Worker (файл шаблона) | 12000 | Реальный потолок токенов, которые модель может сгенерировать для v3-ответа | Должен быть ≥ `gateway.diff.answer-reserve` — иначе Gateway резервирует бюджет под ответ длиннее, чем Worker реально позволит модели сгенерировать |
+| `worker.limits.max-diff-bytes` | Worker | 262144 | Байтовый потолок на diff + chunkContext + systemMessages суммарно | Независим от токен-формулы Gateway'я, отдельная защита на стороне Worker'а (WSR-03) |
+| `worker.limits.max-response-bytes` | Worker | 200000 | Байтовый потолок на ответ LLM, который Worker готов принять | Тот же порядок величины, что и `gateway.publish.max-raw-response-length` (200000, §E в `application.yml`) — оба независимо ограничивают одно и то же на разных концах |
+| `worker.limits.max-system-messages` | Worker | 8 | Потолок числа system-сообщений от Prompt Manager'а | Независим от `gateway.prompt.limits.max-sections` (WSR-03 sibling) |
+| `worker.limits.max-constraint-bytes` | Worker | 69632 | Байтовый потолок на присланную Gateway'ем JSON-схему/constraint | Обязан **превышать** `gateway.structured.max-schema-bytes` на размер самой большой wire-обёртки (~70 байт) |
+
+**Формула итогового бюджета** (то же самое, что печатает Gateway в лог при старте):
+
+```
+context-window − prompt-reserve − answer-reserve − coverageReserveTokens(max-files-per-chunk, max-path-chars, chars-per-token)
+  − (prompt.enabled ? max-system-prompt-tokens : 0)  ≥  min-diff-budget-tokens
+```
+
+Если меняете любой параметр слева — сверяйтесь с этой таблицей на предмет других параметров, которые с ним связаны, ДО перезапуска, а не после отказа стартовать.
+
+### Monitored residual: LLM-compute amplification on validation failure
+
+`gateway.structured.max-validation-attempts` (a per-Review override for the retry-attempt budget on
+structured-validation failures specifically) is **not implemented** — a structured job whose response
+fails validation reuses the same `gateway.retry.max-attempts` (default 3) as any infrastructure failure,
+and each retry re-runs LLM inference at full compute cost. Because the trigger (any of the
+`STRUCTURED_OUTPUT_UNSUPPORTED` conditions in [§6.1](README.md#61-post-reviews--create-a-review) is
+already closed at `POST /reviews`; what's left is genuine model non-conformance) is not attacker-forceable
+in the same way the pre-fix edge gaps were, and because a permanently-failing chunk cascades `CANCELLED`
+to its successful sibling chunks (`ChunkCoordinator`), this is accepted as a monitored residual
+(`SOR-INH-1`) rather than built out further. **The one available lever today is
+`gateway.structured.enabled=false`** (the kill switch, [§4.5](README.md#45-structured-review-output-v5-optional))
+— it disables the feature wholesale (falls back to `CommentParser` parsing for all `v3` traffic) rather
+than tuning the attempt budget for structured failures alone. Watch `structuredValidationFailures` (`GET
+/metrics`) for a sustained rate as the early signal; if a specific project/MR is triggering it
+repeatedly, ask that project to resubmit with `promptVersion: v2` while investigating.
+
+### What NOT to do
+
+- Do not add `v3` to `gateway.review.allowed-prompt-versions` before every Worker in the fleet ships
+  `v3.yml` — see [§2](#2-prerequisites).
+- Do not set a backend's `structured_output_mode` to anything but `OFF`/`NULL` without first running the
+  capability-verification recipe ([§2](#2-prerequisites)) against **that specific** backend — a
+  fail-open `llama-server` build looks identical to a working one on a single happy-path request.
+- Do not relax `ck_backends_structured_output_mode` casually — only when actually adding a fifth mode,
+  in its own migration.
+
 ## 9. Operations quick reference
 
 | Task | How |
@@ -787,6 +1036,12 @@ BACKEND_ALLOWED_HOST_PATTERN=^192\.168\.1\.101$
 # PROMPT_MANAGER_ENABLED=true
 # GITLAB_PROMPT_TOKEN=<separate, read-only GitLab project/group access token, read_api/read_repository scope>
 # PROMPT_CORPORATE_PROJECT=<numeric project id or "group/project" path -- never a URL>
+
+# Structured Review Output (V5, optional -- all three have working defaults, uncomment only to change
+# them; adding "v3" here is a hard no-op until every Worker in the fleet ships v3.yml, see §2/§8c)
+# ALLOWED_PROMPT_VERSIONS=v1,v2,v3
+# STRUCTURED_OUTPUT_ENABLED=true
+# STRUCTURED_OUTPUT_DEFAULT_MODE=OFF
 ```
 
 ### 10.2 Gateway systemd unit (`/etc/systemd/system/review-gateway.service`)

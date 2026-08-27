@@ -50,6 +50,8 @@ services:
       POSTGRES_DB: review_gateway
       POSTGRES_USER: review_gateway
       POSTGRES_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD}
+    ports:
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
     ports:
@@ -90,6 +92,13 @@ services:
       PROMPT_CORPORATE_BASE_PROMPT_PATH: ${PROMPT_CORPORATE_BASE_PROMPT_PATH:-prompts/base-system-prompt.md}
       PROMPT_CORPORATE_REVIEW_RULES_PATH: ${PROMPT_CORPORATE_REVIEW_RULES_PATH:-prompts/review-rules.md}
       PROMPT_ON_ERROR: ${PROMPT_ON_ERROR:-FAIL}
+      # Structured Review Output (docs/structured-review-output-architecture.md) -- same rule as the
+      # Prompt Manager block above: Compose only forwards variables listed here. Left at their
+      # off-by-default-risk values (v3 not allowlisted, no backend constrained) unless the operator
+      # explicitly exports the corresponding host env var (see README.md's promptVersion v3 section).
+      ALLOWED_PROMPT_VERSIONS: ${ALLOWED_PROMPT_VERSIONS:-v1,v2}
+      STRUCTURED_OUTPUT_ENABLED: ${STRUCTURED_OUTPUT_ENABLED:-true}
+      STRUCTURED_OUTPUT_DEFAULT_MODE: ${STRUCTURED_OUTPUT_DEFAULT_MODE:-OFF}
     ports:
       - "8080:8080"
     # GITLAB_BASE_URL uses the gitlab.local hostname (its self-signed cert's SAN is issued for
@@ -152,6 +161,8 @@ services:
       BACKEND_ID: llama-01
       LLAMA_MODEL: ${LLAMA_MODEL:?set LLAMA_MODEL}
       LLAMA_URL: ${LLAMA_URL_1:?set LLAMA_URL_1, e.g. http://192.168.1.101:8000}
+      LLAMA_MAX_TOKENS: ${LLAMA_MAX_TOKENS:-12000}
+      LLAMA_ENABLE_THINKING: ${LLAMA_ENABLE_THINKING:-true}
       WORKER_ALLOW_INSECURE_GATEWAY: "true"
       # Both workers share the Gateway's network namespace (network_mode: service:gateway below),
       # so their Actuator ports would collide on the default 8081 -- pin distinct ports.
@@ -176,6 +187,8 @@ services:
       BACKEND_ID: llama-02
       LLAMA_MODEL: ${LLAMA_MODEL:?set LLAMA_MODEL}
       LLAMA_URL: ${LLAMA_URL_2:?set LLAMA_URL_2, e.g. http://192.168.1.102:8000}
+      LLAMA_MAX_TOKENS: ${LLAMA_MAX_TOKENS:-12000}
+      LLAMA_ENABLE_THINKING: ${LLAMA_ENABLE_THINKING:-true}
       WORKER_ALLOW_INSECURE_GATEWAY: "true"
       # Must differ from worker1's -- see the comment there; both share one network namespace.
       WORKER_HTTP_PORT: "8082"

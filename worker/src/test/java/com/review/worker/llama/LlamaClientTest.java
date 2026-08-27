@@ -81,11 +81,10 @@ class LlamaClientTest {
     }
 
     @Test
-    void requestDisablesModelThinking() throws InterruptedException {
-        // A "thinking" model spends part of max_tokens on a hidden reasoning block before the actual
-        // answer; on a large diff that can exhaust the whole budget and leave message.content empty
-        // (surfaces as LLM_EMPTY_RESPONSE even though the backend is healthy). Guards that the Worker
-        // always asks llama-server to skip it.
+    void defaultConfigSendsNoChatTemplateKwargsAtAll() throws InterruptedException {
+        // worker.llama.enable-thinking defaults to true: no behavior change without an explicit
+        // operator opt-out (see WorkerProperties.Llama#isEnableThinking's javadoc) -- confirms the
+        // request body stays exactly what it was before this knob existed.
         server.enqueue(new MockResponse()
                 .setResponseCode(200)
                 .addHeader("Content-Type", "application/json")
@@ -94,6 +93,42 @@ class LlamaClientTest {
                         """));
 
         llamaClient.chatCompletion(messages(), "test-model", 0.1, 100);
+
+        RecordedRequest recorded = server.takeRequest();
+        assertThat(recorded.getBody().readUtf8()).doesNotContain("chat_template_kwargs");
+    }
+
+    @Test
+    void requestDisablesModelThinkingWhenExplicitlyConfigured() throws IOException, InterruptedException {
+        // A "thinking" model spends part of max_tokens on a hidden reasoning block before the actual
+        // answer; on a large diff that can exhaust the whole budget and leave message.content empty
+        // (surfaces as LLM_EMPTY_RESPONSE even though the backend is healthy). worker.llama.enable-
+        // thinking=false is the blunt, always-off opt-out for a backend where tuning reasoning_effort
+        // via the backend's own --chat-template-kwargs isn't available.
+        WorkerProperties properties = new WorkerProperties("127.0.0.1", "8081", "", "");
+        properties.getGateway().setUrl("https://gateway.internal");
+        properties.getGateway().setApiKey("a".repeat(40));
+        properties.getWorker().setId("worker-1");
+        properties.getBackend().setId("backend-1");
+        properties.getLlama().setUrl(server.url("/").toString());
+        properties.getLlama().setModel("test-model");
+        properties.getLlama().setEnableThinking(false);
+        HttpClient httpClient = HttpClient.newHttpClient();
+        RestClient restClient = RestClient.builder()
+                .baseUrl(server.url("/").toString())
+                .requestFactory(new JdkClientHttpRequestFactory(httpClient))
+                .build();
+        LlamaClient thinkingDisabledClient = new LlamaClient(restClient, httpClient,
+                new com.fasterxml.jackson.databind.ObjectMapper(), properties);
+
+        server.enqueue(new MockResponse()
+                .setResponseCode(200)
+                .addHeader("Content-Type", "application/json")
+                .setBody("""
+                        {"choices":[{"message":{"role":"assistant","content":"[]"},"finish_reason":"stop"}]}
+                        """));
+
+        thinkingDisabledClient.chatCompletion(messages(), "test-model", 0.1, 100);
 
         RecordedRequest recorded = server.takeRequest();
         assertThat(recorded.getBody().readUtf8())

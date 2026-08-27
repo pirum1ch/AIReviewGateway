@@ -60,6 +60,13 @@ class ApplicationYamlBootTest {
 
     @Test
     void promptManagerOptedInWithItsOwnDocumentedEnvVarsAlsoBootsCleanly() {
+        // chore/answer-reserve-consolidation: this test used to also override
+        // gateway.structured.answer-reserve to a value consistent with gateway.diff.answer-reserve, to
+        // stay under the (since-removed) SOR-13 budget check without that being the thing under test
+        // here. That override is gone along with the property it targeted -- the shipped
+        // gateway.diff.answer-reserve default (4000, used for both v1/v2 and structured now) already
+        // satisfies the budget check on its own with Prompt Manager enabled at its shipped
+        // max-system-prompt-tokens (6000), so no override is needed.
         runner.withPropertyValues(
                         "PROMPT_MANAGER_ENABLED=true",
                         "GITLAB_PROMPT_TOKEN=glpat-yyyyyyyyyyyyyyyyyyyy",
@@ -83,6 +90,48 @@ class ApplicationYamlBootTest {
                     assertThat(context.getStartupFailure())
                             .hasRootCauseInstanceOf(IllegalStateException.class)
                             .hasRootCauseMessage("gateway.gitlab.prompt-token must be set (SR-01) — refusing to start");
+                });
+    }
+
+    /**
+     * QA round (task item 7, Structured Output Grammar Budget SGB-02/SOGB-09): the developer's own test
+     * ({@code GatewayPropertiesStructuredValidationTest}) only calls {@code validateOnStartup()} directly
+     * -- it never proves the real Spring Boot application context, wired against the actual {@code
+     * application.yml}, genuinely refuses to start with this value. This exercises the SAME pattern as
+     * {@code promptManagerEnabledWithoutItsOwnEnvVarsStillFailsFastAsDesigned} above: boot the real
+     * config-data machinery, override just the one property under test, and assert on {@code
+     * context.getStartupFailure()} instead of a bare Java method call.
+     */
+    @Test
+    void maxFindingsPerFileOf201RefusesToStartTheRealApplicationContext() {
+        runner.withPropertyValues("gateway.structured.max-findings-per-file=201")
+                .run(context -> {
+                    assertThat(context).hasFailed();
+                    assertThat(context.getStartupFailure())
+                            .hasRootCauseInstanceOf(IllegalStateException.class);
+                    assertThat(rootCause(context.getStartupFailure()).getMessage())
+                            .contains("gateway.structured.max-findings-per-file")
+                            .contains("201")
+                            .contains("MAX_REPETITION_THRESHOLD");
+                });
+    }
+
+    private Throwable rootCause(Throwable t) {
+        Throwable current = t;
+        while (current.getCause() != null && current.getCause() != current) {
+            current = current.getCause();
+        }
+        return current;
+    }
+
+    /** Same context, the boundary value that must still boot cleanly -- the other side of SGB-02's assertion. */
+    @Test
+    void maxFindingsPerFileOfExactly200StillBootsTheRealApplicationContextCleanly() {
+        runner.withPropertyValues("gateway.structured.max-findings-per-file=200")
+                .run(context -> {
+                    assertThat(context).hasNotFailed();
+                    GatewayProperties properties = context.getBean(GatewayProperties.class);
+                    assertThat(properties.getStructured().getMaxFindingsPerFile()).isEqualTo(200);
                 });
     }
 

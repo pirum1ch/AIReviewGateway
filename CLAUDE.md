@@ -8,8 +8,13 @@ The staged build-out described below is **complete**. This is a working Java 21 
 not a planning-only one:
 
 - `src/main/java/com/review/gateway/` — the Gateway (this repo's root Maven module): entities, Flyway
-  migrations, repositories, services, REST controllers, security config. Diff chunking (V2) and Prompt
-  Manager (V3, feature-flagged off by default) are both implemented on top of the original build-out.
+  migrations, repositories, services, REST controllers, security config. Diff chunking (V2), Prompt
+  Manager (V3, feature-flagged off by default), and Structured Review Output (V5, `promptVersion: v3`,
+  not allowlisted by default) are all implemented on top of the original build-out. A `v3` Review is
+  decoder-constrained (on a capable, opted-in backend) and coverage-enforced (a per-file coverage list
+  is always rendered into the prompt, regardless of chunk count or constraint mode) — every response is
+  strictly parsed and validated against that coverage list on receipt, never trusting the decoder
+  constraint, the backend's mode, or `finish_reason` (see `README.md` §4.5/§6.1c).
 - `worker/` — a separate Maven module, the stateless LLM Worker (Executor) that claims jobs and calls
   `llama-server`. See `worker/README.md`.
 - `README.md` (root) — the authoritative deployment/integration guide: every endpoint, config property,
@@ -18,7 +23,8 @@ not a planning-only one:
   Docker Compose).
 - `docs/` — architecture and security artifacts per feature: `implementation-architecture.md`,
   `threat-model.md`/`worker-threat-model.md` (baseline), `prompt-manager-architecture.md`/
-  `prompt-manager-threat-model.md` (V3), and per-feature SAST reports under `docs/security/`.
+  `prompt-manager-threat-model.md` (V3), `structured-review-output-architecture.md`/
+  `structured-review-output-threat-model.md` (V5), and per-feature SAST reports under `docs/security/`.
 
 The original spec docs are still present at the repo root (`Требования_Review_Gateway_v2.md`, `#
 Итоговая архитектура AI Code Review Platform.md`, `Системный промт для генерации кода Review
@@ -95,10 +101,10 @@ Plus `CANCELLED` and `OBSOLETE`, reachable from any non-terminal state. All tran
 - `review_jobs` — the queue: status, priority, backend_id, worker_id, attempts, heartbeat_at, timestamps,
   last_error, `not_before` (V4, Worker Observability & Claim Latency — earliest instant a requeued job is
   claimable again; `NULL` = immediately).
-- `review_results` — raw model response (mandatory, stored before parsing), summary, tokens, duration, model.
+- `review_results` — raw model response (mandatory, stored before parsing), summary, tokens, duration, model, `finish_reason` (V5, Structured Review Output — the backend's own completion-stop reason, whitelist-parsed before storage; `NULL` = not reported by an old Worker/backend build). Write-once per `(review_id, chunk_index)`: a retry's raw response/`finish_reason` are never stored, only the first attempt's.
 - `review_comments` — parsed comments (file/line/severity/text) plus `discussion_id` for idempotent publishing.
 - `review_events` — full audit trail (CREATED, CLAIMED, RUNNING, HEARTBEAT, RETRY, COMPLETED, PUBLISHED, FAILED, OBSOLETE).
-- `backends` — registry of llama-server instances: url, model, capacity, status (`ACTIVE/SUSPECT/MAINTENANCE/OFFLINE`), last_seen (updated on successful probe only, as of V4), `probe_failed_since` (V4 — restart-safe continuous-failure-streak start, `NULL` = not currently failing). Backend load is derived from the count of currently-running jobs, not a separate counter.
+- `backends` — registry of llama-server instances: url, model, capacity, status (`ACTIVE/SUSPECT/MAINTENANCE/OFFLINE`), last_seen (updated on successful probe only, as of V4), `probe_failed_since` (V4 — restart-safe continuous-failure-streak start, `NULL` = not currently failing), `structured_output_mode` (V5, Structured Review Output — per-backend wire shape for the decoder constraint, `NULL` = use `gateway.structured.default-mode`; a `CHECK` constraint bounds it to the closed `StructuredOutputMode` vocabulary). Backend load is derived from the count of currently-running jobs, not a separate counter.
 - `review_chunks` (V2, diff chunking) — one row per file-based chunk when a diff is too large for one prompt; `review_jobs` is 1:N per Review once chunked.
 - `review_prompt_sections` (V3, Prompt Manager, feature-flagged) — immutable, append-only per-section snapshot of the Git-sourced system prompt actually used for a Review (source project/ref/commit, content hash), written once at Review creation and never mutated. `reviews.prompt_bundle_mode` (`NONE`/`REPO`) records whether a Review was created under this feature at all — see `docs/prompt-manager-architecture.md`.
 

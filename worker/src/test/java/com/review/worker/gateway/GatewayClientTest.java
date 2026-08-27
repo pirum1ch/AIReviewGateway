@@ -212,7 +212,7 @@ class GatewayClientTest {
                 .andRespond(withSuccess("{\"reviewId\":7,\"status\":\"COMPLETED\"}", MediaType.APPLICATION_JSON));
 
         ResultOutcome outcome = gatewayClient.submitResult(42,
-                new ResultRequest("worker-1", "raw model output", 100, 200, 5000L, "model-x"));
+                new ResultRequest("worker-1", "raw model output", 100, 200, 5000L, "model-x", null));
 
         assertThat(outcome.status()).isEqualTo(ResultOutcome.ResultStatus.ACCEPTED);
         assertThat(outcome.response().reviewId()).isEqualTo(7L);
@@ -226,7 +226,7 @@ class GatewayClientTest {
                 .andRespond(withStatus(org.springframework.http.HttpStatus.NOT_FOUND));
 
         ResultOutcome outcome = gatewayClient.submitResult(42,
-                new ResultRequest("worker-1", "raw", 1, 1, 1L, "m"));
+                new ResultRequest("worker-1", "raw", 1, 1, 1L, "m", null));
 
         assertThat(outcome.status()).isEqualTo(ResultOutcome.ResultStatus.NOT_FOUND);
         mockServer.verify();
@@ -238,7 +238,7 @@ class GatewayClientTest {
                 .andRespond(withStatus(org.springframework.http.HttpStatus.FORBIDDEN));
 
         ResultOutcome outcome = gatewayClient.submitResult(42,
-                new ResultRequest("worker-1", "raw", 1, 1, 1L, "m"));
+                new ResultRequest("worker-1", "raw", 1, 1, 1L, "m", null));
 
         assertThat(outcome.status()).isEqualTo(ResultOutcome.ResultStatus.FORBIDDEN);
         mockServer.verify();
@@ -249,7 +249,7 @@ class GatewayClientTest {
         mockServer.expect(requestTo("https://gateway.test/jobs/42/result"))
                 .andRespond(withServerError());
 
-        assertThatThrownBy(() -> gatewayClient.submitResult(42, new ResultRequest("worker-1", "raw", 1, 1, 1L, "m")))
+        assertThatThrownBy(() -> gatewayClient.submitResult(42, new ResultRequest("worker-1", "raw", 1, 1, 1L, "m", null)))
                 .isInstanceOf(GatewayUnavailableException.class);
         mockServer.verify();
     }
@@ -264,7 +264,7 @@ class GatewayClientTest {
                 .andRespond(withSuccess("{\"reviewId\":1,\"status\":\"COMPLETED\"}", MediaType.APPLICATION_JSON));
 
         gatewayClient.claim("backend-1", "worker-1");
-        gatewayClient.submitResult(1, new ResultRequest("worker-1", "THE-SECRET-RAW-RESPONSE", 1, 1, 1L, "m"));
+        gatewayClient.submitResult(1, new ResultRequest("worker-1", "THE-SECRET-RAW-RESPONSE", 1, 1, 1L, "m", null));
 
         List<String> allMessages = logAppender.list.stream().map(ILoggingEvent::getFormattedMessage).toList();
         assertThat(allMessages).noneMatch(msg -> msg.contains(BEARER_TOKEN));

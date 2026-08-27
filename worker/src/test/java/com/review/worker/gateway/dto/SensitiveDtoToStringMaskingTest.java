@@ -24,7 +24,7 @@ class SensitiveDtoToStringMaskingTest {
 
     @Test
     void jobPayloadToStringNeverContainsTheRawDiff() {
-        JobPayload payload = new JobPayload(SECRET_DIFF, "v1", null, null);
+        JobPayload payload = new JobPayload(SECRET_DIFF, "v1", null, null, null, null);
 
         String rendered = payload.toString();
 
@@ -38,14 +38,14 @@ class SensitiveDtoToStringMaskingTest {
     @Test
     void jobPayloadAccessorStillReturnsTheFullDiffUnmasked() {
         // The masking is toString()-only; the actual field/accessor (what Jackson serializes) must be untouched.
-        JobPayload payload = new JobPayload(SECRET_DIFF, "v1", null, null);
+        JobPayload payload = new JobPayload(SECRET_DIFF, "v1", null, null, null, null);
 
         assertThat(payload.diff()).isEqualTo(SECRET_DIFF);
     }
 
     @Test
     void resultRequestToStringNeverContainsTheRawResponse() {
-        ResultRequest request = new ResultRequest("worker-1", SECRET_RAW_RESPONSE, 10, 20, 500L, "model-x");
+        ResultRequest request = new ResultRequest("worker-1", SECRET_RAW_RESPONSE, 10, 20, 500L, "model-x", null);
 
         String rendered = request.toString();
 
@@ -59,14 +59,14 @@ class SensitiveDtoToStringMaskingTest {
 
     @Test
     void resultRequestAccessorStillReturnsTheFullRawResponseUnmasked() {
-        ResultRequest request = new ResultRequest("worker-1", SECRET_RAW_RESPONSE, 10, 20, 500L, "model-x");
+        ResultRequest request = new ResultRequest("worker-1", SECRET_RAW_RESPONSE, 10, 20, 500L, "model-x", null);
 
         assertThat(request.rawResponse()).isEqualTo(SECRET_RAW_RESPONSE);
     }
 
     @Test
     void claimResponseToStringNeverContainsTheRawDiffEvenViaNestedPayload() {
-        ClaimResponse response = new ClaimResponse(1L, 2L, new JobPayload(SECRET_DIFF, "v1", null, null));
+        ClaimResponse response = new ClaimResponse(1L, 2L, new JobPayload(SECRET_DIFF, "v1", null, null, null, null));
 
         String rendered = response.toString();
 
@@ -78,15 +78,15 @@ class SensitiveDtoToStringMaskingTest {
 
     @Test
     void toStringMaskingHandlesNullContentGracefully() {
-        assertThat(new JobPayload(null, "v1", null, null).toString()).contains("0 chars");
-        assertThat(new ResultRequest("w", null, null, null, null, null).toString()).contains("0 chars");
+        assertThat(new JobPayload(null, "v1", null, null, null, null).toString()).contains("0 chars");
+        assertThat(new ResultRequest("w", null, null, null, null, null, null).toString()).contains("0 chars");
     }
 
     /** V2 (diff chunking): {@code chunkContext} is just as sensitive (MR-author-controlled file names/prompt text) as {@code diff}. */
     @Test
     void jobPayloadToStringNeverContainsTheRawChunkContext() {
         String secretChunkContext = "part 2 of 6\nSECRET-FILE-PATH-CONTENT.java";
-        JobPayload payload = new JobPayload("small diff", "v2", secretChunkContext, null);
+        JobPayload payload = new JobPayload("small diff", "v2", secretChunkContext, null, null, null);
 
         String rendered = payload.toString();
 
@@ -99,7 +99,7 @@ class SensitiveDtoToStringMaskingTest {
 
     @Test
     void jobPayloadToStringNeverContainsRawSystemMessages() {
-        JobPayload payload = new JobPayload("small diff", "v2", null, List.of(SECRET_SYSTEM_MESSAGE, "second message"));
+        JobPayload payload = new JobPayload("small diff", "v2", null, List.of(SECRET_SYSTEM_MESSAGE, "second message"), null, null);
 
         String rendered = payload.toString();
 
@@ -112,8 +112,8 @@ class SensitiveDtoToStringMaskingTest {
     void jobPayloadToStringDistinguishesNullFromEmptySystemMessages() {
         // PMR-24: null (legacy/kill-switch-off) vs [] (Gateway resolved zero sections) must render
         // distinguishably, not collapse to the same "0 chars" text.
-        JobPayload nullMessages = new JobPayload("diff", "v1", null, null);
-        JobPayload emptyMessages = new JobPayload("diff", "v1", null, List.of());
+        JobPayload nullMessages = new JobPayload("diff", "v1", null, null, null, null);
+        JobPayload emptyMessages = new JobPayload("diff", "v1", null, List.of(), null, null);
 
         assertThat(nullMessages.toString()).contains("systemMessages=null");
         assertThat(emptyMessages.toString()).contains("systemMessages=<masked, 0 msg, 0 chars>");
@@ -122,15 +122,38 @@ class SensitiveDtoToStringMaskingTest {
     @Test
     void jobPayloadAccessorStillReturnsSystemMessagesUnmasked() {
         List<String> messages = List.of(SECRET_SYSTEM_MESSAGE);
-        JobPayload payload = new JobPayload("diff", "v2", null, messages);
+        JobPayload payload = new JobPayload("diff", "v2", null, messages, null, null);
 
         assertThat(payload.systemMessages()).isEqualTo(messages);
+    }
+
+    // ---- Structured Review Output (SRO-12): responseFormat/jsonSchema masking ----
+
+    @Test
+    void jobPayloadToStringNeverContainsTheRawResponseFormatOrJsonSchema() {
+        String secretSchema = "{\"required\":[\"src/SECRET-PATH.java\"]}";
+        JobPayload payload = new JobPayload("diff", "v3", null, null, secretSchema, null);
+
+        String rendered = payload.toString();
+
+        assertThat(rendered).doesNotContain("SECRET-PATH");
+        assertThat(rendered).contains("responseFormat=<masked, " + secretSchema.length() + " chars>");
+        assertThat(rendered).contains("jsonSchema=null");
+    }
+
+    @Test
+    void jobPayloadAccessorsStillReturnResponseFormatAndJsonSchemaUnmasked() {
+        String secretSchema = "{\"required\":[\"src/SECRET-PATH.java\"]}";
+        JobPayload payload = new JobPayload("diff", "v3", null, null, null, secretSchema);
+
+        assertThat(payload.jsonSchema()).isEqualTo(secretSchema);
+        assertThat(payload.responseFormat()).isNull();
     }
 
     @Test
     void claimResponseToStringNeverContainsRawSystemMessagesEvenViaNestedPayload() {
         ClaimResponse response = new ClaimResponse(1L, 2L,
-                new JobPayload("diff", "v2", null, List.of(SECRET_SYSTEM_MESSAGE)));
+                new JobPayload("diff", "v2", null, List.of(SECRET_SYSTEM_MESSAGE), null, null));
 
         String rendered = response.toString();
 

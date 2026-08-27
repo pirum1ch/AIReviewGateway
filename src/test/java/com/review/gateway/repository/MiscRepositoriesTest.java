@@ -60,7 +60,7 @@ class MiscRepositoriesTest extends AbstractPostgresIntegrationTest {
         assertThat(reviewResultRepository.existsByReviewIdAndChunkIndex(review.getId(), 0)).isFalse();
 
         entityManager.persistAndFlush(new ReviewResult(review.getId(), 0, null, "raw", "summary",
-                10, 20, 30, 1000L, "model", null));
+                10, 20, 30, 1000L, "model", null, null));
 
         assertThat(reviewResultRepository.existsByReviewIdAndChunkIndex(review.getId(), 0)).isTrue();
         assertThat(reviewResultRepository.findByReviewIdAndChunkIndex(review.getId(), 0)).isPresent();

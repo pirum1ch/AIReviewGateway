@@ -83,12 +83,18 @@ class ResultProcessorConcurrentSubmitTest extends AbstractPostgresIntegrationTes
         EventService eventService = new EventService(reviewEventRepository, new TextSanitizer());
         StateMachine stateMachine = new StateMachine(eventService);
         JobStateMachine jobStateMachine = new JobStateMachine(eventService);
-        CommentParser commentParser = new CommentParser(new GatewayProperties());
+        CommentParser commentParser = new CommentParser(new GatewayProperties(), new MetricsCounters());
         GatewayProperties properties = new GatewayProperties();
         ChunkCoordinator chunkCoordinator = new ChunkCoordinator(reviewRepository, reviewJobRepository,
                 reviewChunkRepository, reviewCommentRepository, stateMachine, jobStateMachine, properties, entityManager, transactionManager);
-        return new ResultProcessor(reviewRepository, reviewJobRepository, reviewResultRepository,
-                commentParser, jobStateMachine, chunkCoordinator, properties, entityManager, transactionManager);
+        RetryManager retryManager = new RetryManager(reviewJobRepository, jobStateMachine, chunkCoordinator,
+                properties, new TextSanitizer(), entityManager, transactionManager);
+        CommentRenderer commentRenderer = new CommentRenderer(commentParser, new TextSanitizer(), properties);
+        StructuredResponseParser structuredResponseParser = new StructuredResponseParser(
+                commentParser, commentRenderer, new TextSanitizer(), properties, new MetricsCounters());
+        return new ResultProcessor(reviewRepository, reviewJobRepository, reviewChunkRepository, reviewResultRepository,
+                commentParser, structuredResponseParser, jobStateMachine, chunkCoordinator, retryManager,
+                new MetricsCounters(), properties, new TextSanitizer(), entityManager, transactionManager);
     }
 
     @Test
@@ -117,13 +123,13 @@ class ResultProcessorConcurrentSubmitTest extends AbstractPostgresIntegrationTes
                 startLatch.countDown();
                 startLatch.await(10, TimeUnit.SECONDS);
                 return processorA.process(reviewId, jobId, "worker-1", backendId,
-                        new SubmitResultCommand("[{\"comment\":\"finding from A\"}]", 1, 1, 10L, "model-x"));
+                        new SubmitResultCommand("[{\"comment\":\"finding from A\"}]", 1, 1, 10L, "model-x", null));
             });
             Future<ReviewStatus> futureB = executor.submit(() -> {
                 startLatch.countDown();
                 startLatch.await(10, TimeUnit.SECONDS);
                 return processorB.process(reviewId, jobId, "worker-1", backendId,
-                        new SubmitResultCommand("[{\"comment\":\"finding from B\"}]", 1, 1, 10L, "model-x"));
+                        new SubmitResultCommand("[{\"comment\":\"finding from B\"}]", 1, 1, 10L, "model-x", null));
             });
 
             ReviewStatus resultA = futureA.get(15, TimeUnit.SECONDS);

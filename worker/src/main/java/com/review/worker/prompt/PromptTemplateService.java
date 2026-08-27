@@ -3,9 +3,12 @@ package com.review.worker.prompt;
 import com.review.worker.config.WorkerProperties;
 import com.review.worker.error.AbandonJobException;
 import com.review.worker.llama.dto.ChatMessage;
+import jakarta.annotation.PostConstruct;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.core.io.ClassPathResource;
+import org.springframework.core.io.Resource;
+import org.springframework.core.io.support.PathMatchingResourcePatternResolver;
 import org.springframework.stereotype.Component;
 import org.yaml.snakeyaml.Yaml;
 
@@ -13,6 +16,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.regex.Matcher;
@@ -64,6 +68,77 @@ public class PromptTemplateService {
 
     public PromptTemplateService(WorkerProperties properties) {
         this.properties = properties;
+    }
+
+    /**
+     * chore/config-consolidation: symmetric counterpart to
+     * {@code GatewayProperties.validateStructuredOnStartup}'s success-path budget log on the Gateway
+     * side — this only LOGS (never throws, never blocks startup on a single bad template file), since
+     * templates are plain classpath resources, not a validated {@code @ConfigurationProperties} bean.
+     * One INFO line per template found under {@code prompt.location} (default {@code classpath:prompts/}),
+     * each showing its effective {@code maxTokens} (its own override, or the {@code llama.max-tokens}
+     * global default it will fall back to) — so an operator tuning the LLM token budget can see both
+     * halves (Gateway's {@code gateway.structured.answer-reserve}/{@code gateway.diff.answer-reserve}
+     * and Worker's resolved per-template {@code maxTokens}) without needing to read either source file.
+     * See DEPLOYMENT.md, "Бюджет LLM-токенов: сводная таблица", for the full cross-process picture.
+     */
+    @PostConstruct
+    void logResolvedTemplateBudgetsOnStartup() {
+        int globalMaxTokens = properties.getLlama().getMaxTokens();
+        List<Resource> templates = listTemplateResources();
+        if (templates.isEmpty()) {
+            log.warn("No prompt templates found under {} at startup -- every claimed job will fail with "
+                    + "'Unknown promptVersion'", properties.getPrompt().getLocation());
+            return;
+        }
+        for (Resource resource : templates) {
+            String versionName = stripYamlExtension(resource.getFilename());
+            try {
+                Map<String, Object> parsed = parseYamlBestEffort(resource);
+                Integer templateMaxTokens = asInteger(parsed.get("maxTokens"));
+                int effective = templateMaxTokens != null ? templateMaxTokens : globalMaxTokens;
+                log.info("Prompt template '{}': effective maxTokens={}{}", versionName, effective,
+                        templateMaxTokens != null ? "" : " (llama.max-tokens default, no per-template override)");
+            } catch (RuntimeException e) {
+                // Best-effort diagnostic only -- a template that fails to parse here will fail the same
+                // way (as an AbandonJobException) the first time a job actually requests it; this method
+                // must never turn that into a startup failure for every OTHER, valid template.
+                log.warn("Prompt template '{}' could not be inspected for its budget log line ({}); it will "
+                        + "still be validated normally when a job actually requests it", versionName,
+                        e.getClass().getSimpleName());
+            }
+        }
+    }
+
+    private List<Resource> listTemplateResources() {
+        try {
+            PathMatchingResourcePatternResolver resolver = new PathMatchingResourcePatternResolver();
+            Resource[] found = resolver.getResources(properties.getPrompt().getLocation() + "*.yml");
+            List<Resource> sorted = new ArrayList<>(List.of(found));
+            sorted.sort(Comparator.comparing(Resource::getFilename, Comparator.nullsLast(String::compareTo)));
+            return sorted;
+        } catch (IOException e) {
+            log.warn("Could not list prompt templates under {} for the startup budget log ({})",
+                    properties.getPrompt().getLocation(), e.getClass().getSimpleName());
+            return List.of();
+        }
+    }
+
+    private String stripYamlExtension(String filename) {
+        if (filename == null) {
+            return "?";
+        }
+        return filename.endsWith(".yml") ? filename.substring(0, filename.length() - 4) : filename;
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> parseYamlBestEffort(Resource resource) {
+        try (InputStream in = resource.getInputStream()) {
+            Object loaded = new Yaml().load(in);
+            return loaded instanceof Map ? (Map<String, Object>) loaded : Map.of();
+        } catch (IOException e) {
+            throw new IllegalStateException("Could not read prompt template resource", e);
+        }
     }
 
     /**

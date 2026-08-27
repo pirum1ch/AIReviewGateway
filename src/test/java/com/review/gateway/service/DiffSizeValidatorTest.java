@@ -133,4 +133,54 @@ class DiffSizeValidatorTest {
         // The diff budget itself also shrinks well below what a "previously accepted max diff" needed.
         assertThat(validator.budgetTokens(6000)).isLessThan(maxDiffBudgetWithoutPrompt);
     }
+
+    // ---- F-SRO-03: structured-version-aware budgetTokens/assertPromptFits overload ----
+
+    @Test
+    void twoArgBudgetTokensWithDiffAnswerReserveMatchesTheOneArgOverload() {
+        // T-6.1: v1/v2 arithmetic must be byte-identical -- the one-arg overload now delegates to the
+        // two-arg one with gateway.diff.answer-reserve.
+        GatewayProperties properties = propertiesWithBudget(16384, 2000, 4000, 100_000, 4);
+        DiffSizeValidator validator = new DiffSizeValidator(properties);
+
+        assertThat(validator.budgetTokens(3000, 4000)).isEqualTo(validator.budgetTokens(3000));
+    }
+
+    @Test
+    void twoArgBudgetTokensEqualsContextWindowMinusPromptReserveMinusSystemPromptMinusAnswerReserve() {
+        GatewayProperties properties = propertiesWithBudget(16384, 2000, 4000, 100_000, 4);
+        DiffSizeValidator validator = new DiffSizeValidator(properties);
+
+        // Structured versions use a larger, explicitly-passed answer reserve (e.g. 8000) instead of
+        // gateway.diff.answer-reserve (4000 here) -- the maxDiffTokens cap is generous so the
+        // context-window-derived term is always binding, making the arithmetic exact.
+        int structuredAnswerReserve = 8000;
+        assertThat(validator.budgetTokens(3000, structuredAnswerReserve))
+                .isEqualTo(16384 - 2000 - 3000 - structuredAnswerReserve);
+    }
+
+    @Test
+    void aLargerStructuredAnswerReserveYieldsATighterBudgetThanTheDefaultDiffAnswerReserve() {
+        GatewayProperties properties = propertiesWithBudget(16384, 2000, 4000, 100_000, 4);
+        DiffSizeValidator validator = new DiffSizeValidator(properties);
+
+        int v1v2Budget = validator.budgetTokens(0, properties.getDiff().getAnswerReserve());
+        int structuredBudget = validator.budgetTokens(0, 8000);
+
+        assertThat(structuredBudget).isLessThan(v1v2Budget);
+    }
+
+    @Test
+    void assertPromptFitsTwoArgOverloadUsesTheSuppliedAnswerReserveNotTheDiffDefault() {
+        // 16384 - 2000(promptReserve) - 8000(structured answer-reserve) = 6384 headroom; a 6000-token
+        // system prompt leaves only 384 tokens, below the configured 1000-token minimum -- even though
+        // gateway.diff.answer-reserve (4000) alone would have left comfortable headroom.
+        GatewayProperties properties = propertiesWithBudget(16384, 2000, 4000, 100_000, 4);
+        properties.getPrompt().getLimits().setMinDiffBudgetTokens(1000);
+        DiffSizeValidator validator = new DiffSizeValidator(properties);
+
+        assertThatCode(() -> validator.assertPromptFits(6000)).doesNotThrowAnyException();
+        assertThatThrownBy(() -> validator.assertPromptFits(6000, 8000))
+                .isInstanceOf(PromptTooLargeException.class);
+    }
 }

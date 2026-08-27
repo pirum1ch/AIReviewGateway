@@ -80,8 +80,14 @@ class ResultProcessorOversizedFilePathTest extends AbstractPostgresIntegrationTe
         GatewayProperties properties = new GatewayProperties();
         ChunkCoordinator chunkCoordinator = new ChunkCoordinator(reviewRepository, reviewJobRepository,
                 reviewChunkRepository, reviewCommentRepository, stateMachine, jobStateMachine, properties, entityManager, transactionManager);
-        return new ResultProcessor(reviewRepository, reviewJobRepository, reviewResultRepository,
-                commentParser, jobStateMachine, chunkCoordinator, properties, entityManager, transactionManager);
+        RetryManager retryManager = new RetryManager(reviewJobRepository, jobStateMachine, chunkCoordinator,
+                properties, new TextSanitizer(), entityManager, transactionManager);
+        CommentRenderer commentRenderer = new CommentRenderer(commentParser, new TextSanitizer(), properties);
+        StructuredResponseParser structuredResponseParser = new StructuredResponseParser(
+                commentParser, commentRenderer, new TextSanitizer(), properties, new MetricsCounters());
+        return new ResultProcessor(reviewRepository, reviewJobRepository, reviewChunkRepository, reviewResultRepository,
+                commentParser, structuredResponseParser, jobStateMachine, chunkCoordinator, retryManager,
+                new MetricsCounters(), properties, new TextSanitizer(), entityManager, transactionManager);
     }
 
     private Review persistRunningReview(String headSha) {
@@ -105,14 +111,14 @@ class ResultProcessorOversizedFilePathTest extends AbstractPostgresIntegrationTe
         Review review = persistRunningReview("sha-oversized-filepath");
         ReviewJob job = persistJob(review);
 
-        CommentParser commentParser = new CommentParser(new GatewayProperties());
+        CommentParser commentParser = new CommentParser(new GatewayProperties(), new MetricsCounters());
         ResultProcessor processor = newResultProcessor(commentParser);
 
         String hugeFilePath = "a/".repeat(1000) + "File.java"; // ~3000 chars, column is VARCHAR(1024)
         String raw = "[{\"file\":\"" + hugeFilePath + "\",\"line\":1,\"severity\":\"MINOR\",\"comment\":\"finding\"}]";
 
         assertThatCode(() -> processor.process(review.getId(), job.getId(), "worker-1", job.getBackendId(),
-                new SubmitResultCommand(raw, 10, 5, 1000L, "model-x")))
+                new SubmitResultCommand(raw, 10, 5, 1000L, "model-x", null)))
                 .as("FIXED: CommentParser now caps filePath length the same way it caps comment text, "
                         + "so an oversized LLM-supplied file path no longer overflows "
                         + "review_comments.file_path VARCHAR(1024)")
@@ -140,7 +146,7 @@ class ResultProcessorOversizedFilePathTest extends AbstractPostgresIntegrationTe
         Review review = persistRunningReview("sha-escaped-filepath-inflation");
         ReviewJob job = persistJob(review);
 
-        CommentParser commentParser = new CommentParser(new GatewayProperties());
+        CommentParser commentParser = new CommentParser(new GatewayProperties(), new MetricsCounters());
         ResultProcessor processor = newResultProcessor(commentParser);
 
         // 1024 literal '"' characters pre-escape -- exactly at the column limit before escaping, but
@@ -150,7 +156,7 @@ class ResultProcessorOversizedFilePathTest extends AbstractPostgresIntegrationTe
         String raw = "[{\"file\":\"" + jsonEscapedFilePathValue + "\",\"comment\":\"finding\"}]";
 
         assertThatCode(() -> processor.process(review.getId(), job.getId(), "worker-1", job.getBackendId(),
-                new SubmitResultCommand(raw, 10, 5, 1000L, "model-x")))
+                new SubmitResultCommand(raw, 10, 5, 1000L, "model-x", null)))
                 .as("FIXED: capLength runs after htmlEscape, so escaping's inflation of an all-quote "
                         + "filePath cannot overflow review_comments.file_path VARCHAR(1024)")
                 .doesNotThrowAnyException();

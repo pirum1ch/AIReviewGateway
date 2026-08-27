@@ -52,6 +52,15 @@ public class ChunkContextRenderer {
     private static final String OTHER_FILES_BEGIN = "<<<OTHER_FILES_NOT_SHOWN>>>";
     private static final String OTHER_FILES_END = "<<<END_OTHER_FILES_NOT_SHOWN>>>";
 
+    /**
+     * SRO-64a: fixed, Gateway-constant text naming the coverage obligation, rendered for every
+     * structured job regardless of {@code chunkCount} — never derived from path content, never part of
+     * the attacker-controlled file list itself (CSR-10 discipline, extended to this new intro line).
+     */
+    private static final String STRUCTURED_COVERAGE_INTRO =
+            "This review MUST account for every file listed below -- one entry under \"files\" for each, "
+                    + "in exactly this spelling, and no others.";
+
     private final GatewayProperties properties;
     private final TextSanitizer textSanitizer;
 
@@ -107,6 +116,62 @@ public class ChunkContextRenderer {
         // beyond an already-complete block; it exists for the fixed intro text itself being longer than
         // the configured cap.
         return capLength(out.toString(), maxTotalChars);
+    }
+
+    /**
+     * Structured Review Output (architecture §4.2.1, SRO-64a/b): renders the cross-chunk context header
+     * for a structured (v3) job. Unlike {@link #render}, callers invoke this <b>regardless of {@code
+     * chunkCount}</b> — it is never {@code null} for a single-chunk Review, because the schema built from
+     * the same {@code thisChunkPaths} instance always demands the model key its response on exactly this
+     * list, whether or not the decoder constraint is actually applied (SRO-04/SRO-39: the unconstrained
+     * path must remain a <em>working</em> path).
+     *
+     * <p>The {@code <<<FILES_IN_THIS_PART>>>} block is <b>never truncated</b> — no {@code
+     * max-chunk-context-chars} cap, no {@code "... and N more"} footer — it is bounded instead by
+     * construction (at most {@code gateway.structured.max-files-per-chunk} paths of at most {@code
+     * gateway.structured.max-path-chars} characters, both already enforced before this method ever runs;
+     * see the §8 startup validation for the budget this implies). The advisory {@code
+     * <<<OTHER_FILES_NOT_SHOWN>>>} block (multi-chunk only) is not a coverage obligation and may still
+     * truncate with its existing {@code "... and N more"} footer.
+     *
+     * @param thisChunkPaths the <b>same {@code List<String>} instance</b> (SRO-64c) the caller also
+     *                       passes to {@code ReviewSchemaBuilder.build} in the same claim transaction —
+     *                       never re-parsed/re-sanitized a second time on this side
+     * @param otherPaths     already-sanitized paths changed elsewhere in the MR (ignored when {@code
+     *                       chunkCount <= 1} — no cross-chunk query is needed in that case)
+     */
+    public String renderStructured(int chunkIndex, int chunkCount, List<String> thisChunkPaths, List<String> otherPaths) {
+        StringBuilder out = new StringBuilder();
+        out.append(STRUCTURED_COVERAGE_INTRO).append('\n');
+        appendUntruncatedFileBlock(out, FILES_IN_CHUNK_BEGIN, FILES_IN_CHUNK_END, thisChunkPaths);
+
+        if (chunkCount > 1) {
+            out.append("This diff was split into ").append(chunkCount)
+                    .append(" parts because it was too large for one request. This is part ")
+                    .append(chunkIndex + 1).append(" of ").append(chunkCount)
+                    .append(". The files listed above are the only ones in THIS part; do not comment on "
+                            + "files you cannot see.\n");
+            if (!otherPaths.isEmpty()) {
+                int maxTotalChars = Math.max(1, properties.getDiff().getMaxChunkContextChars());
+                appendFileBlock(out, OTHER_FILES_BEGIN, OTHER_FILES_END, otherPaths, maxTotalChars);
+            }
+        }
+        // Deliberately NO capLength() call here (unlike render()) -- that could truncate the untruncated
+        // FILES_IN_THIS_PART block above, which SRO-64b forbids.
+        return out.toString();
+    }
+
+    /**
+     * SRO-64b: emits every path in {@code paths}, deduped, one per line, with no truncation and no
+     * {@code "... and N more"} footer — the counterpart of {@link #appendFileBlock} for the coverage
+     * block that must never be shortened.
+     */
+    private void appendUntruncatedFileBlock(StringBuilder out, String beginToken, String endToken, List<String> paths) {
+        out.append(beginToken).append('\n');
+        for (String path : dedupPreserveOrder(paths)) {
+            out.append(path).append('\n');
+        }
+        out.append(endToken).append('\n');
     }
 
     /**

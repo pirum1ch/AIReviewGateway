@@ -70,7 +70,7 @@ class EntityRoundTripTest extends AbstractPostgresIntegrationTest {
 
         // review_results
         ReviewResult result = new ReviewResult(review.getId(), 0, job.getId(), "{\"raw\":true}", "summary text",
-                100, 200, 300, 4500L, "qwen2.5-coder-32b", backend.getId());
+                100, 200, 300, 4500L, "qwen2.5-coder-32b", backend.getId(), null);
         result = entityManager.persistFlushFind(result);
         assertThat(result.getId()).isNotNull();
         assertThat(result.getReviewId()).isEqualTo(review.getId());

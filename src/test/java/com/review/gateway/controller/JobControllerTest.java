@@ -39,7 +39,7 @@ class JobControllerTest {
     @Test
     void claimReturns200WithPayloadWhenAJobIsAvailable() throws Exception {
         when(queueManager.claim(eq("mac-mini-1"), eq("worker-1")))
-                .thenReturn(Optional.of(new ClaimedJob(10L, 20L, "diff content", "v1", null, null)));
+                .thenReturn(Optional.of(new ClaimedJob(10L, 20L, "diff content", "v1", null, null, null, null)));
 
         mockMvc.perform(post("/jobs/claim")
                         .header("Authorization", "Bearer " + SecurityTestTokens.WORKER_TOKEN)
@@ -58,7 +58,7 @@ class JobControllerTest {
         // Prompt Manager (V3): systemMessages passes through from ClaimedJob into the response payload.
         when(queueManager.claim(eq("mac-mini-1"), eq("worker-1")))
                 .thenReturn(Optional.of(new ClaimedJob(10L, 20L, "diff content", "v2", null,
-                        List.of("corporate base", "corporate rules"))));
+                        List.of("corporate base", "corporate rules"), null, null)));
 
         mockMvc.perform(post("/jobs/claim")
                         .header("Authorization", "Bearer " + SecurityTestTokens.WORKER_TOKEN)

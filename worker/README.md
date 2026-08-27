@@ -58,24 +58,25 @@ all queue/retry/dedup/timeout/routing/publish logic lives in the Gateway (see th
       │
       │ 204 No Content            ──▶ sleep(network.poll-interval-ms), loop
       │
-      │ 200 OK {jobId, reviewId, payload:{diff, promptVersion}}
+      │ 200 OK {jobId, reviewId, payload:{diff, promptVersion, responseFormat, jsonSchema}}
       ▼
- resolve prompt:
-   classpath:prompts/<promptVersion>.yml
-   literal {{DIFF}} substitution                       │
-      │                                                 │
-      │ unknown promptVersion / oversized diff          │
-      │  ──▶ AbandonJobException, jobs_failed++,        │
-      │      POST /jobs/{id}/fail (best-effort), loop   │
-      ▼                                                 │
+ resolve prompt:                            resolve decoder constraint (Structured Review Output, V5):
+   classpath:prompts/<promptVersion>.yml       at most one of responseFormat/jsonSchema is non-null;
+   literal {{DIFF}} substitution                Worker attaches it verbatim, never derives/edits it
+      │                                                 │       │
+      │ unknown promptVersion / oversized diff          │       │ both non-null / oversized / invalid JSON
+      │  ──▶ AbandonJobException, jobs_failed++,        │       │  ──▶ AbandonJobException(CONSTRAINT_INVALID),
+      │      POST /jobs/{id}/fail (best-effort), loop   │       │      jobs_failed++, POST /jobs/{id}/fail, loop
+      ▼                                                 │       ▼
  start heartbeat scheduler ─────────────────────────────┤
       │                                                 ▼
       ▼                                       POST /jobs/{id}/heartbeat  (every heartbeat.interval-sec)
       │                                       "Job in progress" INFO once per tick
  "Starting inference" INFO                               │
       ▼                                                  │ shouldContinue:false / 403 / 404
- POST /v1/chat/completions  (async, cancellable)          │  ──▶ abort signal + cancel llama future
-   on llama-server                                        │
+ POST /v1/chat/completions  (async, cancellable,          │  ──▶ abort signal + cancel llama future
+   response_format/json_schema attached verbatim         │
+   when present) on llama-server                         │
       │                                                  ▼
       │ timeout / 5xx / malformed / oversize   job aborted: submit nothing, no completed/failed metric,
       │  ──▶ LlamaException, abandon, jobs_failed++,     NO /jobs/{id}/fail report (Gateway already owns it)
@@ -98,7 +99,8 @@ Step by step, matching the code in `core.WorkerLoop`/`core.HeartbeatScheduler`:
 1. **Claim.** `POST /jobs/claim` with `{backendId, workerId}` (`gateway.GatewayClient.claim`). `204` means
    nothing to claim right now (empty queue, backend not `ACTIVE`, or at capacity — all indistinguishable
    by design on the Gateway side); the loop sleeps `network.poll-interval-ms` and polls again. `200`
-   yields `{jobId, reviewId, payload:{diff, promptVersion}}`.
+   yields `{jobId, reviewId, payload:{diff, promptVersion, chunkContext, systemMessages, responseFormat,
+   jsonSchema}}` — the last two are Structured Review Output (V5), see step 2a below.
 2. **Resolve the prompt** (`prompt.PromptTemplateService.resolve`): `promptVersion` is checked against an
    allowlist regex (`^[A-Za-z0-9._-]{1,64}$`, plus an explicit rejection of any value containing `..`)
    *before* it is ever used to build a resource path; the matching `classpath:prompts/<promptVersion>.yml`
@@ -106,6 +108,14 @@ Step by step, matching the code in `core.WorkerLoop`/`core.HeartbeatScheduler`:
    `String.replace` (never re-parsed by any template/expression engine). An unknown `promptVersion` or an
    oversized diff (`worker.limits.max-diff-bytes`) throws `AbandonJobException` — the job is abandoned
    before llama is ever called.
+2a. **Resolve the decoder constraint** (`llama.DecoderConstraintResolver.resolve`, Structured Review
+    Output, V5). `payload.responseFormat`/`payload.jsonSchema` are Gateway-computed, untrusted text; at
+    most one may be non-null. The Worker's *only* business logic here is a handful of defensive bounds —
+    it never builds, edits, or semantically inspects the constraint. Both non-null, the raw text exceeding
+    `worker.limits.max-constraint-bytes` (measured on UTF-8 bytes, before any parsing), not valid JSON, or
+    not parsing to a JSON object all throw `AbandonJobException` with reason `CONSTRAINT_INVALID` — see
+    [§8.2](#82-log-patterns-worth-alerting-on). Both `null` (the common case today — `default-mode: OFF`)
+    means no constraint; the Worker proceeds exactly as before this feature.
 3. **Start the heartbeat.** `core.HeartbeatScheduler` starts a per-job, single-thread
    `ScheduledExecutorService` that calls `POST /jobs/{id}/heartbeat` every `heartbeat.interval-sec`
    (default 60s). `shouldContinue:false`, `403`, or `404` on that call sets an abort signal and cancels
@@ -113,22 +123,28 @@ Step by step, matching the code in `core.WorkerLoop`/`core.HeartbeatScheduler`:
    silently) and, after 3 consecutive failures, also aborts the job as a fail-safe.
 4. **Call llama-server.** `POST /v1/chat/completions` (OpenAI Chat-Completions shape) is issued
    asynchronously on the single shared `java.net.http.HttpClient`, so the abort signal above can cancel it
-   mid-generation instead of waiting out the full `network.request-timeout-sec`. Immediately before this
-   call, the Worker logs one INFO line (`"Starting inference (jobId=..., reviewId=..., diffChars=...,
-   systemMessages=..., model=..., maxTokens=...)"` — sizes/counts only, never diff/prompt content) so
-   there is no silent gap between "job claimed" and the first heartbeat tick. A timeout, a non-2xx
-   status, a malformed/empty body, or a response exceeding `worker.limits.max-response-bytes` all result
-   in the job being **abandoned** — no synthetic result is ever submitted for a llama failure.
+   mid-generation instead of waiting out the full `network.request-timeout-sec`. If step 2a resolved a
+   non-null constraint, it is attached to this request **verbatim**, under the corresponding OpenAI-shaped
+   wire field, never through the `{{DIFF}}`/`{{CHUNK_CONTEXT}}` template-substitution path. Immediately
+   before this call, the Worker logs one INFO line (`"Starting inference (jobId=..., reviewId=...,
+   diffChars=..., systemMessages=..., model=..., maxTokens=...)"` — sizes/counts only, never diff/prompt
+   content) so there is no silent gap between "job claimed" and the first heartbeat tick. A timeout, a
+   non-2xx status, a malformed/empty body, or a response exceeding `worker.limits.max-response-bytes` all
+   result in the job being **abandoned** — no synthetic result is ever submitted for a llama failure.
 5. **Submit the result.** `POST /jobs/{id}/result` with `{workerId, rawResponse, promptTokens,
-   completionTokens, durationMs, model}`. If the Gateway is unreachable, the Worker retries this call with
-   capped exponential backoff (holding the already-computed result in memory only, never on disk) until
-   the Gateway responds `200`/`403`/`404` — this is transport-level redelivery of an idempotent,
-   already-produced result, not a re-invocation of the LLM.
-6. **On abandonment, report it (outbound call, `gateway.GatewayClient.reportFailure`).** If step 2 or step
-   4 abandons the job (`AbandonJobException`/`LlamaException`), the Worker sends a single best-effort
+   completionTokens, durationMs, model, finishReason}`. `finishReason` (Structured Review Output, V5) is
+   `llama-server`'s own `choices[0].finish_reason` from the chat-completion response (e.g. `stop`,
+   `length`), forwarded as-is — the Worker does not interpret it, the Gateway whitelist-parses it on
+   receipt. If the Gateway is unreachable, the Worker retries this call with capped exponential backoff
+   (holding the already-computed result in memory only, never on disk) until the Gateway responds
+   `200`/`403`/`404` — this is transport-level redelivery of an idempotent, already-produced result, not a
+   re-invocation of the LLM.
+6. **On abandonment, report it (outbound call, `gateway.GatewayClient.reportFailure`).** If step 2, 2a, or
+   step 4 abandons the job (`AbandonJobException`/`LlamaException`), the Worker sends a single best-effort
    `POST /jobs/{id}/fail` **synchronously**, after `HeartbeatScheduler.stop()` has already run and before
    the loop returns to step 1 — `{workerId, reason, detail}`, where `reason` is one of
-   `LLM_EMPTY_RESPONSE`/`LLM_ERROR`/`LLM_TIMEOUT`/`LLM_RESPONSE_TOO_LARGE`/`PROMPT_INVALID`/`WORKER_ERROR`
+   `LLM_EMPTY_RESPONSE`/`LLM_ERROR`/`LLM_TIMEOUT`/`LLM_RESPONSE_TOO_LARGE`/`PROMPT_INVALID`/`WORKER_ERROR`/
+   `CONSTRAINT_INVALID` (the last one from step 2a, Structured Review Output)
    (classified from the exception, `error.JobFailureReason`) and `detail` is a **fixed, Worker-side
    constant per reason** (never `e.getMessage()`/`e.getCause().getMessage()`/`e.toString()` — a wrapped
    Jackson parse failure can quote the offending llama response verbatim, which must never leave this
@@ -212,6 +228,7 @@ on any violation below; every failure message names the property only, never its
 | `WORKER_ALLOW_INSECURE_GATEWAY` | `worker.allow-insecure-gateway` | `false` | Dev-only escape hatch — see the `GATEWAY_URL` row above; has no effect for a non-loopback `gateway.url`. |
 | `WORKER_MAX_DIFF_BYTES` | `worker.limits.max-diff-bytes` | `262144` (256 KiB) | Hard cap on the claimed diff, in UTF-8 bytes; exceeding it abandons the job before any llama call. Defensive bound against a misbehaving/compromised Gateway, set generously above the Gateway's own diff-token budget. |
 | `WORKER_MAX_RESPONSE_BYTES` | `worker.limits.max-response-bytes` | `200000` | Hard cap on the llama response body, enforced **mid-stream** (never buffers past the cap); exceeding it abandons the job. Matches the Gateway's own documented "normal" raw-response ceiling. |
+| `WORKER_MAX_CONSTRAINT_BYTES` | `worker.limits.max-constraint-bytes` | `69632` (68 KiB) | Structured Review Output (V5). Hard cap, in UTF-8 bytes measured **before** any JSON parsing, on the Gateway-supplied `responseFormat`/`jsonSchema` decoder constraint; exceeding it abandons the job with reason `CONSTRAINT_INVALID`. Deliberately larger than the Gateway's own `gateway.structured.max-schema-bytes` (default `65536`) — the wire-level `response_format`/`json_schema` wrapper `llama-server` expects adds bytes on top of the raw schema, and setting the two equal would produce a fleet-wide `CONSTRAINT_INVALID` loop the first time a schema near the limit is claimed. If you change the Gateway's `max-schema-bytes`, recompute this value too (see the root `DEPLOYMENT.md` §8c's cross-module coupling note). |
 | `LLAMA_URL` | `llama.url` | `http://127.0.0.1:8000` | Must be a valid `http`/`https` URI. A non-loopback host only logs a WARN at startup (does not fail) unless `llama.allow-non-loopback` is also set — the llama socket is unauthenticated by design. |
 | `LLAMA_ALLOW_NON_LOOPBACK` | `llama.allow-non-loopback` | `false` | Suppresses the non-loopback `llama.url` startup warning; never fail-fast either way (this is a SHOULD, not a MUST). |
 | `LLAMA_TEMPERATURE` | `llama.temperature` | `0.1` | Sampling temperature sent to llama-server (unless overridden by the prompt template — [§10](#10-adding-a-prompt-version)). |
@@ -501,7 +518,7 @@ noted):
 | `Idle: no job available in the last {N} poll(s) (backend=…)` | INFO | Rate-limited idle-liveness summary (`worker.log.idle-summary-interval-sec`, default once per 5 minutes) — proves a genuinely idle Worker is still alive without spamming one line per poll. |
 | `Gateway unavailable while claiming a job; backing off {N} ms` | WARN | Gateway is unreachable/erroring on claim; the loop is backing off (capped at 60s) and will keep retrying — not itself an outage requiring restart, but worth alerting if sustained. |
 | `Gateway unavailable while submitting result; retrying in {N} ms` | WARN | Same, but for an already-computed result stuck in redelivery — a sustained run of these means completed work is not reaching the Gateway. |
-| `Job abandoned (jobId=…, reason=…, exceptionType=…)` | WARN | A job was abandoned (prompt/llama failure), classified into one of `LLM_EMPTY_RESPONSE`/`LLM_ERROR`/`LLM_TIMEOUT`/`LLM_RESPONSE_TOO_LARGE`/`PROMPT_INVALID`/`WORKER_ERROR`. **Worker Observability & Claim Latency:** never logs the exception's message any more (only its class name) — a wrapped Jackson parse failure can quote the offending llama response verbatim, which must never reach a log line. Expected occasionally; worth alerting on a sustained rate (points at a broken `llama-server` or a bad prompt template). |
+| `Job abandoned (jobId=…, reason=…, exceptionType=…)` | WARN | A job was abandoned (prompt/llama/constraint failure), classified into one of `LLM_EMPTY_RESPONSE`/`LLM_ERROR`/`LLM_TIMEOUT`/`LLM_RESPONSE_TOO_LARGE`/`PROMPT_INVALID`/`WORKER_ERROR`/`CONSTRAINT_INVALID`. **Worker Observability & Claim Latency:** never logs the exception's message any more (only its class name) — a wrapped Jackson parse failure can quote the offending llama response verbatim, which must never reach a log line. Expected occasionally; worth alerting on a sustained rate (points at a broken `llama-server` or a bad prompt template). `reason=CONSTRAINT_INVALID` specifically (Structured Review Output, V5) means the Gateway-supplied decoder constraint failed this Worker's own defensive re-check (both `responseFormat`/`jsonSchema` set, oversized, not valid JSON, or not a JSON object) — a sustained rate of these points at a `gateway.structured.max-schema-bytes`/`worker.limits.max-constraint-bytes` mismatch (see `DEPLOYMENT.md` §8c) rather than a broken `llama-server`. |
 | `Failed to report job failure to the Gateway; the stale-heartbeat sweep will recover it (jobId=…)` | WARN | The best-effort `POST /jobs/{id}/fail` report failed (Gateway unreachable, non-2xx, or an older Gateway build without the endpoint) — swallowed, no retry; the passive sweep remains the backstop. |
 | `Result redelivery abandoned before the Gateway ever acknowledged it; counting job as failed` | WARN | A result redelivery was interrupted (typically the shutdown grace period elapsing) before the Gateway confirmed receipt. |
 | `Heartbeat tick failed ({N} consecutive) (jobId=…)` | WARN | A single heartbeat attempt failed (e.g. transient Gateway error); the scheduler keeps running. |
@@ -563,8 +580,21 @@ operator-writable directory at runtime. To add a new `promptVersion`:
 
    `user` is required (a template missing it, or that isn't a YAML mapping at all, abandons the job);
    `system` and the three overrides are all optional.
-4. The `user` text must instruct the model to emit the exact shape the Gateway's own comment parser
-   expects — a JSON array of `{file, line, severity, comment}` objects (see the root README's
-   [§6.6](../README.md#66-post-jobsidresult--submit-the-result-worker)) — since the Worker forwards the
-   raw model output to the Gateway verbatim, with no parsing or validation of its own. The shipped
-   `prompts/v1.yml` does exactly this and is the reference example to copy from.
+4. The `user` text must instruct the model to emit the exact shape the Gateway's own parser expects,
+   since the Worker forwards the raw model output to the Gateway verbatim, with no parsing or validation
+   of its own — but **which mechanism actually enforces that shape now depends on the template**:
+   - For a `v1`/`v2`-style template, prose instruction is the **only** mechanism — a JSON array of
+     `{file, line, severity, comment}` objects (see the root README's
+     [§6.6](../README.md#66-post-jobsidresult--submit-the-result-worker)). The shipped `prompts/v1.yml`
+     does exactly this and is the reference example to copy from.
+   - For a **Structured Review Output (V5)** template (`promptVersion` in
+     `gateway.structured` — see the shipped `prompts/v3.yml`), prose instruction alone is no longer the
+     only mechanism: on a backend whose `structured_output_mode` is not `OFF`, the Gateway additionally
+     attaches a decoder-level JSON Schema constraint (`payload.responseFormat`/`payload.jsonSchema`,
+     [§2](#2-how-it-works) step 2a) that this Worker forwards verbatim — the *shape* guarantee comes from
+     that constraint (when active) plus the Gateway's own strict re-validation on receipt, not from the
+     template text alone. The template's `user` text should still describe the desired shape in prose
+     (so the response is still well-formed on a backend running with the constraint `OFF`, which is the
+     shipped default), but it is a second, complementary mechanism now, not the only one. See the root
+     README's [§6.1c](../README.md#61c-structured-review-output-and-response-validation) for the full
+     model, and `worker/src/main/resources/prompts/v3.yml` for the shipped example.

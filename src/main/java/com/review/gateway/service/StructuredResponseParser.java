@@ -1,0 +1,432 @@
+package com.review.gateway.service;
+
+import com.fasterxml.jackson.core.JsonFactory;
+import com.fasterxml.jackson.core.JsonParseException;
+import com.fasterxml.jackson.core.StreamReadConstraints;
+import com.fasterxml.jackson.core.StreamReadFeature;
+import com.fasterxml.jackson.core.io.JsonEOFException;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.json.JsonMapper;
+import com.review.gateway.config.GatewayProperties;
+import com.review.gateway.model.enums.Severity;
+import com.review.gateway.service.dto.ParsedComment;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Service;
+
+import java.util.ArrayList;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Set;
+import java.util.stream.Collectors;
+
+/**
+ * Structured Review Output (architecture §5.1, SRO-30-34): strict, non-fallback parsing and validation
+ * of a structured (v3) response, hand-rolled against the same expected file-path set {@link
+ * ReviewSchemaBuilder} used to build the claim's schema — no JSON-Schema validation library is added
+ * (CLAUDE.md "no extra infrastructure"; SRO-30).
+ *
+ * <p><b>SRO-31:</b> parsing is direct — {@code objectMapper.readTree(raw.strip())} — with {@code
+ * strip()} the only normalization permitted. No {@code extractJsonArraySlice}-style scan, no
+ * markdown-fence stripping, no prose tolerance: under this feature "malformed" is an infra/config fact
+ * the operator must see, not a model mood to work around.
+ *
+ * <p><b>SRO-04/threat-model SOR-11 (structurally un-shortcuttable, CRITICAL):</b> this class has
+ * <b>no dependency whatsoever on {@code Backend}/{@code StructuredOutputMode}/{@code finish_reason ==
+ * "stop"}</b> — a conforming response from a {@code mode = OFF} backend is validated identically to one
+ * from a constrained backend, and an empty expected path set is never treated as a satisfiable
+ * condition (that case is a caller bug, {@link IllegalStateException}, never reported as a pass or as
+ * {@code COVERAGE_SHORTFALL} — SRO-67c).
+ *
+ * <p><b>F-SRO-01 (appsec SAST):</b> the dedicated {@link ObjectMapper} enables {@code
+ * StreamReadFeature.STRICT_DUPLICATE_DETECTION}, so a duplicate {@code files} key or a duplicate
+ * per-file key is reported as {@link FailureKind#NOT_JSON} (via a plain {@code JsonParseException} —
+ * Jackson has no dedicated duplicate-key exception subtype), never silently resolved by keeping only
+ * the last occurrence.
+ */
+@Service
+public class StructuredResponseParser {
+
+    private static final Logger log = LoggerFactory.getLogger(StructuredResponseParser.class);
+
+    /** SRO-45's closed vocabulary — metrics/last_error are keyed on these four kinds only. */
+    public enum FailureKind {
+        NOT_JSON,
+        SCHEMA_MISMATCH,
+        COVERAGE_SHORTFALL,
+        TRUNCATED
+    }
+
+    /** Sealed two-shape validation outcome: exactly one of {@link #success()}/{@link #failure()} is non-null. */
+    public record ValidationResult(Success success, Failure failure) {
+
+        public boolean isSuccess() {
+            return success != null;
+        }
+
+        static ValidationResult ok(Success success) {
+            return new ValidationResult(success, null);
+        }
+
+        static ValidationResult fail(FailureKind kind, String detail) {
+            return new ValidationResult(null, new Failure(kind, detail));
+        }
+    }
+
+    public record Success(List<ParsedComment> comments, String summary) {
+    }
+
+    /** {@code detail} is already sanitized/capped — safe to embed directly in {@code last_error}. */
+    public record Failure(FailureKind kind, String detail) {
+    }
+
+    private static final Set<String> TOP_LEVEL_REQUIRED_KEYS = Set.of("files", "summary");
+    private static final int MAX_LISTED_KEYS = 5;
+    /**
+     * F-SRO-10 (appsec SAST fix round): lowered from 64. Worst case ({@link #MAX_LISTED_KEYS} keys per
+     * side, each capped to this length, plus the {@code (+K more)} remainder marker on both the {@code
+     * missing=}/{@code unexpected=} halves) must fit under {@code RetryManager.MAX_LAST_ERROR_LENGTH}
+     * (512) <em>together with</em> {@code composeStructuredFailureReason}'s
+     * {@code "structured-output: COVERAGE_SHORTFALL; "} prefix (the longest {@link FailureKind} name) —
+     * at 64 chars/key that combined worst case was ~700 chars, so {@code RetryManager.sanitizeLastError}'s
+     * right-truncation at 512 could cut into the {@code unexpected=} half itself (the model-controlled
+     * diagnosis this cap exists to preserve). At 40 chars/key the worst case is ~504 chars for {@code
+     * (prefix + detail)} alone, leaving only {@code RetryManager}'s own attempt-count suffix (appended
+     * after this class returns) as the part truncation can still touch.
+     */
+    private static final int MAX_KEY_CHARS = 40;
+
+    private final CommentParser commentParser;
+    private final CommentRenderer commentRenderer;
+    private final TextSanitizer textSanitizer;
+    private final MetricsCounters metricsCounters;
+    private final ObjectMapper objectMapper;
+
+    public StructuredResponseParser(CommentParser commentParser, CommentRenderer commentRenderer,
+                                     TextSanitizer textSanitizer, GatewayProperties properties,
+                                     MetricsCounters metricsCounters) {
+        this.commentParser = commentParser;
+        this.commentRenderer = commentRenderer;
+        this.textSanitizer = textSanitizer;
+        this.metricsCounters = metricsCounters;
+        // Threat model SOR-14 (TRACKED): a dedicated ObjectMapper with explicit StreamReadConstraints,
+        // turning inherited Jackson defaults into a stated contract on the one parser that eats
+        // adversarial input by design.
+        //
+        // F-SRO-01 (appsec SAST): STRICT_DUPLICATE_DETECTION is enabled deliberately. Without it, a
+        // duplicate "files" key (or a duplicate key inside one file's object) makes Jackson silently
+        // keep only the *last* occurrence and discard the first object's content outright -- validation
+        // then runs against the survivor and can pass, producing a COMPLETED job that silently dropped
+        // real findings with no error, no FailureKind, no counter. With the flag on, a duplicate key
+        // throws a plain JsonParseException (there is no dedicated "duplicate key" exception subtype --
+        // JsonReadContext._checkDup throws JsonParseException itself), which the catch block below
+        // already classifies as FailureKind.NOT_JSON using only getClass().getSimpleName() -- never the
+        // exception message (F02-03/SR-14). A duplicate key is therefore reported as NOT_JSON, not
+        // SCHEMA_MISMATCH; that is an intentional, acceptable classification (SOR-14's property is
+        // "never last-wins", not "classified as SCHEMA_MISMATCH") and needs no message inspection.
+        StreamReadConstraints constraints = StreamReadConstraints.builder()
+                .maxNestingDepth(64)
+                .maxNameLength(1024)
+                .maxStringLength(Math.max(20_000, properties.getPublish().getMaxRawResponseLength()))
+                .build();
+        JsonFactory jsonFactory = JsonFactory.builder()
+                .streamReadConstraints(constraints)
+                .enable(StreamReadFeature.STRICT_DUPLICATE_DETECTION)
+                .build();
+        this.objectMapper = JsonMapper.builder(jsonFactory).build();
+    }
+
+    /**
+     * @param rawResponse          the (already {@code capRawResponseIfNeeded}-capped, SRO-32 step 4
+     *                              depends on that ordering) raw model response
+     * @param expectedPaths        the exact same {@code List<String>} instance {@code
+     *                              ReviewSchemaBuilder} was given for this chunk (SRO-64c) — the
+     *                              validator's "expected" half of the coverage check
+     * @param rawResponseTruncated whether {@code ResultProcessor.capRawResponseIfNeeded} truncated the
+     *                              raw response before this call
+     * @param finishReason         the whitelist-parsed {@link com.review.gateway.model.enums.FinishReason}
+     *                              wire value for this completion, or {@code null}
+     * @param chunkDiff             {@code review_chunks.diff} for this job's own (reviewId, chunkIndex) —
+     *                              forwarded to {@link CommentRenderer} verbatim (SOR-12)
+     * @param commentCap            F-SRO-04 (appsec SAST fix round): the caller's fair-share comment cap
+     *                              for this chunk (the same value the legacy path passes to {@code
+     *                              CommentParser.parse}, {@code max(1, floor(maxCommentCount /
+     *                              chunkCount))}) — bounds only how many of the <em>validated</em>
+     *                              findings are actually rendered, never which findings are validated:
+     *                              coverage/shape/length checks below still run against every finding in
+     *                              the response, exactly as before. Capping happens strictly before
+     *                              rendering so the expensive per-finding diff-context extraction never
+     *                              runs for a finding that could never be published anyway.
+     * @throws IllegalStateException if {@code expectedPaths} is null/empty (SRO-67c) — an internal
+     *                                 invariant violation, never a validation outcome
+     */
+    public ValidationResult validate(String rawResponse, List<String> expectedPaths, boolean rawResponseTruncated,
+                                      String finishReason, String chunkDiff, ReviewSchemaBuilder.SchemaOptions options,
+                                      int commentCap) {
+        if (expectedPaths == null || expectedPaths.isEmpty()) {
+            // SRO-67c: the more rigorously SRO-04 is implemented, the more confidently an empty expected
+            // set would otherwise pass -- this is OUR bug (SRO-67b should have failed the job closed
+            // before this was ever dispatched), never reported as a satisfiable coverage check.
+            throw new IllegalStateException(
+                    "StructuredResponseParser.validate called with an empty/null expected path set -- "
+                            + "SRO-67b should have failed this job closed at claim time; this is a Gateway bug");
+        }
+        Set<String> expectedSet = new LinkedHashSet<>(expectedPaths);
+
+        // SRO-32 step 4 (TRUNCATED), checked before NOT_JSON: known-truncated signals take precedence
+        // over whatever readTree would have made of a (possibly coincidentally valid-looking) prefix.
+        // F-SRO-08(a): compare the WHITELIST-PARSED value, not the raw wire string -- storeRawResult
+        // persists review_results.finish_reason via this same FinishReason.fromWireValue parse (trim +
+        // lowercase), so a differently-cased/whitespace-padded "Length"/"LENGTH"/" length" would otherwise
+        // be stored as "length" but NOT classified TRUNCATED here, falling through to a confusing
+        // NOT_JSON/SCHEMA_MISMATCH instead.
+        boolean knownTruncated = com.review.gateway.model.enums.FinishReason.fromWireValue(finishReason)
+                == com.review.gateway.model.enums.FinishReason.LENGTH || rawResponseTruncated;
+        if (knownTruncated) {
+            return ValidationResult.fail(FailureKind.TRUNCATED,
+                    "finish_reason=" + (finishReason == null ? "null" : finishReason)
+                            + "; raw_response_truncated=" + rawResponseTruncated);
+        }
+
+        JsonNode root;
+        try {
+            root = objectMapper.readTree(rawResponse == null ? "" : rawResponse.strip());
+        } catch (JsonEOFException unexpectedEof) {
+            return ValidationResult.fail(FailureKind.TRUNCATED, "unexpected end of input while parsing JSON");
+        } catch (JsonParseException | com.fasterxml.jackson.databind.exc.MismatchedInputException malformed) {
+            // F02-03/SR-14: never malformed.getMessage() -- Jackson quotes a source excerpt of the
+            // untrusted raw response. Only the exception class is safe.
+            return ValidationResult.fail(FailureKind.NOT_JSON, malformed.getClass().getSimpleName());
+        } catch (Exception malformed) {
+            return ValidationResult.fail(FailureKind.NOT_JSON, malformed.getClass().getSimpleName());
+        }
+        if (root == null || !root.isObject()) {
+            return ValidationResult.fail(FailureKind.NOT_JSON, "response root is not a JSON object");
+        }
+
+        ValidationResult shapeFailure = validateTopLevelShape(root);
+        if (shapeFailure != null) {
+            return shapeFailure;
+        }
+        String chunkSummary = root.get("summary").asText();
+        JsonNode filesNode = root.get("files");
+
+        Set<String> actualKeys = fieldNames(filesNode);
+        if (!actualKeys.equals(expectedSet)) {
+            return ValidationResult.fail(FailureKind.COVERAGE_SHORTFALL, formatCoverageDetail(expectedSet, actualKeys));
+        }
+
+        List<RawFinding> findings = new ArrayList<>();
+        // F-SRO-02 belt-and-braces: iterate the deduped expectedSet, not the raw expectedPaths list --
+        // if a caller-side sanitization collision ever slipped a duplicate value into expectedPaths
+        // (ReviewService's SRO-17 check is the primary defense against that), this class must still
+        // never process the same file twice.
+        for (String path : expectedSet) {
+            ValidationResult fileShapeFailure = validateFileEntryAndCollect(filesNode.get(path), path, options, findings);
+            if (fileShapeFailure != null) {
+                return fileShapeFailure;
+            }
+        }
+
+        // F-SRO-04: cap RENDERING (never validation, which is already complete above) to the caller's
+        // fair-share limit -- the schema's hard bound alone allows up to 40 files x 20 findings = 800
+        // RawFinding entries, and rendering every one of them before any cap let a single chunk consume
+        // the entire review-wide comment budget (SRO-33's fairShareCommentCap was never applied on this
+        // path) while also running the expensive per-finding diff-context extraction for findings that
+        // could never survive the cap anyway.
+        int effectiveCap = Math.max(0, commentCap);
+        List<RawFinding> findingsToRender = findings.size() > effectiveCap ? findings.subList(0, effectiveCap) : findings;
+        if (findings.size() > effectiveCap) {
+            log.debug("Structured response yielded {} finding(s), rendering only the first {} under the "
+                    + "fair-share comment cap", findings.size(), effectiveCap);
+        }
+
+        // F-SRO-04: the chunk diff is split/indexed exactly ONCE here, then reused across every finding's
+        // render() call -- previously every single render() call re-split and re-scanned the whole chunk
+        // diff from scratch.
+        CommentRenderer.ChunkDiffIndex diffIndex = commentRenderer.prepareChunkDiffIndex(chunkDiff);
+
+        List<ParsedComment> comments = new ArrayList<>();
+        for (RawFinding finding : findingsToRender) {
+            // SRO-34: a file whose findings is empty simply contributes no entries to `findings` above.
+            Integer normalizedLine = commentParser.normalizeLineNumber(finding.line());
+            // SGB-04/SOGT-01 (Structured Output Grammar Budget, BLOCKING): the comment/suggestion may
+            // already have been truncated above (SGB-03) -- that fact is threaded through explicitly
+            // rather than let CommentRenderer re-derive "was this altered?" against text that is already
+            // the truncated string, which would silently omit ALTERED_CODE_MARKER (see renderIndexed's
+            // javadoc).
+            String renderedText = commentRenderer.renderIndexed(finding.filePath(), normalizedLine, finding.severity(),
+                    finding.comment(), finding.commentTruncated(), finding.suggestion(), finding.suggestionTruncated(),
+                    diffIndex);
+            String sanitizedFilePath = commentParser.sanitizeFilePath(finding.filePath());
+            comments.add(new ParsedComment(sanitizedFilePath, normalizedLine, finding.severity(), renderedText));
+        }
+        return ValidationResult.ok(new Success(comments, chunkSummary));
+    }
+
+    private ValidationResult validateTopLevelShape(JsonNode root) {
+        Set<String> topKeys = fieldNames(root);
+        if (!topKeys.equals(TOP_LEVEL_REQUIRED_KEYS)) {
+            return ValidationResult.fail(FailureKind.SCHEMA_MISMATCH,
+                    "top-level keys did not match the required {files, summary} set");
+        }
+        JsonNode filesNode = root.get("files");
+        if (filesNode == null || !filesNode.isObject()) {
+            return ValidationResult.fail(FailureKind.SCHEMA_MISMATCH, "'files' is missing or not a JSON object");
+        }
+        JsonNode summaryNode = root.get("summary");
+        if (summaryNode == null || !summaryNode.isTextual()) {
+            return ValidationResult.fail(FailureKind.SCHEMA_MISMATCH, "'summary' is missing or not a string");
+        }
+        return null;
+    }
+
+    /** @return a failure result, or {@code null} on success (findings appended to {@code out}). */
+    private ValidationResult validateFileEntryAndCollect(JsonNode fileNode, String path,
+                                                           ReviewSchemaBuilder.SchemaOptions options,
+                                                           List<RawFinding> out) {
+        if (fileNode == null || !fileNode.isObject()) {
+            return ValidationResult.fail(FailureKind.SCHEMA_MISMATCH, "a file entry is missing or not a JSON object");
+        }
+        JsonNode findingsNode = fileNode.get("findings");
+        if (findingsNode == null || !findingsNode.isArray()) {
+            return ValidationResult.fail(FailureKind.SCHEMA_MISMATCH, "'findings' is missing or not an array for a file entry");
+        }
+        if (options.perFileSummary()) {
+            // SOGB-10 (Info, TRACKED): only existence-checked, never read/bounded -- unbounded because it
+            // is discarded (never collected into `out`/RawFinding). If a future change starts reading it,
+            // route it through TextSanitizer.truncateSafely first, same as `comment`/`suggestion` below.
+            JsonNode fileSummaryNode = fileNode.get("summary");
+            if (fileSummaryNode == null || !fileSummaryNode.isTextual()) {
+                return ValidationResult.fail(FailureKind.SCHEMA_MISMATCH, "per-file 'summary' is missing or not a string");
+            }
+        }
+        if (findingsNode.size() > Math.max(0, options.maxFindingsPerFile())) {
+            // SRO-04: never trust the decoder constraint -- the maxItems bound is re-checked here too.
+            return ValidationResult.fail(FailureKind.SCHEMA_MISMATCH, "'findings' array exceeded the configured maximum");
+        }
+        for (JsonNode findingNode : findingsNode) {
+            ValidationResult findingFailure = validateFindingAndCollect(findingNode, path, options, out);
+            if (findingFailure != null) {
+                return findingFailure;
+            }
+        }
+        return null;
+    }
+
+    private ValidationResult validateFindingAndCollect(JsonNode findingNode, String path,
+                                                         ReviewSchemaBuilder.SchemaOptions options, List<RawFinding> out) {
+        if (findingNode == null || !findingNode.isObject()) {
+            return ValidationResult.fail(FailureKind.SCHEMA_MISMATCH, "a finding is not a JSON object");
+        }
+        JsonNode lineNode = findingNode.get("line");
+        JsonNode severityNode = findingNode.get("severity");
+        JsonNode commentNode = findingNode.get("comment");
+        JsonNode suggestionNode = findingNode.get("suggestion");
+        if (lineNode == null || !lineNode.isIntegralNumber()) {
+            return ValidationResult.fail(FailureKind.SCHEMA_MISMATCH, "finding 'line' is missing or not an integer");
+        }
+        if (severityNode == null || !severityNode.isTextual()) {
+            return ValidationResult.fail(FailureKind.SCHEMA_MISMATCH, "finding 'severity' is missing or not a string");
+        }
+        if (commentNode == null || !commentNode.isTextual()) {
+            return ValidationResult.fail(FailureKind.SCHEMA_MISMATCH, "finding 'comment' is missing or not a string");
+        }
+        if (suggestionNode == null || !suggestionNode.isTextual()) {
+            return ValidationResult.fail(FailureKind.SCHEMA_MISMATCH, "finding 'suggestion' is missing or not a string");
+        }
+        Severity severity = parseSeverityStrict(severityNode.asText());
+        if (severity == null) {
+            // SRO-24: an out-of-set severity is a validation failure, never a silent CommentParser-style
+            // downgrade to INFO.
+            return ValidationResult.fail(FailureKind.SCHEMA_MISMATCH, "finding 'severity' is outside the allowed enum");
+        }
+        String comment = commentNode.asText();
+        String suggestion = suggestionNode.asText();
+
+        // SGB-01/SGB-03 (Structured Output Grammar Budget): ReviewSchemaBuilder no longer emits
+        // maxLength (a bounded string repetition is what tripped llama.cpp's grammar-parser complexity
+        // guard in production), so an over-length comment/suggestion is now a routine, expected shape --
+        // never a whole-chunk-retryable SCHEMA_MISMATCH. It is truncated to the configured cap instead,
+        // on a code-point boundary (SOGB-03: never split a UTF-16 surrogate pair -- TextSanitizer's
+        // shared helper, not a second unsafe substring). SOGB-04: this runs unconditionally, on every
+        // structured result, with no branch on Backend/StructuredOutputMode/finish_reason/whether the
+        // decoder was actually constrained (SOR-11).
+        TextSanitizer.Truncation commentResult = textSanitizer.truncateSafely(comment, options.maxCommentChars());
+        TextSanitizer.Truncation suggestionResult = textSanitizer.truncateSafely(suggestion, options.maxSuggestionChars());
+        if (commentResult.truncated()) {
+            metricsCounters.incrementStructuredFieldTruncated("comment");
+            log.debug("Structured finding 'comment' truncated to the configured cap (originalLength={}, cappedLength={})",
+                    comment.length(), commentResult.text().length());
+        }
+        if (suggestionResult.truncated()) {
+            metricsCounters.incrementStructuredFieldTruncated("suggestion");
+            log.debug("Structured finding 'suggestion' truncated to the configured cap (originalLength={}, cappedLength={})",
+                    suggestion.length(), suggestionResult.text().length());
+        }
+
+        out.add(new RawFinding(path, lineNode.asInt(), severity, commentResult.text(), commentResult.truncated(),
+                suggestionResult.text(), suggestionResult.truncated()));
+        return null;
+    }
+
+    private Severity parseSeverityStrict(String rawSeverity) {
+        if (rawSeverity == null) {
+            return null;
+        }
+        return switch (rawSeverity) {
+            case "critical" -> Severity.CRITICAL;
+            case "major" -> Severity.MAJOR;
+            case "minor" -> Severity.MINOR;
+            case "info" -> Severity.INFO;
+            default -> null;
+        };
+    }
+
+    private Set<String> fieldNames(JsonNode objectNode) {
+        Set<String> names = new LinkedHashSet<>();
+        objectNode.fieldNames().forEachRemaining(names::add);
+        return names;
+    }
+
+    /**
+     * Threat model SOR-15 (TRACKED): lists at most {@value #MAX_LISTED_KEYS} missing and {@value
+     * #MAX_LISTED_KEYS} unexpected keys, each capped to {@value #MAX_KEY_CHARS} chars, with a
+     * {@code (+K more)} remainder marker -- so {@code RetryManager}'s own 512-char cap on the whole
+     * {@code last_error} string can never truncate away the one diagnosis {@code COVERAGE_SHORTFALL}
+     * exists to carry ("omitted src/B.java" vs. "invented src/Z.java" are different diagnoses).
+     */
+    private String formatCoverageDetail(Set<String> expected, Set<String> actual) {
+        Set<String> missing = new LinkedHashSet<>(expected);
+        missing.removeAll(actual);
+        Set<String> unexpected = new LinkedHashSet<>(actual);
+        unexpected.removeAll(expected);
+        return "missing=" + formatKeyList(missing) + "; unexpected=" + formatKeyList(unexpected);
+    }
+
+    private String formatKeyList(Set<String> keys) {
+        if (keys.isEmpty()) {
+            return "none";
+        }
+        List<String> capped = keys.stream()
+                .limit(MAX_LISTED_KEYS)
+                .map(key -> textSanitizer.sanitizeSingleLine(key, MAX_KEY_CHARS))
+                .collect(Collectors.toList());
+        StringBuilder rendered = new StringBuilder("[").append(String.join(", ", capped)).append(']');
+        if (keys.size() > MAX_LISTED_KEYS) {
+            rendered.append(" (+").append(keys.size() - MAX_LISTED_KEYS).append(" more)");
+        }
+        return rendered.toString();
+    }
+
+    /**
+     * SGB-04 (Structured Output Grammar Budget): {@code commentTruncated}/{@code suggestionTruncated}
+     * carry whether {@link #validateFindingAndCollect} already cut that field to its configured cap --
+     * see {@code CommentRenderer.renderIndexed}'s truncated-upstream overload for why this must not be
+     * re-derived downstream.
+     */
+    private record RawFinding(String filePath, int line, Severity severity, String comment,
+                               boolean commentTruncated, String suggestion, boolean suggestionTruncated) {
+    }
+}

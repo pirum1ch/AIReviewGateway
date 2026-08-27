@@ -242,8 +242,9 @@ class WorkerLoopContractAndResilienceTest {
         HeartbeatScheduler heartbeatScheduler = new HeartbeatScheduler(gatewayClient, properties);
         WorkerMetrics metrics = new WorkerMetrics(registry);
 
-        WorkerLoop workerLoop = new WorkerLoop(gatewayClient, llamaClient, promptTemplateService, heartbeatScheduler,
-                metrics, properties);
+        WorkerLoop workerLoop = new WorkerLoop(gatewayClient, llamaClient, promptTemplateService,
+                new com.review.worker.llama.DecoderConstraintResolver(new com.fasterxml.jackson.databind.ObjectMapper(), properties),
+                heartbeatScheduler, metrics, properties);
         loopsToStop.add(workerLoop);
         return new Harness(properties, metrics, registry, workerLoop, gatewayDispatcher);
     }
@@ -317,8 +318,11 @@ class WorkerLoopContractAndResilienceTest {
         long observedTotalMs = System.currentTimeMillis() - startedAtMs;
 
         JsonNode resultBody = MAPPER.readTree(resultRequest.getBody().readUtf8());
+        // finishReason (SRO-42/43) is a deliberate new field on the result contract -- propagated
+        // end-to-end from llama-server's finish_reason, nullable, whitelist-parsed on the Gateway side.
         Set<String> expectedFields = Set.of(
-                "workerId", "rawResponse", "promptTokens", "completionTokens", "durationMs", "model");
+                "workerId", "rawResponse", "promptTokens", "completionTokens", "durationMs", "model",
+                "finishReason");
         Set<String> actualFields = new java.util.HashSet<>();
         resultBody.fieldNames().forEachRemaining(actualFields::add);
         assertThat(actualFields).as("result payload fields exactly match the Gateway contract")

@@ -68,6 +68,28 @@ class DiffChunkerTest {
     }
 
     @Test
+    void diffGitHeaderPathIsTrimmedForParityWithTheOtherHeaderBranches() {
+        // F-SRO-02: the "diff --git " branch of extractPathFromHeaderLine did not trim(), unlike the
+        // "+++ "/"--- " branches, so it could diverge from them on a header carrying an incidental
+        // leading space right after " b/" (e.g. "diff --git a/A.java b/ A.java"). Pre-fix, the diff --git
+        // branch contributed the untrimmed " A.java" while the "+++ b/A.java" line (canonical, no space)
+        // contributed "A.java" -- two DIFFERENT strings for what a caller would read as the same file, so
+        // Section.addPath's dedup-by-equality never collapsed them and both ended up in filePaths. Post-fix
+        // both branches agree on the trimmed "A.java" and dedupe to a single entry.
+        GatewayProperties properties = propertiesWithBudget(10_000, 256, 5);
+        DiffChunker chunker = newChunker(properties);
+        String diff = "diff --git a/A.java b/ A.java\n"
+                + "index 1111111..2222222 100644\n"
+                + "--- a/A.java\n"
+                + "+++ b/A.java\n"
+                + "@@ -1,1 +1,1 @@\n+x\n";
+
+        DiffChunker.ChunkPlan plan = chunker.split(diff);
+
+        assertThat(plan.chunks().get(0).filePaths()).containsExactly("A.java");
+    }
+
+    @Test
     void nullDiffIsTreatedAsASingleEmptyChunk() {
         DiffChunker chunker = newChunker(propertiesWithBudget(10_000, 256, 5));
 
@@ -280,7 +302,7 @@ class DiffChunkerTest {
     void chunkPlanToStringNeverDumpsItsChunks() {
         String secretDiff = "diff --git a/Secret.java\n+String apiKey = \"THE-SECRET-DIFF-CONTENT\";";
         DiffChunker.ChunkPlan plan = new DiffChunker.ChunkPlan(
-                List.of(new DiffChunker.DiffChunk(0, secretDiff, 42, List.of())), 42);
+                List.of(new DiffChunker.DiffChunk(0, secretDiff, 42, List.of())), 42, true);
 
         String rendered = plan.toString();
 
@@ -345,5 +367,268 @@ class DiffChunkerTest {
         assertThat(elapsedMs)
                 .as("must abort as soon as the maxChunks bound is exceeded, not after processing every hunk")
                 .isLessThan(2000L);
+    }
+
+    // ---- Structured Review Output: SRO-14/SRO-66 maxFilesPerChunk bound ----
+
+    @Test
+    void maxFilesPerChunkZeroLeavesV1V2ChunkingByteForByteUnchanged() {
+        GatewayProperties properties = propertiesWithBudget(10_000, 256, 5);
+        DiffChunker chunker = newChunker(properties);
+        String diff = gitSection("A.java", oneHunk("+x")) + gitSection("B.java", oneHunk("+y"));
+
+        DiffChunker.ChunkPlan unbounded = chunker.split(diff, 0);
+        DiffChunker.ChunkPlan explicitZero = chunker.split(diff, 0, 0);
+
+        assertThat(unbounded.chunks()).hasSize(1);
+        assertThat(explicitZero.chunks()).hasSize(1);
+        assertThat(unbounded.chunks().get(0).diff()).isEqualTo(explicitZero.chunks().get(0).diff());
+    }
+
+    @Test
+    void maxFilesPerChunkDefeatsTheSingleChunkShortcutWhenFileCountExceedsIt() {
+        GatewayProperties properties = propertiesWithBudget(1_000_000, 0, 10);
+        DiffChunker chunker = newChunker(properties);
+        StringBuilder diff = new StringBuilder();
+        for (int i = 0; i < 5; i++) {
+            diff.append(gitSection("File" + i + ".java", oneHunk("+change")));
+        }
+
+        // The whole diff comfortably fits the token budget in one chunk, but maxFilesPerChunk=2 means a
+        // single chunk can never hold all 5 files -- the shortcut must be defeated and normal packing
+        // (respecting the file-count bound) must run instead.
+        DiffChunker.ChunkPlan plan = chunker.split(diff.toString(), 0, 2);
+
+        assertThat(plan.chunks().size()).isGreaterThan(1);
+        for (DiffChunker.DiffChunk chunk : plan.chunks()) {
+            assertThat(chunk.filePaths().size()).isLessThanOrEqualTo(2);
+        }
+    }
+
+    @Test
+    void maxFilesPerChunkBoundsEachPackedChunksFileCount() {
+        GatewayProperties properties = propertiesWithBudget(1_000_000, 0, 10);
+        DiffChunker chunker = newChunker(properties);
+        // Force multi-chunk packing on token size too, so binPack's file-count bound (not just the
+        // single-chunk shortcut) is exercised.
+        StringBuilder bigHunk = new StringBuilder();
+        for (int i = 0; i < 50; i++) {
+            bigHunk.append("+line ").append(i).append('\n');
+        }
+        StringBuilder diff = new StringBuilder();
+        for (int i = 0; i < 6; i++) {
+            diff.append(gitSection("File" + i + ".java", "@@ -1,1 +1,1 @@\n" + bigHunk));
+        }
+        int perChunkBudgetChars = gitSection("File0.java", "@@ -1,1 +1,1 @@\n" + bigHunk).length() * 3;
+        GatewayProperties tightBudget = propertiesWithBudget(perChunkBudgetChars, 0, 10);
+        DiffChunker tightChunker = newChunker(tightBudget);
+
+        DiffChunker.ChunkPlan plan = tightChunker.split(diff.toString(), 0, 2);
+
+        for (DiffChunker.DiffChunk chunk : plan.chunks()) {
+            assertThat(chunk.filePaths().size()).isLessThanOrEqualTo(2);
+        }
+        // No file was dropped across the whole plan.
+        java.util.Set<String> allPaths = new java.util.LinkedHashSet<>();
+        plan.chunks().forEach(c -> allPaths.addAll(c.filePaths()));
+        assertThat(allPaths).hasSize(6);
+    }
+
+    @Test
+    void structuredVersionSingleChunkShortcutReservesRoomForTheCoverageBlockSRO64d() {
+        // F-SRO-03/SRO-64d: a structured version's single-chunk shortcut must ALSO reserve room for the
+        // coverage block that renders even when chunkCount == 1 -- a non-structured version gets the
+        // full, un-reserved budget for the same shortcut (byte-identical v1/v2 behavior, §8).
+        String sectionA = gitSection("A.java", oneHunk("+" + "a".repeat(200)));
+        String sectionB = gitSection("B.java", oneHunk("+" + "b".repeat(200)));
+        int sectionLen = sectionA.length();
+        assertThat(sectionB.length()).isEqualTo(sectionLen);
+        String diff = sectionA + sectionB;
+
+        // coverageReserveTokens(maxFilesPerChunk=2, maxPathChars=10, charsPerToken=1)
+        //   = ceil((2 * (10 + 1) + 400) / 1) = 422
+        int coverageReserveTokens = 422;
+        GatewayProperties properties = propertiesWithBudget(1_000_000, 0, 5);
+        properties.getDiff().setContextWindow(2 * sectionLen + coverageReserveTokens - 50);
+        properties.getDiff().setPromptReserve(0);
+        properties.getStructured().setMaxPathChars(10);
+        DiffChunker chunker = newChunker(properties);
+
+        DiffChunker.ChunkPlan nonStructured = chunker.split(diff, 0, 0);
+        DiffChunker.ChunkPlan structured = chunker.split(diff, 0, 2);
+
+        assertThat(nonStructured.chunks())
+                .as("non-structured (maxFilesPerChunk=0) takes the un-reserved single-chunk shortcut")
+                .hasSize(1);
+        assertThat(structured.chunks().size())
+                .as("structured version must NOT take the single-chunk shortcut once the coverage-block "
+                        + "reserve is subtracted from the budget -- it must pack into more than one chunk")
+                .isGreaterThan(1);
+        for (DiffChunker.DiffChunk chunk : structured.chunks()) {
+            assertThat(chunk.filePaths().size()).isLessThanOrEqualTo(2);
+        }
+    }
+
+    @Test
+    void structuredVersionUsesTheSameDiffAnswerReserveAsNonStructured() {
+        // chore/answer-reserve-consolidation: gateway.structured.answer-reserve was merged into
+        // gateway.diff.answer-reserve after repeatedly causing exactly the misconfiguration its own
+        // startup check (removed) existed to catch. Before the merge, a structured version's runtime
+        // budget used a SEPARATE, larger reserve (independent of whatever gateway.diff.answer-reserve
+        // was set to) -- if that were still true here, setting gateway.diff.answer-reserve very low
+        // would widen the non-structured budget but leave the structured one artificially tight. Assert
+        // both fit comfortably under the same small reserve, proving there is no other, larger reserve
+        // left for the structured path to fall back on.
+        GatewayProperties properties = propertiesWithBudget(1_000_000, 0, 5);
+        properties.getDiff().setContextWindow(5000);
+        properties.getDiff().setPromptReserve(0);
+        properties.getDiff().setAnswerReserve(0);
+        properties.getStructured().setMaxPathChars(10);
+        DiffChunker chunker = newChunker(properties);
+        String diff = gitSection("A.java", oneHunk("+" + "x".repeat(600)));
+
+        assertThat(chunker.split(diff, 0, 0).chunks()).hasSize(1);
+        assertThat(chunker.split(diff, 0, 1).chunks()).hasSize(1);
+    }
+
+    @Test
+    void aSingleSectionExceedingMaxFilesPerChunkIsRejectedAtTheEdge() {
+        // A section can only ever carry >1 path in the rare CSR-11-adjacent shape where diff --git,
+        // +++, and a distinct --- line disagree -- exercised here indirectly is not needed: the simplest
+        // reproduction is a section whose own extracted-path count (bounded by max-paths-per-section)
+        // still exceeds a tiny maxFilesPerChunk, which SRO-66b must reject before any packing.
+        GatewayProperties properties = propertiesWithBudget(1_000_000, 0, 10);
+        properties.getDiff().setMaxPathsPerSection(5);
+        DiffChunker chunker = newChunker(properties);
+        String diff = gitSection("A.java", oneHunk("+x"));
+
+        // maxFilesPerChunk=0 is unbounded (v1/v2); a structured version with maxFilesPerChunk >= 1 must
+        // never reject a normal one-file-per-section diff, though.
+        assertThat(chunker.split(diff, 0, 1).chunks()).hasSize(1);
+    }
+
+    @Test
+    void diffTotalDistinctPathCountExceedingMaxChunksTimesMaxFilesPerChunkIsRejected() {
+        int maxChunks = 2;
+        GatewayProperties properties = propertiesWithBudget(1_000_000, 0, maxChunks);
+        DiffChunker chunker = newChunker(properties);
+        StringBuilder diff = new StringBuilder();
+        for (int i = 0; i < 10; i++) {
+            diff.append(gitSection("File" + i + ".java", oneHunk("+x")));
+        }
+
+        // 10 distinct files > maxChunks(2) * maxFilesPerChunk(2) = 4 -- no packing could ever succeed.
+        assertThatThrownBy(() -> chunker.split(diff.toString(), 0, 2))
+                .isInstanceOf(DiffTooLargeException.class)
+                .hasMessageContaining("max-files-per-chunk");
+    }
+
+    @Test
+    void sectionThatHitTheMaxPathsPerSectionBoundIsRejectedForAStructuredVersion() {
+        GatewayProperties properties = propertiesWithBudget(1_000_000, 0, 5);
+        properties.getDiff().setMaxPathsPerSection(2);
+        DiffChunker chunker = newChunker(properties);
+        // A crafted section: one diff --git header, then several extra "+++ " header lines before the
+        // first @@ hunk -- each one is a distinct path candidate within the SAME section.
+        StringBuilder section = new StringBuilder("diff --git a/A.java b/A.java\n");
+        for (int i = 0; i < 5; i++) {
+            section.append("+++ b/Extra").append(i).append(".java\n");
+        }
+        section.append("@@ -1,1 +1,1 @@\n+content\n");
+
+        assertThatThrownBy(() -> chunker.split(section.toString(), 0, 40))
+                .isInstanceOf(DiffTooLargeException.class)
+                .hasMessageContaining("max-paths-per-section");
+    }
+
+    @Test
+    void nonStructuredVersionsAreUnaffectedByTheMaxPathsPerSectionBoundExceptForAdvisoryTruncation() {
+        // SRO-66a: unconditional across all prompt versions, but the ONLY observable v1/v2 effect is a
+        // shorter advisory file-path list for a pathological >64-header-lines-in-one-section input --
+        // never a rejection, never a change to chunk boundaries/text.
+        GatewayProperties properties = propertiesWithBudget(1_000_000, 0, 5);
+        properties.getDiff().setMaxPathsPerSection(2);
+        DiffChunker chunker = newChunker(properties);
+        StringBuilder section = new StringBuilder("diff --git a/A.java b/A.java\n");
+        for (int i = 0; i < 5; i++) {
+            section.append("+++ b/Extra").append(i).append(".java\n");
+        }
+        section.append("@@ -1,1 +1,1 @@\n+content\n");
+
+        // maxFilesPerChunk=0 -> non-structured version -> never rejected, chunk text unchanged.
+        DiffChunker.ChunkPlan plan = chunker.split(section.toString(), 0, 0);
+
+        assertThat(plan.chunks()).hasSize(1);
+        assertThat(plan.chunks().get(0).diff()).isEqualTo(section.toString());
+        assertThat(plan.chunks().get(0).filePaths().size()).isLessThanOrEqualTo(2);
+    }
+
+    @Test
+    void chunkPlanCarriesPathsTrustedFromTheUnderlyingParse() {
+        GatewayProperties properties = propertiesWithBudget(10_000, 256, 5);
+        DiffChunker chunker = newChunker(properties);
+
+        DiffChunker.ChunkPlan trusted = chunker.split(gitSection("A.java", oneHunk("+x")));
+        DiffChunker.ChunkPlan untrusted = chunker.split("--- a/A.java\n+++ b/A.java\n" + oneHunk("+x"));
+        DiffChunker.ChunkPlan noDelimiters = chunker.split("just some free text\nwith no diff markers at all\n");
+
+        assertThat(trusted.pathsTrusted()).isTrue();
+        assertThat(untrusted.pathsTrusted()).isFalse();
+        assertThat(noDelimiters.pathsTrusted()).isFalse();
+    }
+
+    // ---- QA round: T-6.1 corpus regression -- SRO-66a's new unconditional per-section extraction bound
+    // must not move v1/v2 chunk boundaries by even one byte ----
+
+    /**
+     * A small corpus of real-diff-shaped inputs spanning the cases that matter for chunk-boundary
+     * stability: a single small file (single-chunk shortcut), several files forced into separate chunks
+     * by a tight budget (bin-packing), a file whose own section alone exceeds the per-chunk budget
+     * (oversized-section splitting), and a path containing characters real git output can produce
+     * (spaces, dots, nested directories).
+     */
+    private List<String> realShapedDiffCorpus() {
+        String smallSingleFile = gitSection("README.md", oneHunk("+one line change"));
+
+        StringBuilder threeFiles = new StringBuilder();
+        threeFiles.append(gitSection("src/main/java/com/example/Foo.java", oneHunk("+" + "a".repeat(200))));
+        threeFiles.append(gitSection("src/main/java/com/example/Bar.java", oneHunk("+" + "b".repeat(200))));
+        threeFiles.append(gitSection("src/test/java/com/example/FooTest.java", oneHunk("+" + "c".repeat(200))));
+
+        StringBuilder oneOversizedFile = new StringBuilder();
+        oneOversizedFile.append(gitSection("src/main/resources/generated.sql",
+                oneHunk("+" + "x".repeat(2000)), "@@ -100,1 +100,1 @@", "+" + "y".repeat(2000)));
+
+        String pathWithSpaceAndDots = gitSection("docs/release notes v1.2.3.md", oneHunk("+changelog entry"));
+
+        return List.of(smallSingleFile, threeFiles.toString(), oneOversizedFile.toString(), pathWithSpaceAndDots);
+    }
+
+    @Test
+    void theSRO66aPerSectionExtractionBoundNeverChangesV1V2ChunkBoundariesAcrossARealDiffCorpus() {
+        // Two DiffChunker instances differing ONLY in gateway.diff.max-paths-per-section -- a tiny bound
+        // that would visibly truncate the advisory file list for a pathological many-header-lines-in-one-
+        // section input (SRO-66a), vs. an effectively unbounded one. For maxFilesPerChunk=0 (v1/v2), SRO-66b's
+        // whole edge-bound check short-circuits, so the corpus's ChunkPlan output must be byte-identical
+        // (same chunk count, same chunk text, same file paths, same estimatedTokens, same pathsTrusted)
+        // regardless of this bound -- proving the §8 backward-compat guarantee holds even after SRO-66a
+        // was added, not just for the pathological inputs the other tests in this class already cover.
+        GatewayProperties tightSectionBound = propertiesWithBudget(4_000, 128, 10);
+        tightSectionBound.getDiff().setMaxPathsPerSection(2);
+        GatewayProperties looseSectionBound = propertiesWithBudget(4_000, 128, 10);
+        looseSectionBound.getDiff().setMaxPathsPerSection(10_000);
+
+        DiffChunker tightChunker = newChunker(tightSectionBound);
+        DiffChunker looseChunker = newChunker(looseSectionBound);
+
+        for (String diff : realShapedDiffCorpus()) {
+            DiffChunker.ChunkPlan tightPlan = tightChunker.split(diff, 0, 0);
+            DiffChunker.ChunkPlan loosePlan = looseChunker.split(diff, 0, 0);
+
+            assertThat(tightPlan)
+                    .as("maxFilesPerChunk=0 (v1/v2) must be completely unaffected by "
+                            + "gateway.diff.max-paths-per-section for diff: " + diff.substring(0, Math.min(60, diff.length())))
+                    .isEqualTo(loosePlan);
+        }
     }
 }

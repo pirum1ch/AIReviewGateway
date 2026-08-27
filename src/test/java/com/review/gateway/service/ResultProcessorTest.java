@@ -98,8 +98,14 @@ class ResultProcessorTest extends AbstractPostgresIntegrationTest {
         JobStateMachine jobStateMachine = new JobStateMachine(eventService);
         ChunkCoordinator chunkCoordinator = new ChunkCoordinator(reviewRepository, reviewJobRepository,
                 reviewChunkRepository, reviewCommentRepository, stateMachine, jobStateMachine, properties, entityManager, transactionManager);
-        return new ResultProcessor(reviewRepository, reviewJobRepository, reviewResultRepository,
-                commentParser, jobStateMachine, chunkCoordinator, properties, entityManager, transactionManager);
+        RetryManager retryManager = new RetryManager(reviewJobRepository, jobStateMachine, chunkCoordinator,
+                properties, new TextSanitizer(), entityManager, transactionManager);
+        CommentRenderer commentRenderer = new CommentRenderer(commentParser, new TextSanitizer(), properties);
+        StructuredResponseParser structuredResponseParser = new StructuredResponseParser(
+                commentParser, commentRenderer, new TextSanitizer(), properties, new MetricsCounters());
+        return new ResultProcessor(reviewRepository, reviewJobRepository, reviewChunkRepository, reviewResultRepository,
+                commentParser, structuredResponseParser, jobStateMachine, chunkCoordinator, retryManager,
+                new MetricsCounters(), properties, new TextSanitizer(), entityManager, transactionManager);
     }
 
     private Review persistRunningReview(String headSha) {
@@ -128,7 +134,7 @@ class ResultProcessorTest extends AbstractPostgresIntegrationTest {
 
         ResultProcessor processor = newResultProcessor(commentParser);
         ReviewStatus finalStatus = processor.process(review.getId(), job.getId(), "worker-1", job.getBackendId(),
-                new SubmitResultCommand("raw-broken", 10, 5, 1000L, "model-x"));
+                new SubmitResultCommand("raw-broken", 10, 5, 1000L, "model-x", null));
 
         assertThat(finalStatus).isEqualTo(ReviewStatus.FAILED);
         assertThat(reviewResultRepository.existsByReviewIdAndChunkIndex(review.getId(), 0)).isTrue();
@@ -145,12 +151,12 @@ class ResultProcessorTest extends AbstractPostgresIntegrationTest {
         Review review = persistRunningReview("sha-success");
         ReviewJob job = persistJob(review);
 
-        CommentParser commentParser = new CommentParser(new GatewayProperties());
+        CommentParser commentParser = new CommentParser(new GatewayProperties(), new MetricsCounters());
 
         ResultProcessor processor = newResultProcessor(commentParser);
         String raw = "[{\"file\":\"A.java\",\"line\":1,\"severity\":\"MAJOR\",\"comment\":\"Fix this\"}]";
         ReviewStatus finalStatus = processor.process(review.getId(), job.getId(), "worker-1", job.getBackendId(),
-                new SubmitResultCommand(raw, 10, 5, 1000L, "model-x"));
+                new SubmitResultCommand(raw, 10, 5, 1000L, "model-x", null));
 
         assertThat(finalStatus).isEqualTo(ReviewStatus.COMPLETED);
         assertThat(reviewResultRepository.existsByReviewIdAndChunkIndex(review.getId(), 0)).isTrue();
@@ -164,17 +170,60 @@ class ResultProcessorTest extends AbstractPostgresIntegrationTest {
         assertThat(reloadedJob.getFinishedAt()).isNotNull();
     }
 
+    // ---- Structured Review Output: finish_reason propagation/normalization (SRO-42/43/44) ----
+
+    @Test
+    void recognizedFinishReasonIsStoredNormalizedLowercase() {
+        Review review = persistRunningReview("sha-finish-length");
+        ReviewJob job = persistJob(review);
+        CommentParser commentParser = new CommentParser(new GatewayProperties(), new MetricsCounters());
+
+        newResultProcessor(commentParser).process(review.getId(), job.getId(), "worker-1", job.getBackendId(),
+                new SubmitResultCommand("[]", 10, 5, 1000L, "model-x", "LENGTH"));
+
+        assertThat(reviewResultRepository.findByReviewIdAndChunkIndex(review.getId(), 0).orElseThrow().getFinishReason())
+                .isEqualTo("length");
+    }
+
+    @Test
+    void nullFinishReasonIsStoredAsNullNotAsUnknown() {
+        // SRO-44: an old Worker/backend build that omits the field must be distinguishable from a
+        // genuinely-unrecognized value -- both must never be conflated.
+        Review review = persistRunningReview("sha-finish-null");
+        ReviewJob job = persistJob(review);
+        CommentParser commentParser = new CommentParser(new GatewayProperties(), new MetricsCounters());
+
+        newResultProcessor(commentParser).process(review.getId(), job.getId(), "worker-1", job.getBackendId(),
+                new SubmitResultCommand("[]", 10, 5, 1000L, "model-x", null));
+
+        assertThat(reviewResultRepository.findByReviewIdAndChunkIndex(review.getId(), 0).orElseThrow().getFinishReason())
+                .isNull();
+    }
+
+    @Test
+    void unrecognizedFinishReasonIsNormalizedToUnknownNeverEnumValueOf() {
+        Review review = persistRunningReview("sha-finish-unknown");
+        ReviewJob job = persistJob(review);
+        CommentParser commentParser = new CommentParser(new GatewayProperties(), new MetricsCounters());
+
+        newResultProcessor(commentParser).process(review.getId(), job.getId(), "worker-1", job.getBackendId(),
+                new SubmitResultCommand("[]", 10, 5, 1000L, "model-x", "some-future-llama-cpp-value"));
+
+        assertThat(reviewResultRepository.findByReviewIdAndChunkIndex(review.getId(), 0).orElseThrow().getFinishReason())
+                .isEqualTo("unknown");
+    }
+
     @Test
     void resultIsIdempotentWhenReviewResultAlreadyExists() {
         Review review = persistRunningReview("sha-idempotent");
         ReviewJob job = persistJob(review);
 
-        CommentParser commentParser = new CommentParser(new GatewayProperties());
+        CommentParser commentParser = new CommentParser(new GatewayProperties(), new MetricsCounters());
         ResultProcessor processor = newResultProcessor(commentParser);
 
         // First delivery.
         processor.process(review.getId(), job.getId(), "worker-1", job.getBackendId(),
-                new SubmitResultCommand("first raw response", 1, 1, 10L, "model-x"));
+                new SubmitResultCommand("first raw response", 1, 1, 10L, "model-x", null));
 
         long resultCountAfterFirst = reviewResultRepository.findByReviewIdAndChunkIndex(review.getId(), 0).stream().count();
 
@@ -182,7 +231,7 @@ class ResultProcessorTest extends AbstractPostgresIntegrationTest {
         // (ResultProcessor itself doesn't re-check RUNNING -- that's QueueManager's job -- but its
         // storeRawResult step must still be idempotent if ever invoked twice for the same review).
         processor.process(review.getId(), job.getId(), "worker-1", job.getBackendId(),
-                new SubmitResultCommand("first raw response", 1, 1, 10L, "model-x"));
+                new SubmitResultCommand("first raw response", 1, 1, 10L, "model-x", null));
 
         assertThat(reviewResultRepository.findByReviewIdAndChunkIndex(review.getId(), 0).orElseThrow().getRawResponse())
                 .isEqualTo("first raw response");
@@ -198,12 +247,12 @@ class ResultProcessorTest extends AbstractPostgresIntegrationTest {
 
         GatewayProperties properties = new GatewayProperties();
         properties.getPublish().setMaxRawResponseLength(100);
-        CommentParser commentParser = new CommentParser(properties);
+        CommentParser commentParser = new CommentParser(properties, new MetricsCounters());
         ResultProcessor processor = newResultProcessor(commentParser, properties);
 
         String oversizedRaw = "x".repeat(1000);
         ReviewStatus finalStatus = processor.process(review.getId(), job.getId(), "worker-1", job.getBackendId(),
-                new SubmitResultCommand(oversizedRaw, 10, 5, 1000L, "model-x"));
+                new SubmitResultCommand(oversizedRaw, 10, 5, 1000L, "model-x", null));
 
         assertThat(finalStatus).isEqualTo(ReviewStatus.COMPLETED);
 
@@ -231,12 +280,12 @@ class ResultProcessorTest extends AbstractPostgresIntegrationTest {
 
         GatewayProperties properties = new GatewayProperties();
         properties.getPublish().setMaxRawResponseLength(100);
-        CommentParser commentParser = new CommentParser(properties);
+        CommentParser commentParser = new CommentParser(properties, new MetricsCounters());
         ResultProcessor processor = newResultProcessor(commentParser, properties);
 
         String withinCapRaw = "a normal, short model response";
         processor.process(review.getId(), job.getId(), "worker-1", job.getBackendId(),
-                new SubmitResultCommand(withinCapRaw, 10, 5, 1000L, "model-x"));
+                new SubmitResultCommand(withinCapRaw, 10, 5, 1000L, "model-x", null));
 
         String storedRaw = reviewResultRepository.findByReviewIdAndChunkIndex(review.getId(), 0).orElseThrow().getRawResponse();
         assertThat(storedRaw).isEqualTo(withinCapRaw);
@@ -246,5 +295,332 @@ class ResultProcessorTest extends AbstractPostgresIntegrationTest {
                 .filteredOn(e -> e.getEventType() == com.review.gateway.model.enums.EventType.COMPLETED)
                 .extracting(com.review.gateway.model.ReviewEvent::getDetails)
                 .noneSatisfy(details -> assertThat(details).contains("truncated"));
+    }
+
+    // ---- Structured Review Output: retry wiring, RETRY_THEN_FALLBACK, kill switch (SRO-35-41/68) ----
+
+    private Review persistRunningStructuredReview(String headSha) {
+        Review review = new Review(1L, 1L, headSha, "base", "v3", 10);
+        review.setStatus(ReviewStatus.RUNNING);
+        review.setAttempts(1);
+        return reviewRepository.saveAndFlush(review);
+    }
+
+    private ReviewJob persistStructuredJob(Review review, int attempts) {
+        Backend backend = backendRepository.saveAndFlush(
+                new Backend("backend-struct-" + review.getId(), "https://backend-struct.local", "model", 1));
+        ReviewJob job = new ReviewJob(review.getId(), backend.getId(), "worker-1");
+        job.setStatus(JobStatus.RUNNING);
+        job.setStartedAt(Instant.now());
+        job.setAttempts(attempts);
+        return reviewJobRepository.saveAndFlush(job);
+    }
+
+    private void persistChunk(Long reviewId, String diff, List<String> filePaths) {
+        StringBuilder json = new StringBuilder("[");
+        for (int i = 0; i < filePaths.size(); i++) {
+            if (i > 0) {
+                json.append(',');
+            }
+            json.append('"').append(filePaths.get(i)).append('"');
+        }
+        json.append(']');
+        com.review.gateway.model.ReviewChunk chunk = new com.review.gateway.model.ReviewChunk(
+                reviewId, 0, 1, diff, 10, filePaths.size(), json.toString());
+        reviewChunkRepository.saveAndFlush(chunk);
+    }
+
+    private static final String SINGLE_FILE_DIFF =
+            "diff --git a/A.java b/A.java\nindex 111..222 100644\n--- a/A.java\n+++ b/A.java\n@@ -1,1 +1,1 @@\n+x\n";
+
+    @Test
+    void structuredValidationFailureIsRequeuedWhenAttemptsRemain() {
+        Review review = persistRunningStructuredReview("sha-struct-retry");
+        persistChunk(review.getId(), SINGLE_FILE_DIFF, List.of("A.java"));
+        ReviewJob job = persistStructuredJob(review, 1); // 1 < default max-attempts (3)
+
+        CommentParser commentParser = new CommentParser(new GatewayProperties(), new MetricsCounters());
+        ResultProcessor processor = newResultProcessor(commentParser);
+
+        ReviewStatus status = processor.process(review.getId(), job.getId(), "worker-1", job.getBackendId(),
+                new SubmitResultCommand("not valid json", 10, 5, 1000L, "model-x", null));
+
+        assertThat(status).isEqualTo(ReviewStatus.QUEUED);
+        ReviewJob reloaded = reviewJobRepository.findById(job.getId()).orElseThrow();
+        assertThat(reloaded.getStatus()).isEqualTo(JobStatus.QUEUED);
+        assertThat(reloaded.getLastError()).startsWith("structured-output: NOT_JSON");
+    }
+
+    @Test
+    void structuredValidationFailureOnTheLastAttemptFailsUnderDefaultRetryThenFail() {
+        Review review = persistRunningStructuredReview("sha-struct-exhausted");
+        persistChunk(review.getId(), SINGLE_FILE_DIFF, List.of("A.java"));
+        ReviewJob job = persistStructuredJob(review, 3); // == default max-attempts
+
+        CommentParser commentParser = new CommentParser(new GatewayProperties(), new MetricsCounters());
+        ResultProcessor processor = newResultProcessor(commentParser);
+
+        ReviewStatus status = processor.process(review.getId(), job.getId(), "worker-1", job.getBackendId(),
+                new SubmitResultCommand("not valid json", 10, 5, 1000L, "model-x", null));
+
+        assertThat(status).isEqualTo(ReviewStatus.FAILED);
+        ReviewJob reloaded = reviewJobRepository.findById(job.getId()).orElseThrow();
+        assertThat(reloaded.getStatus()).isEqualTo(JobStatus.FAILED);
+        assertThat(reloaded.getLastError()).contains("structured-output: NOT_JSON");
+    }
+
+    @Test
+    void coverageShortfallIsClassifiedAndRequeuedWithADiagnosticLastError() {
+        Review review = persistRunningStructuredReview("sha-struct-coverage");
+        persistChunk(review.getId(), SINGLE_FILE_DIFF, List.of("A.java", "B.java"));
+        ReviewJob job = persistStructuredJob(review, 1);
+
+        CommentParser commentParser = new CommentParser(new GatewayProperties(), new MetricsCounters());
+        ResultProcessor processor = newResultProcessor(commentParser);
+        // Only covers A.java -- B.java is missing.
+        String raw = "{\"files\":{\"A.java\":{\"findings\":[],\"summary\":\"s\"}},\"summary\":\"y\"}";
+
+        processor.process(review.getId(), job.getId(), "worker-1", job.getBackendId(),
+                new SubmitResultCommand(raw, 10, 5, 1000L, "model-x", null));
+
+        ReviewJob reloaded = reviewJobRepository.findById(job.getId()).orElseThrow();
+        assertThat(reloaded.getStatus()).isEqualTo(JobStatus.QUEUED);
+        assertThat(reloaded.getLastError()).startsWith("structured-output: COVERAGE_SHORTFALL");
+        assertThat(reloaded.getLastError()).contains("B.java");
+    }
+
+    @Test
+    void retryThenFallbackPublishesUnvalidatedCommentsWhenTheLegacyParserFindsARealJsonArray() {
+        GatewayProperties properties = new GatewayProperties();
+        properties.getStructured().setOnInvalidResponse("RETRY_THEN_FALLBACK");
+        Review review = persistRunningStructuredReview("sha-struct-fallback-ok");
+        persistChunk(review.getId(), SINGLE_FILE_DIFF, List.of("A.java"));
+        ReviewJob job = persistStructuredJob(review, 3);
+
+        CommentParser commentParser = new CommentParser(properties, new MetricsCounters());
+        ResultProcessor processor = newResultProcessor(commentParser, properties);
+        String legacyShaped = "[{\"file\":\"A.java\",\"line\":1,\"severity\":\"MAJOR\",\"comment\":\"legacy shaped\"}]";
+
+        ReviewStatus status = processor.process(review.getId(), job.getId(), "worker-1", job.getBackendId(),
+                new SubmitResultCommand(legacyShaped, 10, 5, 1000L, "model-x", null));
+
+        assertThat(status).isEqualTo(ReviewStatus.COMPLETED);
+        ReviewJob reloaded = reviewJobRepository.findById(job.getId()).orElseThrow();
+        assertThat(reloaded.getStatus()).isEqualTo(JobStatus.COMPLETED);
+        var comments = reviewCommentRepository.findByReviewId(review.getId());
+        assertThat(comments).hasSize(1);
+        assertThat(comments.get(0).getComment()).contains("UNVALIDATED");
+        assertThat(comments.get(0).getComment()).contains("legacy shaped");
+    }
+
+    @Test
+    void retryThenFallbackStillFailsWhenTheLegacyParserAlsoFindsNothing() {
+        GatewayProperties properties = new GatewayProperties();
+        properties.getStructured().setOnInvalidResponse("RETRY_THEN_FALLBACK");
+        Review review = persistRunningStructuredReview("sha-struct-fallback-fail");
+        persistChunk(review.getId(), SINGLE_FILE_DIFF, List.of("A.java"));
+        ReviewJob job = persistStructuredJob(review, 3);
+
+        CommentParser commentParser = new CommentParser(properties, new MetricsCounters());
+        ResultProcessor processor = newResultProcessor(commentParser, properties);
+
+        ReviewStatus status = processor.process(review.getId(), job.getId(), "worker-1", job.getBackendId(),
+                new SubmitResultCommand("complete garbage, no brackets at all", 10, 5, 1000L, "model-x", null));
+
+        assertThat(status).isEqualTo(ReviewStatus.FAILED);
+        ReviewJob reloaded = reviewJobRepository.findById(job.getId()).orElseThrow();
+        assertThat(reloaded.getStatus()).isEqualTo(JobStatus.FAILED);
+        assertThat(reviewCommentRepository.findByReviewId(review.getId())).isEmpty();
+    }
+
+    @Test
+    void killSwitchOffRoutesAStructuredVersionThroughTheLegacyParser() {
+        GatewayProperties properties = new GatewayProperties();
+        properties.getStructured().setEnabled(false);
+        Review review = persistRunningStructuredReview("sha-struct-killswitch");
+        persistChunk(review.getId(), SINGLE_FILE_DIFF, List.of("A.java"));
+        ReviewJob job = persistStructuredJob(review, 1);
+
+        CommentParser commentParser = new CommentParser(properties, new MetricsCounters());
+        ResultProcessor processor = newResultProcessor(commentParser, properties);
+        String legacyShaped = "[{\"file\":\"A.java\",\"line\":1,\"severity\":\"MAJOR\",\"comment\":\"legacy path\"}]";
+
+        ReviewStatus status = processor.process(review.getId(), job.getId(), "worker-1", job.getBackendId(),
+                new SubmitResultCommand(legacyShaped, 10, 5, 1000L, "model-x", null));
+
+        assertThat(status).isEqualTo(ReviewStatus.COMPLETED);
+        var comments = reviewCommentRepository.findByReviewId(review.getId());
+        assertThat(comments).hasSize(1);
+        assertThat(comments.get(0).getComment()).doesNotContain("UNVALIDATED");
+        assertThat(comments.get(0).getComment()).contains("legacy path");
+    }
+
+    @Test
+    void aConformingStructuredResponseCompletesNormallyAndPersistsRenderedComments() {
+        Review review = persistRunningStructuredReview("sha-struct-success");
+        persistChunk(review.getId(), SINGLE_FILE_DIFF, List.of("A.java"));
+        ReviewJob job = persistStructuredJob(review, 1);
+
+        CommentParser commentParser = new CommentParser(new GatewayProperties(), new MetricsCounters());
+        ResultProcessor processor = newResultProcessor(commentParser);
+        String raw = "{\"files\":{\"A.java\":{\"findings\":[{\"line\":1,\"severity\":\"major\","
+                + "\"comment\":\"issue found\",\"suggestion\":\"\"}],\"summary\":\"s\"}},\"summary\":\"overall\"}";
+
+        ReviewStatus status = processor.process(review.getId(), job.getId(), "worker-1", job.getBackendId(),
+                new SubmitResultCommand(raw, 10, 5, 1000L, "model-x", null));
+
+        assertThat(status).isEqualTo(ReviewStatus.COMPLETED);
+        var comments = reviewCommentRepository.findByReviewId(review.getId());
+        assertThat(comments).hasSize(1);
+        assertThat(comments.get(0).getComment()).contains("issue found");
+        assertThat(comments.get(0).getComment()).contains("**MAJOR**");
+    }
+
+    // ---- F-SRO-04: fairShareCommentCap must apply on the structured path too ----
+
+    private ReviewJob persistStructuredJobForChunk(Review review, Long chunkId, int chunkIndex, int attempts) {
+        Backend backend = backendRepository.saveAndFlush(
+                new Backend("backend-struct-" + review.getId() + "-" + chunkIndex, "https://backend-struct.local", "model", 1));
+        ReviewJob job = new ReviewJob(review.getId(), chunkId, chunkIndex, 10, "worker-1", backend.getId());
+        job.setStatus(JobStatus.RUNNING);
+        job.setStartedAt(Instant.now());
+        job.setAttempts(attempts);
+        return reviewJobRepository.saveAndFlush(job);
+    }
+
+    private com.review.gateway.model.ReviewChunk persistChunkAt(Long reviewId, int chunkIndex, int chunkCount,
+                                                                   String diff, List<String> filePaths) {
+        StringBuilder json = new StringBuilder("[");
+        for (int i = 0; i < filePaths.size(); i++) {
+            if (i > 0) {
+                json.append(',');
+            }
+            json.append('"').append(filePaths.get(i)).append('"');
+        }
+        json.append(']');
+        com.review.gateway.model.ReviewChunk chunk = new com.review.gateway.model.ReviewChunk(
+                reviewId, chunkIndex, chunkCount, diff, 10, filePaths.size(), json.toString());
+        return reviewChunkRepository.saveAndFlush(chunk);
+    }
+
+    private String structuredFindingsRaw(String filePath, int findingCount) {
+        StringBuilder findings = new StringBuilder();
+        for (int i = 0; i < findingCount; i++) {
+            if (i > 0) {
+                findings.append(',');
+            }
+            findings.append("{\"line\":1,\"severity\":\"major\",\"comment\":\"finding-")
+                    .append(filePath).append('-').append(i).append("\",\"suggestion\":\"\"}");
+        }
+        return "{\"files\":{\"" + filePath + "\":{\"findings\":[" + findings + "],\"summary\":\"s\"}},\"summary\":\"overall\"}";
+    }
+
+    @Test
+    void fairShareCommentCapAppliesOnTheStructuredPathAcrossMultipleChunks() {
+        // F-SRO-04(a): before this fix, processStructuredJobPhase never called fairShareCommentCap --
+        // only the review-level cap (persistCappedComments, first-come-first-served) applied. With a
+        // 2-chunk review and a review-wide cap of 3, chunk 0 alone (5 candidate findings) would have
+        // consumed the entire budget, leaving chunk 1's own genuine finding published nowhere. With the
+        // fair-share cap applied (max(1, 3/2) = 1 per chunk), both chunks must contribute.
+        GatewayProperties properties = new GatewayProperties();
+        properties.getPublish().setMaxCommentCount(3);
+        Review review = persistRunningStructuredReview("sha-struct-fairshare");
+
+        var chunk0 = persistChunkAt(review.getId(), 0, 2, SINGLE_FILE_DIFF, List.of("A.java"));
+        String diffB = "diff --git a/B.java b/B.java\nindex 111..222 100644\n--- a/B.java\n+++ b/B.java\n@@ -1,1 +1,1 @@\n+y\n";
+        var chunk1 = persistChunkAt(review.getId(), 1, 2, diffB, List.of("B.java"));
+        ReviewJob job0 = persistStructuredJobForChunk(review, chunk0.getId(), 0, 1);
+        ReviewJob job1 = persistStructuredJobForChunk(review, chunk1.getId(), 1, 1);
+
+        CommentParser commentParser = new CommentParser(properties, new MetricsCounters());
+        ResultProcessor processor = newResultProcessor(commentParser, properties);
+
+        // Chunk 0's response offers 5 candidate findings for A.java -- far more than its fair share.
+        processor.process(review.getId(), job0.getId(), "worker-1", job0.getBackendId(),
+                new SubmitResultCommand(structuredFindingsRaw("A.java", 5), 10, 5, 1000L, "model-x", null));
+        // Chunk 1's response offers a single genuine finding for B.java.
+        processor.process(review.getId(), job1.getId(), "worker-1", job1.getBackendId(),
+                new SubmitResultCommand(structuredFindingsRaw("B.java", 1), 10, 5, 1000L, "model-x", null));
+
+        var comments = reviewCommentRepository.findByReviewId(review.getId());
+        assertThat(comments.size()).isLessThanOrEqualTo(3);
+        assertThat(comments)
+                .as("chunk 0 must not have consumed the entire review-wide comment budget -- chunk 1's "
+                        + "genuine finding must still have been published")
+                .anySatisfy(c -> assertThat(c.getFilePath()).isEqualTo("B.java"));
+        assertThat(comments)
+                .anySatisfy(c -> assertThat(c.getFilePath()).isEqualTo("A.java"));
+    }
+
+    @Test
+    void structuredCommentCapNeverAffectsCoverageValidationOnlyRendering() {
+        // F-SRO-04: the fair-share cap must bound RENDERING only -- coverage validation (every expected
+        // file must be present) still runs against the full, uncapped response.
+        GatewayProperties properties = new GatewayProperties();
+        properties.getPublish().setMaxCommentCount(1); // fair-share cap = 1 for this single-chunk review
+        Review review = persistRunningStructuredReview("sha-struct-cap-vs-coverage");
+        persistChunk(review.getId(), SINGLE_FILE_DIFF, List.of("A.java", "B.java"));
+        ReviewJob job = persistStructuredJob(review, 1);
+
+        CommentParser commentParser = new CommentParser(properties, new MetricsCounters());
+        ResultProcessor processor = newResultProcessor(commentParser, properties);
+        // B.java is missing entirely -- must still be reported as COVERAGE_SHORTFALL, cap notwithstanding.
+        String raw = "{\"files\":{\"A.java\":{\"findings\":[],\"summary\":\"s\"}},\"summary\":\"y\"}";
+
+        processor.process(review.getId(), job.getId(), "worker-1", job.getBackendId(),
+                new SubmitResultCommand(raw, 10, 5, 1000L, "model-x", null));
+
+        ReviewJob reloaded = reviewJobRepository.findById(job.getId()).orElseThrow();
+        assertThat(reloaded.getStatus()).isEqualTo(JobStatus.QUEUED);
+        assertThat(reloaded.getLastError()).startsWith("structured-output: COVERAGE_SHORTFALL");
+        assertThat(reloaded.getLastError()).contains("B.java");
+    }
+
+    // ---- F-SRO-10: the 512-char last_error cap must never truncate away the "unexpected=" half ----
+
+    @Test
+    void coverageShortfallLastErrorNeverTruncatesAwayTheUnexpectedHalfEvenWithLongPaths() {
+        // 5 missing + 5 unexpected paths, each near gateway.structured.max-path-chars (256), pushes
+        // formatCoverageDetail's worst case close to RetryManager's 512-char last_error cap. Before
+        // F-SRO-10 (MAX_KEY_CHARS=64), the combined (Gateway-constant prefix + detail) could reach ~740
+        // chars, and RetryManager.sanitizeLastError's right-truncation at 512 would cut into the
+        // "unexpected=" half itself -- the model-controlled diagnosis this cap exists to preserve.
+        Review review = persistRunningStructuredReview("sha-struct-longpaths");
+        List<String> missingPaths = new java.util.ArrayList<>();
+        for (int i = 0; i < 5; i++) {
+            missingPaths.add(longPath("missing" + i));
+        }
+        persistChunk(review.getId(), SINGLE_FILE_DIFF, missingPaths);
+        ReviewJob job = persistStructuredJob(review, 1);
+
+        StringBuilder filesJson = new StringBuilder("{");
+        for (int i = 0; i < 5; i++) {
+            if (i > 0) {
+                filesJson.append(',');
+            }
+            filesJson.append('"').append(longPath("unexpectd" + i)).append("\":{\"findings\":[],\"summary\":\"s\"}");
+        }
+        filesJson.append('}');
+        String raw = "{\"files\":" + filesJson + ",\"summary\":\"y\"}";
+
+        CommentParser commentParser = new CommentParser(new GatewayProperties(), new MetricsCounters());
+        ResultProcessor processor = newResultProcessor(commentParser);
+
+        processor.process(review.getId(), job.getId(), "worker-1", job.getBackendId(),
+                new SubmitResultCommand(raw, 10, 5, 1000L, "model-x", null));
+
+        ReviewJob reloaded = reviewJobRepository.findById(job.getId()).orElseThrow();
+        String lastError = reloaded.getLastError();
+        assertThat(lastError.length()).isLessThanOrEqualTo(512);
+        assertThat(lastError).contains("missing=");
+        assertThat(lastError)
+                .as("the unexpected= label and at least one real key must survive, never truncated away")
+                .contains("unexpected=")
+                .contains("unexpectd0");
+        assertThat(lastError).contains("missing0");
+    }
+
+    private String longPath(String label) {
+        return label + "-" + "x".repeat(256 - label.length() - 1);
     }
 }

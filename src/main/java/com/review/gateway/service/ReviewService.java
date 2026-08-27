@@ -1,8 +1,10 @@
 package com.review.gateway.service;
 
+import com.review.gateway.config.GatewayProperties;
 import com.review.gateway.exception.IncompatiblePromptVersionException;
 import com.review.gateway.exception.InvalidStateTransitionException;
 import com.review.gateway.exception.ReviewNotFoundException;
+import com.review.gateway.exception.StructuredOutputUnsupportedException;
 import com.review.gateway.model.Review;
 import com.review.gateway.model.ReviewChunk;
 import com.review.gateway.model.ReviewInput;
@@ -32,6 +34,7 @@ import org.springframework.transaction.support.TransactionTemplate;
 
 import java.util.ArrayList;
 import java.util.EnumSet;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Objects;
 import java.util.Set;
@@ -64,9 +67,10 @@ public class ReviewService {
      * CSR-12: Gateway-side allowlist of prompt versions known to contain the {@code {{CHUNK_CONTEXT}}}
      * placeholder. Only enforced when a Review needs more than one chunk — a single-chunk Review never
      * renders a chunk context, so any existing prompt version (e.g. {@code v1}) remains valid for it
-     * (backward compatibility, §8).
+     * (backward compatibility, §8). SRO-61: {@code v3} (Structured Review Output) is chunk-context-aware
+     * too — {@code v3.yml} requires the placeholder unconditionally (SRO-64a).
      */
-    private static final Set<String> CHUNK_AWARE_PROMPT_VERSIONS = Set.of("v2");
+    private static final Set<String> CHUNK_AWARE_PROMPT_VERSIONS = Set.of("v2", "v3");
 
     private final ReviewRepository reviewRepository;
     private final ReviewInputRepository reviewInputRepository;
@@ -82,6 +86,8 @@ public class ReviewService {
     private final EventService eventService;
     private final StateMachine stateMachine;
     private final JobStateMachine jobStateMachine;
+    private final StructuredPathValidator structuredPathValidator;
+    private final GatewayProperties properties;
     private final EntityManager entityManager;
     private final TransactionTemplate requiresNewTransactionTemplate;
 
@@ -99,6 +105,8 @@ public class ReviewService {
                           EventService eventService,
                           StateMachine stateMachine,
                           JobStateMachine jobStateMachine,
+                          StructuredPathValidator structuredPathValidator,
+                          GatewayProperties properties,
                           EntityManager entityManager,
                           PlatformTransactionManager transactionManager) {
         this.reviewRepository = reviewRepository;
@@ -115,6 +123,8 @@ public class ReviewService {
         this.eventService = eventService;
         this.stateMachine = stateMachine;
         this.jobStateMachine = jobStateMachine;
+        this.structuredPathValidator = structuredPathValidator;
+        this.properties = properties;
         this.entityManager = entityManager;
         this.requiresNewTransactionTemplate = new TransactionTemplate(transactionManager);
         this.requiresNewTransactionTemplate.setPropagationBehavior(TransactionTemplate.PROPAGATION_REQUIRES_NEW);
@@ -131,6 +141,11 @@ public class ReviewService {
      * against concurrent creates).
      */
     public CreateReviewResult createReview(CreateReviewCommand command) {
+        // Threat model SOR-08 (CRITICAL): promptVersion is allowlisted at the very edge, before any
+        // other work -- 'v3' is deliberately absent from the shipped default allowlist until an operator
+        // adds it once every Worker in the fleet ships v3.yml (Workers-first deployment order, §11).
+        validatePromptVersionAllowlist(command.promptVersion());
+
         diffSizeValidator.rejectIfAbsurdlyLarge(command.diff());
 
         sweepObsolete(command.projectId(), command.mergeRequestId(), command.headSha());
@@ -146,11 +161,24 @@ public class ReviewService {
         // Never inside a DB transaction (architecture §3): a GitLab HTTP call must never hold a Hikari
         // connection or a row lock.
         PromptManager.PromptResolution promptResolution = promptManager.resolve(command.projectId());
-        diffSizeValidator.assertPromptFits(promptResolution.estimatedTokens());
 
-        DiffChunker.ChunkPlan plan = diffChunker.split(command.diff(), promptResolution.estimatedTokens());
+        // F-SRO-03: the answer reserve must size BOTH this pre-chunking prompt-fits check and
+        // DiffChunker.split's runtime chunk budget below -- computed once, before either call, so they
+        // cannot diverge from each other or from the startup assertion
+        // (GatewayProperties.validateStructuredOnStartup) that already checks this same arithmetic.
+        // chore/answer-reserve-consolidation: a single gateway.diff.answer-reserve now sizes both v1/v2
+        // and structured (v3) responses -- no branch needed.
+        boolean structured = StructuredOutputSupport.isStructured(command.promptVersion());
+        int answerReserveTokens = properties.getDiff().getAnswerReserve();
+        diffSizeValidator.assertPromptFits(promptResolution.estimatedTokens(), answerReserveTokens);
+
+        int maxFilesPerChunk = structured ? properties.getStructured().getMaxFilesPerChunk() : 0;
+        DiffChunker.ChunkPlan plan = diffChunker.split(command.diff(), promptResolution.estimatedTokens(), maxFilesPerChunk);
         if (plan.chunks().size() > 1) {
             validatePromptVersionForChunking(command.promptVersion());
+        }
+        if (structured) {
+            validateStructuredOutputEligibility(command.promptVersion(), plan);
         }
 
         try {
@@ -176,6 +204,80 @@ public class ReviewService {
             throw new IncompatiblePromptVersionException(
                     "promptVersion '" + promptVersion + "' is not chunk-context-aware; this diff requires chunking. "
                             + "Use one of " + CHUNK_AWARE_PROMPT_VERSIONS + " or submit a smaller diff.");
+        }
+    }
+
+    /**
+     * Threat model SOR-08 (CRITICAL): {@code promptVersion} must be in {@code
+     * gateway.review.allowed-prompt-versions} — an old Worker fleet meeting a {@code v3} job before it
+     * ships {@code v3.yml} would abandon it and burn all three attempts in ~3 minutes (WOC's immediate
+     * {@code POST /jobs/{id}/fail}), failing the Review with the sibling cascade. Reuses {@code 422
+     * STRUCTURED_OUTPUT_UNSUPPORTED} (no new error code, architecture §4.3 preamble).
+     *
+     * <p><b>F-SRO-09 (appsec SAST fix round):</b> never echoes the caller-supplied {@code promptVersion}
+     * back into the response body — {@code CreateReviewRequest.promptVersion} now has an edge-level
+     * {@code @Size}/{@code @Pattern} bound, but this throw site itself still names only the allowed set
+     * (a Gateway-config value, not attacker-controlled), matching the discipline the SRO-16/17/65 throw
+     * sites in {@link #validateStructuredOutputEligibility} already follow.
+     */
+    private void validatePromptVersionAllowlist(String promptVersion) {
+        if (!properties.getReview().getAllowedPromptVersions().contains(promptVersion)) {
+            throw new StructuredOutputUnsupportedException(
+                    "promptVersion is not in the allowlist gateway.review.allowed-prompt-versions="
+                            + properties.getReview().getAllowedPromptVersions()
+                            + "; an operator enables a new version only once every Worker in the fleet can serve it");
+        }
+    }
+
+    /**
+     * Structured Review Output (architecture §4.3, SRO-16/17/65; threat model SOT-02/07/15/22/24,
+     * SOR-01, BLOCKING). Fail-fast at the edge, before any Review/chunk/job is persisted — a structured
+     * Review whose coverage guarantee would otherwise be weaker than advertised is rejected wholesale,
+     * never silently degraded.
+     */
+    private void validateStructuredOutputEligibility(String promptVersion, DiffChunker.ChunkPlan plan) {
+        if (!plan.pathsTrusted()) {
+            // SRO-16: the CSR-11 fallback (no `diff --git` headers) extracts no paths at all -- a
+            // structured schema built from an empty set would have no coverage constraint whatsoever.
+            throw new StructuredOutputUnsupportedException(
+                    "promptVersion '" + promptVersion + "' requires git-style `diff --git` headers to derive "
+                            + "the per-file coverage list; submit a `git diff` or use promptVersion 'v2'.");
+        }
+        int maxPathChars = properties.getStructured().getMaxPathChars();
+        for (DiffChunker.DiffChunk chunk : plan.chunks()) {
+            List<String> sanitizedPaths = chunk.filePaths().stream()
+                    .map(chunkContextRenderer::sanitizePath)
+                    .filter(Objects::nonNull)
+                    .collect(Collectors.toList());
+            // F-SRO-02: compare DISTINCT sanitized values against the raw count, not just the size.
+            // sanitizePath is not injective (it strips control/format chars and '<'/'>' and trim()s), so
+            // two different raw paths can sanitize to the same string while both remain non-null -- a
+            // plain size comparison misses that collision entirely. A collision must trip the same
+            // fail-closed path as a dropped path: either way, one file silently loses its coverage
+            // guarantee.
+            if (sanitizedPaths.size() != chunk.filePaths().size()
+                    || new LinkedHashSet<>(sanitizedPaths).size() != sanitizedPaths.size()) {
+                // SRO-17: sanitization dropped a path (control/format characters only), or two distinct
+                // paths collided onto the same sanitized value -- either way a file is left uncovered.
+                // Never echo the raw or sanitized path back to the caller.
+                throw new StructuredOutputUnsupportedException(
+                        "promptVersion '" + promptVersion + "' requires every changed file path to survive "
+                                + "sanitization and remain distinct from every other path; this diff contains "
+                                + "at least one path that does not — use promptVersion 'v2' or rename the "
+                                + "affected file(s).");
+            }
+            for (String path : sanitizedPaths) {
+                if (!structuredPathValidator.isEligible(path, maxPathChars)) {
+                    // SRO-65: a conservative, constrained alphabet -- never echoes the offending path,
+                    // only the character class it violated.
+                    throw new StructuredOutputUnsupportedException(
+                            "promptVersion '" + promptVersion + "' requires file paths free of the characters "
+                                    + "{ } \" \\ ` [ ] | * and whitespace, with no '..' segment, no leading '/', "
+                                    + "and at most " + maxPathChars + " characters — use promptVersion 'v2' or "
+                                    + "rename the affected file(s). If this repository uses git's default "
+                                    + "core.quotePath, submit `git -c core.quotePath=false diff` instead.");
+                }
+            }
         }
     }
 

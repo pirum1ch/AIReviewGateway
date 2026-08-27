@@ -8,7 +8,10 @@ import org.springframework.stereotype.Component;
 
 import java.time.Duration;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.regex.Pattern;
 
 /**
@@ -58,6 +61,8 @@ public class GatewayProperties {
     private final Backend backend = new Backend();
     private final Scheduler scheduler = new Scheduler();
     private final Prompt prompt = new Prompt();
+    private final Structured structured = new Structured();
+    private final Review review = new Review();
 
     public Diff getDiff() {
         return diff;
@@ -99,6 +104,14 @@ public class GatewayProperties {
         return prompt;
     }
 
+    public Structured getStructured() {
+        return structured;
+    }
+
+    public Review getReview() {
+        return review;
+    }
+
     /** PMR-14: project reference = numeric id, or up to 10 {@code /}-separated path segments — never a scheme/host. */
     private static final Pattern PROJECT_REF_PATTERN =
             Pattern.compile("^[0-9]+$|^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+){1,10}$");
@@ -108,6 +121,31 @@ public class GatewayProperties {
     private static final Pattern SOURCE_PATH_PATTERN = Pattern.compile("^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$");
     private static final int MAX_SOURCE_PATH_LENGTH = 200;
     private static final int MAX_OVERRIDES = 500;
+    /**
+     * Structured Review Output (SRO-64d): fixed-text overhead of the coverage block (the
+     * {@code STRUCTURED_COVERAGE_INTRO} sentence, delimiter tokens, and the part-of-N intro) added to
+     * the per-path budget when computing {@code coverageReserveTokens} at startup. A generous constant
+     * rather than a literal shared with {@code ChunkContextRenderer} — deliberately conservative so a
+     * future wording change to that fixed text cannot silently invalidate this budget check.
+     */
+    private static final int COVERAGE_BLOCK_FIXED_CHARS = 400;
+
+    /**
+     * F-SRO-03 (appsec SAST fix round): the coverage-block header-reserve formula, extracted to this one
+     * shared static method so {@link #validateStructuredOnStartup()} (the startup budget assertion) and
+     * {@code DiffChunker.split}'s runtime chunk sizing can never compute two different numbers for the
+     * same inputs. Before this fix, the formula existed only inline inside the startup check — the
+     * startup validation asserted a budget the runtime chunker never actually used.
+     *
+     * @return the coverage-block header reserve, in tokens, for a structured-output chunk whose coverage
+     *         list can carry up to {@code maxFilesPerChunk} paths of up to {@code maxPathChars} each
+     */
+    public static long coverageReserveTokens(int maxFilesPerChunk, int maxPathChars, int charsPerToken) {
+        int effectiveCharsPerToken = Math.max(1, charsPerToken);
+        return (long) Math.ceil(
+                ((double) Math.max(0, maxFilesPerChunk) * (Math.max(0, maxPathChars) + 1) + COVERAGE_BLOCK_FIXED_CHARS)
+                        / effectiveCharsPerToken);
+    }
 
     @PostConstruct
     void validateOnStartup() {
@@ -139,6 +177,109 @@ public class GatewayProperties {
 
         validateRetryAndBackendHealthOnStartup();
         validatePromptOnStartup();
+        validateStructuredOnStartup();
+    }
+
+    /**
+     * Structured Review Output (architecture §8, five-point startup validation). Runs unconditionally
+     * (not gated on {@code gateway.structured.enabled}) — SRO-39's kill switch still renders the SRO-64
+     * coverage list, so the budget it needs must always be consistent, not only when a decoder
+     * constraint happens to be turned on.
+     *
+     * <p>Point 5 (threat model SOR-13, CRITICAL) is the one the pre-implementation draft omitted: without
+     * subtracting {@code gateway.prompt.limits.max-system-prompt-tokens} when Prompt Manager is enabled,
+     * every v3 Review in a {@code REPO}-mode deployment would fail at <em>runtime</em> with {@code 422
+     * PROMPT_TOO_LARGE} instead of the Gateway refusing to start with a precise, named-property message.
+     */
+    private void validateStructuredOnStartup() {
+        if (structured.getMaxFilesPerChunk() < 1) {
+            throw new IllegalStateException(
+                    "gateway.structured.max-files-per-chunk must be >= 1; got: " + structured.getMaxFilesPerChunk());
+        }
+        // Point 1: max-path-chars must stay below ChunkContextRenderer's own (more generous) cap, so a
+        // structured Review never silently relies on THAT truncation instead of this feature's own bound.
+        if (structured.getMaxPathChars() < 1 || structured.getMaxPathChars() > 300) {
+            throw new IllegalStateException(
+                    "gateway.structured.max-path-chars must be between 1 and 300 (ChunkContextRenderer's own "
+                            + "path-length cap); got: " + structured.getMaxPathChars());
+        }
+        // Point 2: a per-section bound tighter than the per-chunk bound would make SRO-66b unreachable
+        // for legitimate input (a single well-formed section could never satisfy both).
+        if (diff.getMaxPathsPerSection() < structured.getMaxFilesPerChunk()) {
+            throw new IllegalStateException(
+                    "gateway.diff.max-paths-per-section must be >= gateway.structured.max-files-per-chunk "
+                            + "(otherwise a single legitimate file section could never satisfy both bounds) — got "
+                            + "max-paths-per-section=" + diff.getMaxPathsPerSection() + ", max-files-per-chunk="
+                            + structured.getMaxFilesPerChunk());
+        }
+        // SGB-02 (Structured Output Grammar Budget, threat model SOGB-09): llama.cpp's grammar-parser
+        // complexity guard (src/llama-grammar.cpp, MAX_REPETITION_THRESHOLD = 2000) throws when a single
+        // repetition site's expanded rule count reaches that threshold. The "findings" array's maxItems
+        // is exactly such a site, once per file per chunk -- this bounds only that PER-SITE cost (a
+        // deliberate ~10x margin below 2000, not a tuned number), never the files x findings product,
+        // which is bounded empirically instead (gateway.structured.max-files-per-chunk, left at its
+        // current default pending the probe in docs/structured-output-grammar-budget-architecture.md §6).
+        if (structured.getMaxFindingsPerFile() > 200) {
+            throw new IllegalStateException(
+                    "gateway.structured.max-findings-per-file must be <= 200; got: "
+                            + structured.getMaxFindingsPerFile() + " -- above this, the 'findings' array's "
+                            + "maxItems repetition site risks tripping llama.cpp's grammar-parser complexity "
+                            + "guard (MAX_REPETITION_THRESHOLD = 2000; this check bounds only the per-file, "
+                            + "per-site cost, not gateway.structured.max-files-per-chunk x max-findings-per-file) "
+                            + "-- refusing to start");
+        }
+
+        // SRO-38: fail fast on a typo'd on-invalid-response value rather than degrading it silently at
+        // claim/result time -- ResultProcessor itself still defends via OnInvalidResponse.fromNullable
+        // (never Enum.valueOf), but a bad *configured* value should never reach production unnoticed.
+        if (com.review.gateway.model.enums.OnInvalidResponse.fromNullable(structured.getOnInvalidResponse()).isEmpty()) {
+            throw new IllegalStateException(
+                    "gateway.structured.on-invalid-response must be RETRY_THEN_FAIL or RETRY_THEN_FALLBACK; got: "
+                            + structured.getOnInvalidResponse());
+        }
+
+        // Point 3 (chore/answer-reserve-consolidation): PREVIOUSLY a >= check between two separately
+        // configurable knobs (gateway.structured.answer-reserve vs gateway.diff.answer-reserve). That
+        // split existed so a v3-specific reserve could be more generous than v1/v2's without affecting
+        // v1/v2's own chunk-packing budget -- but in practice this repeatedly caused exactly the
+        // misconfiguration this check existed to catch: an operator raises one and forgets the other,
+        // learning about it only from a refused startup. There is now a SINGLE
+        // gateway.diff.answer-reserve, used for both v1/v2 and structured (v3) budget math (see
+        // DiffChunker.split/ReviewService, which no longer branch on prompt version for this value) --
+        // nothing left to compare here, so this point is removed rather than made permanently trivial.
+
+        // Point 4 (SRO-64d): the coverage block must fit the budget. Sized for the worst case -- every
+        // path at max-path-chars -- because a budget that only works for typical inputs is not a budget.
+        // F-SRO-03: this must be the exact same formula DiffChunker.split uses at runtime (see
+        // coverageReserveTokens's javadoc) -- computed once, shared, so the two can never drift apart.
+        int charsPerToken = Math.max(1, diff.getCharsPerToken());
+        long coverageReserveTokens =
+                coverageReserveTokens(structured.getMaxFilesPerChunk(), structured.getMaxPathChars(), charsPerToken);
+
+        // Point 5 (threat model SOR-13, CRITICAL): include the Prompt Manager term when it is enabled.
+        long promptManagerTerm = prompt.isEnabled() ? prompt.getLimits().getMaxSystemPromptTokens() : 0;
+
+        long remainingDiffBudget = diff.getContextWindow() - diff.getPromptReserve() - diff.getAnswerReserve()
+                - coverageReserveTokens - promptManagerTerm;
+        int minDiffBudgetTokens = prompt.getLimits().getMinDiffBudgetTokens();
+        if (remainingDiffBudget < minDiffBudgetTokens) {
+            throw new IllegalStateException(
+                    "gateway.structured budget is inconsistent: gateway.diff.context-window - "
+                            + "gateway.diff.prompt-reserve - gateway.diff.answer-reserve - "
+                            + "coverageReserveTokens(" + coverageReserveTokens + ", derived from "
+                            + "gateway.structured.max-files-per-chunk and gateway.structured.max-path-chars)"
+                            + (prompt.isEnabled() ? " - gateway.prompt.limits.max-system-prompt-tokens" : "")
+                            + " = " + remainingDiffBudget + ", which must be >= "
+                            + "gateway.prompt.limits.min-diff-budget-tokens (" + minDiffBudgetTokens
+                            + ") — refusing to start");
+        }
+        log.info("Structured Review Output budget check passed: context-window={} - prompt-reserve={} - "
+                        + "answer-reserve={} - coverageReserveTokens={} (max-files-per-chunk={}, "
+                        + "max-path-chars={}){} = {} remaining diff-token budget per chunk (min required: {})",
+                diff.getContextWindow(), diff.getPromptReserve(), diff.getAnswerReserve(),
+                coverageReserveTokens, structured.getMaxFilesPerChunk(), structured.getMaxPathChars(),
+                prompt.isEnabled() ? " - max-system-prompt-tokens=" + prompt.getLimits().getMaxSystemPromptTokens() : "",
+                remainingDiffBudget, minDiffBudgetTokens);
     }
 
     /**
@@ -454,6 +595,18 @@ public class GatewayProperties {
          */
         private int maxChunkContextChars = 1000;
         /**
+         * Structured Review Output (SRO-66a, threat model SOT-03/SOR-03, BLOCKING): unconditional
+         * memory-safety bound on how many file paths {@code DiffChunker.Section} accumulates while
+         * scanning a single section's header region — applies to <b>every</b> prompt version, not just
+         * structured ones, because it closes an F-DC-01-shaped amplification (a crafted section of many
+         * short {@code +++ } header lines) rather than gating a feature. Never fires on real {@code git
+         * diff} output (one file per section); a section that hits this bound stops accumulating paths
+         * into the (advisory, v1/v2) chunk-context file list but the true count is still tracked, so a
+         * structured (v3) Review can fail fast at the edge instead of silently narrowing its coverage set
+         * (SRO-66b).
+         */
+        private int maxPathsPerSection = 64;
+        /**
          * SR-11 hard edge cap (bytes) for the whole {@code POST /reviews} request body, enforced by
          * {@code RequestBodySizeLimitFilter} before Spring MVC/Jackson reads it.
          *
@@ -540,6 +693,14 @@ public class GatewayProperties {
 
         public void setMaxChunkContextChars(int maxChunkContextChars) {
             this.maxChunkContextChars = maxChunkContextChars;
+        }
+
+        public int getMaxPathsPerSection() {
+            return maxPathsPerSection;
+        }
+
+        public void setMaxPathsPerSection(int maxPathsPerSection) {
+            this.maxPathsPerSection = maxPathsPerSection;
         }
     }
 
@@ -1178,6 +1339,159 @@ public class GatewayProperties {
             public void setMaxConcurrentResolutions(int maxConcurrentResolutions) {
                 this.maxConcurrentResolutions = maxConcurrentResolutions;
             }
+        }
+    }
+
+    /** Structured Review Output (architecture §8, {@code gateway.structured.*}). */
+    public static class Structured {
+        /** SRO-39: global kill switch — {@code false} emits no constraint and legacy-parses v3. The SRO-64 coverage list is still rendered either way. */
+        private boolean enabled = true;
+        /** SRO-07: used when {@code backends.structured_output_mode IS NULL}. Parsed via {@code StructuredOutputMode.fromNullable}. */
+        private String defaultMode = "OFF";
+        /** SRO-14/SRO-66: bounds schema size, coverage-block size and per-response length; structured prompt versions only. */
+        private int maxFilesPerChunk = 40;
+        /** SRO-65: max length of a schema-eligible path (checked after sanitizePath); deliberately below {@code ChunkContextRenderer.MAX_PATH_LENGTH} (300). */
+        private int maxPathChars = 256;
+        /** SRO-15: backstop only — if this ever fires, the SRO-65/SRO-66 edge bounds have a bug. */
+        private int maxSchemaBytes = 65536;
+        /** SRO-27 -&gt; {@code maxItems} on the {@code findings} array. */
+        private int maxFindingsPerFile = 20;
+        /** SGB-01/SOGB-12: receipt-side truncation bound only — the schema no longer emits {@code maxLength} for finding {@code comment} (Structured Output Grammar Budget); over-length values are truncated on receipt and published, never {@code SCHEMA_MISMATCH}. */
+        private int maxCommentChars = 1200;
+        /** SGB-01/SOGB-12: same as {@link #maxCommentChars}, for finding {@code suggestion}. */
+        private int maxSuggestionChars = 2000;
+        /** SRO-25: token-budget lever — {@code false} omits the per-file {@code summary} property entirely. */
+        private boolean perFileSummary = true;
+        /** SRO-38/SRO-68: {@code RETRY_THEN_FAIL} (default) or {@code RETRY_THEN_FALLBACK}. */
+        private String onInvalidResponse = "RETRY_THEN_FAIL";
+        /** SRO-51: whether to extract and render a {@code ```diff} context block per finding. */
+        private boolean includeDiffContext = true;
+        /** SRO-51: lines of context on each side of the finding's line. */
+        private int diffContextLines = 3;
+        // chore/answer-reserve-consolidation: this class USED TO have its own `answerReserve` field
+        // (§10 of the original design), separate from gateway.diff.answer-reserve, specifically so a
+        // structured (v3) response's answer budget could be more generous than v1/v2's without affecting
+        // v1/v2's own chunk-packing math. In practice this repeatedly caused exactly the misconfiguration
+        // its startup check (validateStructuredOnStartup Point 3) existed to catch: an operator raises
+        // one and forgets the other. Removed -- gateway.diff.answer-reserve is now the single value used
+        // for both (see DiffChunker.split/ReviewService, no longer branching on prompt version for this).
+
+        public boolean isEnabled() {
+            return enabled;
+        }
+
+        public void setEnabled(boolean enabled) {
+            this.enabled = enabled;
+        }
+
+        public String getDefaultMode() {
+            return defaultMode;
+        }
+
+        public void setDefaultMode(String defaultMode) {
+            this.defaultMode = defaultMode;
+        }
+
+        public int getMaxFilesPerChunk() {
+            return maxFilesPerChunk;
+        }
+
+        public void setMaxFilesPerChunk(int maxFilesPerChunk) {
+            this.maxFilesPerChunk = maxFilesPerChunk;
+        }
+
+        public int getMaxPathChars() {
+            return maxPathChars;
+        }
+
+        public void setMaxPathChars(int maxPathChars) {
+            this.maxPathChars = maxPathChars;
+        }
+
+        public int getMaxSchemaBytes() {
+            return maxSchemaBytes;
+        }
+
+        public void setMaxSchemaBytes(int maxSchemaBytes) {
+            this.maxSchemaBytes = maxSchemaBytes;
+        }
+
+        public int getMaxFindingsPerFile() {
+            return maxFindingsPerFile;
+        }
+
+        public void setMaxFindingsPerFile(int maxFindingsPerFile) {
+            this.maxFindingsPerFile = maxFindingsPerFile;
+        }
+
+        public int getMaxCommentChars() {
+            return maxCommentChars;
+        }
+
+        public void setMaxCommentChars(int maxCommentChars) {
+            this.maxCommentChars = maxCommentChars;
+        }
+
+        public int getMaxSuggestionChars() {
+            return maxSuggestionChars;
+        }
+
+        public void setMaxSuggestionChars(int maxSuggestionChars) {
+            this.maxSuggestionChars = maxSuggestionChars;
+        }
+
+        public boolean isPerFileSummary() {
+            return perFileSummary;
+        }
+
+        public void setPerFileSummary(boolean perFileSummary) {
+            this.perFileSummary = perFileSummary;
+        }
+
+        public String getOnInvalidResponse() {
+            return onInvalidResponse;
+        }
+
+        public void setOnInvalidResponse(String onInvalidResponse) {
+            this.onInvalidResponse = onInvalidResponse;
+        }
+
+        public boolean isIncludeDiffContext() {
+            return includeDiffContext;
+        }
+
+        public void setIncludeDiffContext(boolean includeDiffContext) {
+            this.includeDiffContext = includeDiffContext;
+        }
+
+        public int getDiffContextLines() {
+            return diffContextLines;
+        }
+
+        public void setDiffContextLines(int diffContextLines) {
+            this.diffContextLines = diffContextLines;
+        }
+    }
+
+    /**
+     * Review-creation edge config (architecture threat model SOR-08, CRITICAL — {@code
+     * gateway.review.*}).
+     */
+    public static class Review {
+        /**
+         * SOR-08: {@code promptVersion} allowlist enforced at {@code POST /reviews}. {@code v3} is
+         * deliberately <b>not</b> in the shipped default — an operator adds it only after every Worker in
+         * the fleet has {@code v3.yml} deployed (§11 rollout order, Workers-first).
+         */
+        private Set<String> allowedPromptVersions = new LinkedHashSet<>(List.of("v1", "v2"));
+
+        public Set<String> getAllowedPromptVersions() {
+            return allowedPromptVersions;
+        }
+
+        public void setAllowedPromptVersions(Set<String> allowedPromptVersions) {
+            this.allowedPromptVersions = allowedPromptVersions != null
+                    ? allowedPromptVersions : new LinkedHashSet<>();
         }
     }
 }

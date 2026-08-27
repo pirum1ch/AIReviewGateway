@@ -36,37 +36,26 @@ management:
       probes:
         enabled: true               # включает liveness/readiness-пробы Spring Boot Actuator (используются оркестратором/системой мониторинга для проверки готовности сервиса)
 
+# ============================================================================================
+# gateway.* — конфигурация ниже сгруппирована в логические блоки (chore/config-consolidation):
+#   §A Секреты и подключение к смежным системам (GitLab, backend'ы llama-server, CI/Worker/Admin)
+#   §B Бюджет LLM-токенов (diff chunking + structured output) — единая сводная таблица со всеми
+#      связанными параметрами ОБОИХ процессов (Gateway и Worker) — DEPLOYMENT.md §"Бюджет токенов"
+#   §C Prompt Manager (V3, опционально)
+#   §D Очередь / повторные попытки / жизненный цикл джобы
+#   §E Публикация комментариев в GitLab
+#   §F Фоновый планировщик
+#   §G Allowlist версий промпта
+# Порядок блоков внутри gateway.* — чисто организационный, Spring биндит свойства по полному
+# пути (gateway.xxx.yyy), а не по порядку в файле, так что переупорядочивание ничего не меняет
+# в поведении приложения.
+# ============================================================================================
 gateway:
-  diff:
-    context-window: 32768          # размер контекстного окна используемой LLM в токенах — база для расчёта бюджетов на промпт/diff/ответ
-    prompt-reserve: 4000            # сколько токенов контекстного окна резервируется под системный промпт
-    answer-reserve: 8000            # сколько токенов контекстного окна резервируется под ответ модели
-    max-diff-tokens: 20000          # derived cap; per-chunk budget as of V2 diff chunking (CSR-05) — производный предел: максимум токенов diff на один чанк/запрос к LLM
-    chars-per-token: 4              # heuristic for the token estimator — эвристика "символов на токен", применяемая для оценки числа токенов без реального токенайзера
-    # F-DC-04 fix: это значение ОБЯЗАНО соответствовать формуле CSR-02 (max-chunks * max-diff-tokens *
-    # chars-per-token * коэффициент запаса 1.5 + фиксированные накладные расходы 20000) -- при
-    # приведённых ниже значениях по умолчанию: 5 * 10000 * 4 * 1.5 + 20000 = 320000. Ранее это
-    # значение оставалось равным дочанкинговому 100000, что незаметно ограничивало каждый
-    # чанкованный Review примерно 2 чанками, независимо от gateway.diff.max-chunks. Пересчитывайте и
-    # обновляйте это значение (и MAX_REQUEST_BODY_BYTES, если он задан), если изменятся
-    # max-chunks/max-diff-tokens/chars-per-token.
-    max-request-body-bytes: ${MAX_REQUEST_BODY_BYTES:320000}  # SR-11/CSR-02 edge cap for POST /reviews — максимальный размер тела запроса POST /reviews в байтах; должен быть согласован с формулой CSR-02 выше
-  heartbeat:
-    interval: 60s                   # expected worker ping cadence — ожидаемый интервал между heartbeat-пингами воркера
-    timeout: 180s                   # stuck if now - heartbeat_at exceeds this — если с момента последнего heartbeat прошло больше этого времени, джоба считается "зависшей" и возвращается в очередь
-  retry:
-    max-attempts: 3                 # максимальное число попыток выполнения одной джобы, прежде чем Review переводится в FAILED
-  job:
-    max-duration: 45m               # hard cap backstop — жёсткий предел общей длительности джобы; запасной механизм поверх мониторинга по heartbeat
-  publish:
-    max-comment-count: 50           # максимальное число комментариев ревью, публикуемых в один merge request
-    max-comment-length: 4000        # максимальная длина одного комментария в символах
-    max-raw-response-length: 200000 # SR-21 — максимальная длина "сырого" ответа LLM, сохраняемого в БД
-    max-request-body-bytes: 500000  # SR-11 edge cap for POST /jobs/{id}/result — максимальный размер тела запроса POST /jobs/{id}/result в байтах
-  scheduler:
-    heartbeat-check-interval: 30s   # как часто фоновый планировщик проверяет джобы на "зависание" по heartbeat
-    backend-health-interval: 60s    # как часто планировщик опрашивает backend'ы (llama-server) для проверки их состояния
-    publish-retry-interval: 60s     # как часто планировщик повторяет неудавшиеся попытки публикации комментариев в GitLab
+  # ---- §A Секреты и подключение к смежным системам ------------------------------------------
+  security:
+    ci-token: ${CI_TOKEN}           # Bearer-токен, которым GitLab CI аутентифицируется к API создания/статуса Review (POST/GET /reviews)
+    worker-token: ${WORKER_TOKEN}   # отдельный Bearer-токен для Worker-facing API (/jobs/*), с более узкими правами, чем у CI-токена
+    admin-token: ${ADMIN_TOKEN}     # Bearer-токен для административных операций (например, DELETE /reviews/{id})
   gitlab:
     base-url: ${GITLAB_BASE_URL:https://gitlab.example.com/api/v4}   # базовый URL GitLab API — используется для получения diff'ов MR и публикации комментариев
     token: ${GITLAB_TOKEN}          # masked in toString; only Gateway holds this — токен GitLab с правом записи (публикация комментариев); маскируется в toString, хранится только у Gateway
@@ -83,10 +72,60 @@ gateway:
                                      # outside any DB transaction (see GatewayProperties.Backend#readTimeout)
                                      # — таймаут чтения ответа backend'а при health-пробе; увеличен с 5s, т.к. WOC-14 вынес ввод-вывод пробы за пределы транзакции БД, и это стало безопасно
     allowed-host-pattern: ${BACKEND_ALLOWED_HOST_PATTERN:.*}   # SR-10: tighten per deployment — regex-паттерн допустимых хостов для URL backend'ов (защита от SSRF); в конкретном окружении следует сузить
-  security:
-    ci-token: ${CI_TOKEN}           # Bearer-токен, которым GitLab CI аутентифицируется к API создания/статуса Review (POST/GET /reviews)
-    worker-token: ${WORKER_TOKEN}   # отдельный Bearer-токен для Worker-facing API (/jobs/*), с более узкими правами, чем у CI-токена
-    admin-token: ${ADMIN_TOKEN}     # Bearer-токен для административных операций (например, DELETE /reviews/{id})
+
+  # ---- §B Бюджет LLM-токенов ------------------------------------------------------------------
+  # Все параметры этого блока (плюс gateway.prompt.limits.* из §C, плюс аналогичные параметры
+  # worker/application.yml и worker/.../prompts/*.yml на стороне Worker'а) вместе формируют ОДИН
+  # общий бюджет контекстного окна модели. Они физически не могут жить в одном файле (Gateway и
+  # Worker — разные процессы, не обязательно на одной машине), поэтому единая сводная таблица со
+  # всеми связями/неравенствами между ними — в DEPLOYMENT.md, раздел "Бюджет LLM-токенов:
+  # сводная таблица". Смотрите её целиком перед тем, как менять любое из значений ниже.
+  diff:
+    context-window: 65536          # размер контекстного окна используемой LLM в токенах — база для расчёта бюджетов на промпт/diff/ответ
+    prompt-reserve: 10000            # сколько токенов контекстного окна резервируется под системный промпт
+    answer-reserve: 12000            # сколько токенов контекстного окна резервируется под ответ модели
+    max-diff-tokens: 10000          # derived cap; per-chunk budget as of V2 diff chunking (CSR-05) — производный предел: максимум токенов diff на один чанк/запрос к LLM
+    chars-per-token: 4              # heuristic for the token estimator — эвристика "символов на токен", применяемая для оценки числа токенов без реального токенайзера
+    # F-DC-04 fix: это значение ОБЯЗАНО соответствовать формуле CSR-02 (max-chunks * max-diff-tokens *
+    # chars-per-token * коэффициент запаса 1.5 + фиксированные накладные расходы 20000) -- при
+    # приведённых ниже значениях по умолчанию: 5 * 10000 * 4 * 1.5 + 20000 = 320000. Ранее это
+    # значение оставалось равным дочанкинговому 100000, что незаметно ограничивало каждый
+    # чанкованный Review примерно 2 чанками, независимо от gateway.diff.max-chunks. Пересчитывайте и
+    # обновляйте это значение (и MAX_REQUEST_BODY_BYTES, если он задан), если изменятся
+    # max-chunks/max-diff-tokens/chars-per-token.
+    max-request-body-bytes: ${MAX_REQUEST_BODY_BYTES:320000}  # SR-11/CSR-02 edge cap for POST /reviews — максимальный размер тела запроса POST /reviews в байтах; должен быть согласован с формулой CSR-02 выше
+    # Structured Review Output (SRO-66a, threat model SOT-03/SOR-03): безусловная (для всех версий
+    # промпта) граница числа путей, извлекаемых DiffChunker.Section из ОДНОЙ секции diff -- защита от
+    # памяти-амплификации на уровне F-DC-01; никогда не срабатывает на настоящем выводе `git diff`
+    # (одна секция = один файл).
+    max-paths-per-section: 64   # максимальное число путей файлов, извлекаемых из одной секции diff (memory-safety bound, SRO-66a)
+  # Structured Review Output (docs/structured-review-output-architecture.md): decoder-constrained,
+  # coverage-enforced ответы модели для promptVersion "v3". Полностью аддитивно -- ничего здесь не
+  # меняет поведение v1/v2.
+  structured:
+    enabled: ${STRUCTURED_OUTPUT_ENABLED:true}   # SRO-39 kill-switch: false -- ни один constraint не отправляется, v3 парсится тем же CommentParser, что и v1/v2; список покрытия (coverage list) в промпте всё равно рендерится
+    default-mode: ${STRUCTURED_OUTPUT_DEFAULT_MODE:OFF}   # SRO-07: используется, когда backends.structured_output_mode IS NULL -- OFF означает "ничего не меняется в байтах запроса к llama-server" пока оператор не включит конкретный backend
+    max-files-per-chunk: 40      # SRO-14/66: верхняя граница числа файлов в одном структурированном чанке (влияет на размер схемы/coverage-блока/ответа)
+    max-path-chars: 256          # SRO-65: максимальная длина пути, допустимого в качестве ключа схемы (после sanitizePath); длиннее -- 422 STRUCTURED_OUTPUT_UNSUPPORTED
+    max-schema-bytes: 65536      # SRO-15: backstop -- при исправных SRO-65/66 не должен срабатывать никогда
+    max-findings-per-file: 20    # SRO-27 -> maxItems массива findings
+    max-comment-chars: 1200      # SGB-01/SOGB-12: receipt-side truncation bound only -- schema больше не эмитит maxLength (см. docs/structured-output-grammar-budget-architecture.md §1); over-length comment усекается на приёме и публикуется, а не отклоняется как SCHEMA_MISMATCH
+    max-suggestion-chars: 2000   # SGB-01/SOGB-12: то же самое для suggestion -- см. комментарий выше
+    per-file-summary: true       # SRO-25: включает обязательное поле summary на уровне файла (anti-skip device); false экономит токены ценой более слабой защиты от пропуска файла
+    on-invalid-response: RETRY_THEN_FAIL   # SRO-38/68: RETRY_THEN_FAIL (по умолчанию) | RETRY_THEN_FALLBACK (emergency escape hatch, публикует только генуинный JSON-массив с меткой "UNVALIDATED")
+    include-diff-context: true   # SRO-51: включает извлечение и рендер блока ```diff с контекстом вокруг строки finding
+    diff-context-lines: 3        # SRO-51: число строк контекста с каждой стороны от строки finding
+    # answer-reserve здесь больше НЕТ (V-04, appsec final verification): после chore/config-consolidation
+    # единый gateway.diff.answer-reserve (см. §B выше) считается и для v1/v2, и для v3 -- отдельного
+    # структурированного оверрайда не существует. Не добавляйте его обратно без соответствующего поля в
+    # GatewayProperties.Structured -- иначе ключ будет молча проигнорирован (Spring's ignoreUnknownFields),
+    # ровно как этот был все последние коммиты.
+
+  # ---- §C Prompt Manager (V3, опционально) -----------------------------------------------------
+  # gateway.prompt.limits.* ниже — тоже часть бюджета LLM-токенов (см. §B и сводную таблицу в
+  # DEPLOYMENT.md), но физически остаётся внутри этого блока: Prompt Manager — самостоятельная
+  # опциональная фича со своим набором настроек (corporate/project источники, формат сообщений,
+  # таймауты чтения из GitLab), которые нет смысла разносить по разным частям файла.
   prompt:
     # F-PM-02: изначально отгружается выключенным (безопасное значение по умолчанию) — намеренное
     # отклонение от примера в документе архитектуры (${PROMPT_MANAGER_ENABLED:true}) -- обновлённый
@@ -116,13 +155,43 @@ gateway:
     section-separator: "\n\n---\n\n"   # SINGLE mode only — разделитель между секциями промпта при их объединении в одно сообщение (режим SINGLE)
     limits:
       max-file-bytes: 262144              # максимальный размер одного файла промпта (в байтах), читаемого из Git
-      max-system-prompt-tokens: 6000      # максимальный суммарный размер системного промпта в токенах
-      min-diff-budget-tokens: 1000        # минимально допустимый остаток токенового бюджета под сам diff после вычитания промпта; если промпт "съедает" больше — ошибка
+      max-system-prompt-tokens: 6000      # максимальный суммарный размер системного промпта в токенах — ЧАСТЬ ОБЩЕГО БЮДЖЕТА ТОКЕНОВ (см. §B и сводную таблицу в DEPLOYMENT.md)
+      min-diff-budget-tokens: 1000        # минимально допустимый остаток токенового бюджета под сам diff после вычитания промпта; если промпт "съедает" больше — ошибка (общий порог, используется и базовой, и structured-валидацией бюджета)
       max-sections: 4                     # максимальное число промпт-секций (корпоративных + проектных), которые могут быть подмешаны в один Review
       max-concurrent-resolutions: 4          # PMR-19 semaphore permits — сколько параллельных операций разрешения/загрузки промпт-файлов из Git допускается одновременно (ограничение семафором)
     connect-timeout: 3s          # таймаут установления соединения при чтении промпт-файлов из GitLab
     read-timeout: 8s             # таймаут чтения ответа при получении одного промпт-файла из GitLab
     total-timeout: 20s           # суммарный таймаут на получение всех промпт-секций для одного Review
+
+  # ---- §D Очередь / повторные попытки / жизненный цикл джобы ------------------------------------
+  heartbeat:
+    interval: 60s                   # expected worker ping cadence — ожидаемый интервал между heartbeat-пингами воркера
+    timeout: 180s                   # stuck if now - heartbeat_at exceeds this — если с момента последнего heartbeat прошло больше этого времени, джоба считается "зависшей" и возвращается в очередь
+  retry:
+    max-attempts: 3                 # максимальное число попыток выполнения одной джобы, прежде чем Review переводится в FAILED
+  job:
+    max-duration: 45m               # hard cap backstop — жёсткий предел общей длительности джобы; запасной механизм поверх мониторинга по heartbeat
+
+  # ---- §E Публикация комментариев в GitLab -------------------------------------------------------
+  publish:
+    max-comment-count: 50           # максимальное число комментариев ревью, публикуемых в один merge request
+    max-comment-length: 4000        # максимальная длина одного комментария в символах
+    max-raw-response-length: 200000 # SR-21 — максимальная длина "сырого" ответа LLM, сохраняемого в БД
+    max-request-body-bytes: 500000  # SR-11 edge cap for POST /jobs/{id}/result — максимальный размер тела запроса POST /jobs/{id}/result в байтах
+
+  # ---- §F Фоновый планировщик -------------------------------------------------------------------
+  scheduler:
+    heartbeat-check-interval: 30s   # как часто фоновый планировщик проверяет джобы на "зависание" по heartbeat
+    backend-health-interval: 60s    # как часто планировщик опрашивает backend'ы (llama-server) для проверки их состояния
+    publish-retry-interval: 60s     # как часто планировщик повторяет неудавшиеся попытки публикации комментариев в GitLab
+
+  # ---- §G Allowlist версий промпта ---------------------------------------------------------------
+  # Structured Review Output (threat model SOR-08, CRITICAL): allowlist прикладного значения
+  # promptVersion, проверяемый на самом краю POST /reviews. "v3" НАМЕРЕННО отсутствует в значении по
+  # умолчанию -- оператор добавляет его вручную только после того, как весь парк Worker'ов уже несёт
+  # v3.yml (порядок разворачивания: сначала Worker'ы, потом Gateway, §11).
+  review:
+    allowed-prompt-versions: ${ALLOWED_PROMPT_VERSIONS:v1,v2}   # allowlist значений promptVersion, принимаемых POST /reviews; "v3" добавляется явно оператором после разворачивания Worker'ов с v3.yml
 
 # ПРИМЕЧАНИЕ: gateway.security.*/gateway.gitlab.token ОБЯЗАНЫ быть длиной >=32 символов (SR-01), а
 # gateway.gitlab.base-url ОБЯЗАН начинаться с https:// (SR-15) -- иначе GatewayProperties прерывает
@@ -135,3 +204,8 @@ gateway:
 # старте (GatewayProperties.validatePromptOnStartup), и GITLAB_PROMPT_TOKEN никогда не требуется.
 # Чтобы включить функцию, установите PROMPT_MANAGER_ENABLED=true и подготовьте
 # GITLAB_PROMPT_TOKEN + PROMPT_CORPORATE_PROJECT (см. DEPLOYMENT.md §2).
+#
+# Бюджет LLM-токенов (context-window/prompt-reserve/answer-reserve/max-system-prompt-tokens/
+# structured.* и их аналоги в worker/application.yml + worker/.../prompts/v3.yml) — единая сводная
+# таблица со всеми связями между этими параметрами ОБОИХ процессов в DEPLOYMENT.md, раздел
+# "Бюджет LLM-токенов: сводная таблица". Смотрите её перед тем, как менять любое из этих значений.

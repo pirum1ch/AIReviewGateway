@@ -13,5 +13,6 @@ public record LlamaResult(
         Integer promptTokens,
         Integer completionTokens,
         long durationMs,
-        String model) {
+        String model,
+        String finishReason) {
 }

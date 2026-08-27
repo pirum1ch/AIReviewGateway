@@ -66,7 +66,9 @@
             <artifactId>flyway-database-postgresql</artifactId>
         </dependency>
 
-        <!-- PostgreSQL driver -->
+        <!-- PostgreSQL driver: pinned above the Boot BOM's 42.7.11 (patch-level pgjdbc fixes); override
+             is intentional, not drift. Bump this explicitly, don't let it silently fall back to the
+             BOM version on a routine Boot upgrade. -->
         <dependency>
             <groupId>org.postgresql</groupId>
             <artifactId>postgresql</artifactId>

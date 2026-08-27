@@ -45,14 +45,20 @@ public class DiffChunker {
         }
     }
 
-    /** The full result of {@link #split}. */
-    public record ChunkPlan(List<DiffChunk> chunks, int totalEstimatedTokens) {
+    /**
+     * The full result of {@link #split}. {@code pathsTrusted} (SRO-16, threat model SOT-02) mirrors
+     * {@link ParsedDiff#pathsTrusted()} — {@code false} means every {@link DiffChunk#filePaths()} in
+     * {@code chunks} is empty by construction (the {@code --- }-delimiter fallback, CSR-11) and a
+     * structured {@code promptVersion} must be rejected at the edge rather than silently producing a
+     * schema with no coverage constraint at all.
+     */
+    public record ChunkPlan(List<DiffChunk> chunks, int totalEstimatedTokens, boolean pathsTrusted) {
 
         /** F-DC-07: the default {@code toString()} would dump every {@link DiffChunk} in {@code chunks}. */
         @Override
         public String toString() {
             return "ChunkPlan[chunks=<" + chunks.size() + " chunk(s), masked>, totalEstimatedTokens="
-                    + totalEstimatedTokens + "]";
+                    + totalEstimatedTokens + ", pathsTrusted=" + pathsTrusted + "]";
         }
     }
 
@@ -78,7 +84,20 @@ public class DiffChunker {
      *                                 with its header replayed) still can't fit in one chunk
      */
     public ChunkPlan split(String diff) {
-        return split(diff, 0);
+        return split(diff, 0, 0);
+    }
+
+    /**
+     * Retained for callers that predate Structured Review Output (equivalent to
+     * {@code split(diff, systemPromptTokens, 0)} — {@code maxFilesPerChunk=0} means "unbounded", so v1/v2
+     * chunking stays byte-for-byte unchanged, per §8's backward-compatibility guarantee).
+     *
+     * @throws DiffTooLargeException if bin-packing would need more than {@code gateway.diff.max-chunks}
+     *                                 chunks, or if a single file's diff (even split at hunk boundaries,
+     *                                 with its header replayed) still can't fit in one chunk
+     */
+    public ChunkPlan split(String diff, int systemPromptTokens) {
+        return split(diff, systemPromptTokens, 0);
     }
 
     /**
@@ -86,38 +105,126 @@ public class DiffChunker {
      * size for this Review (0 if Prompt Manager is disabled or produced no sections), subtracted from
      * the per-chunk budget exactly like {@link DiffSizeValidator#budgetTokens(int)}.
      *
+     * <p>Structured Review Output (SRO-14/SRO-66, as amended by the pre-implementation threat model):
+     * {@code maxFilesPerChunk} (0 = unbounded) bounds a chunk's distinct file count, both by rejecting an
+     * unpackable input at the edge ({@link #enforceStructuredCoverageBounds}, before any packing) and by
+     * bounding {@link #binPack}'s per-chunk file count and defeating the single-chunk shortcut when the
+     * whole diff's file count exceeds it. Passed as {@code 0} for every non-structured prompt version, so
+     * v1/v2 chunk boundaries are byte-for-byte unchanged (§8).
+     *
+     * <p><b>F-SRO-03 (appsec SAST fix round, SRO-64d):</b> for a structured prompt version ({@code
+     * maxFilesPerChunk > 0}), the per-chunk budget's answer reserve is {@code gateway.diff.answer-reserve}
+     * — the SAME single value v1/v2 uses (chore/answer-reserve-consolidation: a formerly separate {@code
+     * gateway.structured.answer-reserve} was merged into this one after repeatedly causing exactly the
+     * misconfiguration its own startup check existed to catch) — and the header reserve is the
+     * SRO-64d-computed coverage block reserve ({@link GatewayProperties#coverageReserveTokens} — the exact
+     * formula {@code GatewayProperties.validateStructuredOnStartup} already asserts at boot), not {@code
+     * gateway.diff.chunk-header-reserve-tokens} — including for the single-chunk shortcut, which for a
+     * structured version still renders a coverage block even though {@code chunkCount == 1}. The header
+     * reserve is a no-op for every non-structured prompt version ({@code maxFilesPerChunk <= 0}), so v1/v2
+     * chunk boundaries stay byte-for-byte unchanged (§8).
+     *
      * @throws DiffTooLargeException if bin-packing would need more than {@code gateway.diff.max-chunks}
-     *                                 chunks, or if a single file's diff (even split at hunk boundaries,
-     *                                 with its header replayed) still can't fit in one chunk
+     *                                 chunks, if a single file's diff (even split at hunk boundaries, with
+     *                                 its header replayed) still can't fit in one chunk, or (when
+     *                                 {@code maxFilesPerChunk > 0}) if the coverage-list bounds of
+     *                                 SRO-66b are exceeded
      */
-    public ChunkPlan split(String diff, int systemPromptTokens) {
+    public ChunkPlan split(String diff, int systemPromptTokens, int maxFilesPerChunk) {
         String effectiveDiff = diff == null ? "" : diff;
-        int wholeBudgetTokens = Math.max(1, diffSizeValidator.budgetTokens(systemPromptTokens));
+        boolean structuredVersion = maxFilesPerChunk > 0;
+        int charsPerToken = Math.max(1, properties.getDiff().getCharsPerToken());
+
+        // F-SRO-03: the computed coverage-block header reserve, threaded into the same arithmetic
+        // DiffSizeValidator/binPack already use for v1/v2 -- previously it existed only in
+        // GatewayProperties' startup assertion and was never read here. The answer reserve itself is now
+        // a single gateway.diff.answer-reserve value regardless of prompt version
+        // (chore/answer-reserve-consolidation) -- no branch needed.
+        int answerReserveTokens = properties.getDiff().getAnswerReserve();
+        int headerReserveTokens = structuredVersion
+                ? (int) Math.min(Integer.MAX_VALUE, GatewayProperties.coverageReserveTokens(
+                        maxFilesPerChunk, properties.getStructured().getMaxPathChars(), charsPerToken))
+                : Math.max(0, properties.getDiff().getChunkHeaderReserveTokens());
+
+        int wholeBudgetTokens = Math.max(1, diffSizeValidator.budgetTokens(systemPromptTokens, answerReserveTokens));
         int estimatedWhole = diffSizeValidator.estimateTokens(effectiveDiff);
 
         ParsedDiff parsed = parseSections(effectiveDiff);
 
-        // Single-chunk shortcut (§2): if the whole diff already fits the (un-reduced) per-request
-        // budget, no context header will ever be rendered (ChunkContextRenderer only fires when
-        // chunkCount > 1) -- so use the FULL budget here, not the header-reserved one, and return the
-        // original diff String instance unmodified. This is what guarantees byte-identical behavior
-        // for small MRs (backward compatibility, §8).
-        if (estimatedWhole <= wholeBudgetTokens) {
-            List<String> filePaths = parsed.pathsTrusted() ? collectAllFilePaths(parsed.sections()) : List.of();
-            DiffChunk single = new DiffChunk(0, diff, estimatedWhole, filePaths);
-            return new ChunkPlan(List.of(single), estimatedWhole);
+        // SRO-66b: reject an unpackable/oversized coverage list at the edge, before the single-chunk
+        // shortcut and before any packing -- immediately after parseSections, exactly per §4.3's flow.
+        // A no-op (maxFilesPerChunk <= 0) for every non-structured prompt version.
+        enforceStructuredCoverageBounds(parsed, maxFilesPerChunk);
+
+        // Single-chunk shortcut (§2): if the whole diff already fits the per-request budget, no context
+        // header will ever be rendered (ChunkContextRenderer only fires when chunkCount > 1) -- so a
+        // NON-structured version uses the FULL, un-reserved budget here, returning the original diff
+        // String instance unmodified (byte-identical behavior for small MRs, §8). A STRUCTURED version
+        // (SRO-64d) instead uses the header-reserved budget even for one chunk, because its coverage
+        // block renders regardless of chunkCount. SRO-14: also defeated when a structured maxFilesPerChunk
+        // bound can't accommodate the whole diff's distinct file count in one chunk.
+        List<String> allFilePaths = parsed.pathsTrusted() ? collectAllFilePaths(parsed.sections()) : List.of();
+        boolean singleChunkFileCountFits = maxFilesPerChunk <= 0 || allFilePaths.size() <= maxFilesPerChunk;
+        int singleChunkBudgetTokens = structuredVersion
+                ? Math.max(1, wholeBudgetTokens - headerReserveTokens)
+                : wholeBudgetTokens;
+        if (estimatedWhole <= singleChunkBudgetTokens && singleChunkFileCountFits) {
+            DiffChunk single = new DiffChunk(0, diff, estimatedWhole, allFilePaths);
+            return new ChunkPlan(List.of(single), estimatedWhole, parsed.pathsTrusted());
         }
 
-        int charsPerToken = Math.max(1, properties.getDiff().getCharsPerToken());
-        int headerReserveTokens = Math.max(0, properties.getDiff().getChunkHeaderReserveTokens());
         int perChunkBudgetTokens = Math.max(1, wholeBudgetTokens - headerReserveTokens);
         int perChunkBudgetChars = perChunkBudgetTokens * charsPerToken;
         int maxChunks = Math.max(1, properties.getDiff().getMaxChunks());
 
-        List<DiffChunk> chunks = binPack(parsed.sections(), parsed.pathsTrusted(), perChunkBudgetChars, maxChunks);
+        List<DiffChunk> chunks = binPack(parsed.sections(), parsed.pathsTrusted(), perChunkBudgetChars, maxChunks,
+                maxFilesPerChunk);
 
         int total = chunks.stream().mapToInt(DiffChunk::estimatedTokens).sum();
-        return new ChunkPlan(chunks, total);
+        return new ChunkPlan(chunks, total, parsed.pathsTrusted());
+    }
+
+    /**
+     * SRO-66b (threat model SOT-03/SOR-03, BLOCKING): rejects, with the existing
+     * {@link DiffTooLargeException}/{@code 422 DIFF_TOO_LARGE} (no new error code, no new failure
+     * semantics, no Review/chunk/job created), a structured Review whose coverage list cannot possibly
+     * be packed or is already known-truncated at the source:
+     * <ul>
+     *   <li>a section hit the unconditional {@link GatewayProperties.Diff#getMaxPathsPerSection()} bound
+     *       (SRO-66a) — a truncated per-section path list must never silently become the coverage set;</li>
+     *   <li>a single section's path count alone exceeds {@code maxFilesPerChunk} — no packing decision
+     *       can ever split one section across chunks;</li>
+     *   <li>the diff's total distinct path count exceeds {@code max-chunks * maxFilesPerChunk} — no
+     *       number of chunks could ever accommodate it.</li>
+     * </ul>
+     * A no-op whenever {@code maxFilesPerChunk <= 0} (every non-structured prompt version, SRO-66c) or
+     * {@code !parsed.pathsTrusted()} (the CSR-11 fallback mode extracts no paths at all, so there is
+     * nothing to bound here — {@code POST /reviews}'s separate SRO-16 check is what rejects that case
+     * for a structured version).
+     */
+    private void enforceStructuredCoverageBounds(ParsedDiff parsed, int maxFilesPerChunk) {
+        if (maxFilesPerChunk <= 0 || !parsed.pathsTrusted()) {
+            return;
+        }
+        Set<String> allDistinct = new LinkedHashSet<>();
+        for (Section section : parsed.sections()) {
+            if (section.pathExtractionTruncated()) {
+                throw new DiffTooLargeException("A diff section's file-path header lines exceeded "
+                        + "gateway.diff.max-paths-per-section=" + properties.getDiff().getMaxPathsPerSection()
+                        + " while extracting the structured-output coverage list");
+            }
+            if (section.filePaths().size() > maxFilesPerChunk) {
+                throw new DiffTooLargeException("A single file section's path count exceeds "
+                        + "gateway.structured.max-files-per-chunk=" + maxFilesPerChunk
+                        + "; it can never be packed into one structured-output chunk");
+            }
+            allDistinct.addAll(section.filePaths());
+        }
+        long ceiling = (long) Math.max(1, properties.getDiff().getMaxChunks()) * maxFilesPerChunk;
+        if (allDistinct.size() > ceiling) {
+            throw new DiffTooLargeException("Diff has " + allDistinct.size() + " distinct file paths, exceeding "
+                    + "gateway.diff.max-chunks * gateway.structured.max-files-per-chunk=" + ceiling);
+        }
     }
 
     // ---- bin-packing (next-fit, original file order preserved) ----
@@ -134,7 +241,8 @@ public class DiffChunker {
      * allocation to at most {@code maxChunks} materialized pieces (worst case, a few hundred KB) plus
      * the one in-flight piece being built when the limit is hit.
      */
-    private List<DiffChunk> binPack(List<Section> sections, boolean pathsTrusted, int perChunkBudgetChars, int maxChunks) {
+    private List<DiffChunk> binPack(List<Section> sections, boolean pathsTrusted, int perChunkBudgetChars,
+                                     int maxChunks, int maxFilesPerChunk) {
         List<DiffChunk> result = new ArrayList<>();
         StringBuilder currentText = new StringBuilder();
         Set<String> currentPaths = new LinkedHashSet<>();
@@ -156,7 +264,12 @@ public class DiffChunker {
                 continue;
             }
 
-            if (currentChars > 0 && currentChars + sectionChars > perChunkBudgetChars) {
+            // SRO-14: bound a chunk's distinct file count exactly like its char budget -- a no-op
+            // (wouldExceedFileCount always false) when maxFilesPerChunk <= 0, so v1/v2 packing decisions
+            // are byte-for-byte unchanged (§8).
+            boolean wouldExceedFileCount = pathsTrusted && maxFilesPerChunk > 0
+                    && exceedsFileCountBound(currentPaths, section.filePaths(), maxFilesPerChunk);
+            if (currentChars > 0 && (currentChars + sectionChars > perChunkBudgetChars || wouldExceedFileCount)) {
                 emitChunk(result, chunkIndex, maxChunks, currentText.toString(), currentPaths);
                 currentText = new StringBuilder();
                 currentPaths = new LinkedHashSet<>();
@@ -173,6 +286,13 @@ public class DiffChunker {
             emitChunk(result, chunkIndex, maxChunks, currentText.toString(), currentPaths);
         }
         return result;
+    }
+
+    /** @return whether adding {@code incoming} to {@code current} would push the union past {@code maxFilesPerChunk}. */
+    private boolean exceedsFileCountBound(Set<String> current, List<String> incoming, int maxFilesPerChunk) {
+        Set<String> union = new LinkedHashSet<>(current);
+        union.addAll(incoming);
+        return union.size() > maxFilesPerChunk;
     }
 
     /**
@@ -263,35 +383,36 @@ public class DiffChunker {
      * yields nothing, the whole input is one indivisible section.
      */
     private ParsedDiff parseSections(String diff) {
-        List<Section> gitSections = scanByDelimiter(diff, "diff --git ", true);
+        int maxPathsPerSection = Math.max(0, properties.getDiff().getMaxPathsPerSection());
+        List<Section> gitSections = scanByDelimiter(diff, "diff --git ", true, maxPathsPerSection);
         if (!gitSections.isEmpty()) {
             return new ParsedDiff(gitSections, true);
         }
-        List<Section> dashSections = scanByDelimiter(diff, "--- ", false);
+        List<Section> dashSections = scanByDelimiter(diff, "--- ", false, maxPathsPerSection);
         if (!dashSections.isEmpty()) {
             return new ParsedDiff(dashSections, false);
         }
-        Section whole = new Section();
+        Section whole = new Section(maxPathsPerSection);
         forEachLine(diff, line -> whole.addLine(line, false));
         return new ParsedDiff(List.of(whole), false);
     }
 
-    private List<Section> scanByDelimiter(String diff, String delimiterPrefix, boolean extractPaths) {
+    private List<Section> scanByDelimiter(String diff, String delimiterPrefix, boolean extractPaths, int maxPathsPerSection) {
         List<Section> sections = new ArrayList<>();
-        Section preamble = new Section();
+        Section preamble = new Section(maxPathsPerSection);
         Section[] current = {null};
 
         forEachLine(diff, line -> {
             if (line.startsWith(delimiterPrefix)) {
                 if (current[0] == null) {
-                    Section first = new Section();
+                    Section first = new Section(maxPathsPerSection);
                     for (String preambleLine : preamble.lines()) {
                         first.addLine(preambleLine, false);
                     }
                     current[0] = first;
                 } else {
                     sections.add(current[0]);
-                    current[0] = new Section();
+                    current[0] = new Section(maxPathsPerSection);
                 }
                 current[0].addLine(line, extractPaths);
             } else if (current[0] != null) {
@@ -351,7 +472,19 @@ public class DiffChunker {
         private final List<String> lines = new ArrayList<>();
         private int firstHunkLineIndex = -1;
         private final List<String> filePaths = new ArrayList<>();
+        /**
+         * SRO-66a (unconditional, all prompt versions): the maximum number of distinct paths this
+         * section will ever accumulate into {@link #filePaths}. {@link #pathLinesSeen} keeps counting
+         * past this bound, so a caller can still tell a truncated extraction apart from a section that
+         * genuinely had few paths.
+         */
+        private final int maxPathsPerSection;
+        private int pathLinesSeen;
         private String cachedText;
+
+        Section(int maxPathsPerSection) {
+            this.maxPathsPerSection = Math.max(0, maxPathsPerSection);
+        }
 
         void addLine(String line, boolean extractPaths) {
             if (firstHunkLineIndex < 0 && line.startsWith("@@")) {
@@ -431,7 +564,11 @@ public class DiffChunker {
                 String rest = line.substring("diff --git ".length());
                 int bIdx = rest.lastIndexOf(" b/");
                 if (bIdx >= 0) {
-                    addPath(rest.substring(bIdx + 3));
+                    // F-SRO-02: trim() for parity with the "+++ "/"--- " branches below -- without it, a
+                    // path with incidental leading/trailing whitespace survives into filePaths as a
+                    // distinct raw entry, and TextSanitizer.sanitizePath's own trim() then collapses it
+                    // with the untrimmed sibling, producing a post-sanitization duplicate.
+                    addPath(rest.substring(bIdx + 3).trim());
                     return;
                 }
             }
@@ -450,10 +587,26 @@ public class DiffChunker {
             }
         }
 
+        /**
+         * SRO-66a: counts every non-blank path line seen ({@link #pathLinesSeen}) regardless of the cap,
+         * but only accumulates into {@link #filePaths} (deduped) up to {@link #maxPathsPerSection} — this
+         * bounds peak memory for a crafted section with many header lines (the F-DC-01-shaped
+         * amplification SOT-03 identified) while keeping the true count available to
+         * {@link #pathExtractionTruncated()}.
+         */
         private void addPath(String path) {
-            if (path != null && !path.isBlank() && !filePaths.contains(path)) {
+            if (path == null || path.isBlank()) {
+                return;
+            }
+            pathLinesSeen++;
+            if (filePaths.size() < maxPathsPerSection && !filePaths.contains(path)) {
                 filePaths.add(path);
             }
+        }
+
+        /** @return whether path extraction hit {@link #maxPathsPerSection} before this section ended. */
+        boolean pathExtractionTruncated() {
+            return pathLinesSeen > maxPathsPerSection;
         }
     }
 }

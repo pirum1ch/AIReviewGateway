@@ -89,7 +89,8 @@ class ReviewServiceAdditionalTest {
         reviewService = new ReviewService(reviewRepository, reviewInputRepository, reviewChunkRepository,
                 reviewJobRepository, reviewCommentRepository, reviewPromptSectionRepository, deduplicationService,
                 diffSizeValidator, diffChunker, chunkContextRenderer, promptManager, eventService, stateMachine,
-                jobStateMachine, entityManager, transactionManager);
+                jobStateMachine, new StructuredPathValidator(), new com.review.gateway.config.GatewayProperties(),
+                entityManager, transactionManager);
     }
 
     @ParameterizedTest

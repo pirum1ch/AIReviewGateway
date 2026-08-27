@@ -1,0 +1,51 @@
+{
+  "type" : "object",
+  "additionalProperties" : false,
+  "required" : [ "files", "summary" ],
+  "properties" : {
+    "files" : {
+      "type" : "object",
+      "additionalProperties" : false,
+      "required" : [ "src/main/java/com/example/Service.java" ],
+      "properties" : {
+        "src/main/java/com/example/Service.java" : {
+          "type" : "object",
+          "additionalProperties" : false,
+          "required" : [ "findings", "summary" ],
+          "properties" : {
+            "findings" : {
+              "type" : "array",
+              "maxItems" : 20,
+              "items" : {
+                "type" : "object",
+                "additionalProperties" : false,
+                "required" : [ "line", "severity", "comment", "suggestion" ],
+                "properties" : {
+                  "line" : {
+                    "type" : "integer"
+                  },
+                  "severity" : {
+                    "type" : "string",
+                    "enum" : [ "critical", "major", "minor", "info" ]
+                  },
+                  "comment" : {
+                    "type" : "string"
+                  },
+                  "suggestion" : {
+                    "type" : "string"
+                  }
+                }
+              }
+            },
+            "summary" : {
+              "type" : "string"
+            }
+          }
+        }
+      }
+    },
+    "summary" : {
+      "type" : "string"
+    }
+  }
+}

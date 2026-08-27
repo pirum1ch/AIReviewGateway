@@ -18,22 +18,34 @@ import java.util.List;
  * know about yet must not fail deserialization — forward compatibility is a stated contract here, not
  * an accident of Jackson defaults (the llama DTOs already have this annotation; this one and {@link
  * ClaimResponse} previously did not).
+ *
+ * <p>Structured Review Output (SRO-12): {@code responseFormat}/{@code jsonSchema} are the Gateway-
+ * computed decoder constraint, forwarded <b>verbatim</b> to llama-server — the Worker never parses file
+ * paths out of either, never builds a coverage list, and never decides which one (if either) is set;
+ * it only re-checks the SRO-13 mutual-exclusivity bound defensively (see {@code LlamaClient}/{@code
+ * WorkerLoop}). Field-level compatibility only (SRO-12): an old Worker against a new Gateway ignores
+ * both (this annotation) and runs exactly as today; a new Worker against an old Gateway sees
+ * {@code null}/{@code null}. This is <b>not</b> {@code promptVersion} compatibility — an old Worker
+ * still cannot serve a {@code v3} job at all, absent {@code v3.yml} on its classpath.
  */
 @JsonIgnoreProperties(ignoreUnknown = true)
-public record JobPayload(String diff, String promptVersion, String chunkContext, List<String> systemMessages) {
+public record JobPayload(String diff, String promptVersion, String chunkContext, List<String> systemMessages,
+                          String responseFormat, String jsonSchema) {
 
     /**
-     * FW-05/WSR-10/PMR-25 hardening: the default record {@code toString()} would dump the full
-     * (proprietary) diff, chunk-context, and now system-prompt text into any accidental {@code
-     * log.debug("{}", job)}/exception-message rendering. This does not affect JSON (de)serialization,
-     * which Jackson performs via the accessors/canonical constructor, not {@code toString()}.
+     * FW-05/WSR-10/PMR-25/SRO-07 hardening: the default record {@code toString()} would dump the full
+     * (proprietary) diff, chunk-context, system-prompt text, and now the decoder-constraint schema
+     * (MR-author-controlled file paths) into any accidental {@code log.debug("{}", job)}/exception-
+     * message rendering. This does not affect JSON (de)serialization, which Jackson performs via the
+     * accessors/canonical constructor, not {@code toString()}.
      */
     @Override
     public String toString() {
         int diffChars = diff == null ? 0 : diff.length();
         int contextChars = chunkContext == null ? 0 : chunkContext.length();
         return "JobPayload[diff=<masked, " + diffChars + " chars>, promptVersion=" + promptVersion
-                + ", chunkContext=<masked, " + contextChars + " chars>, systemMessages=" + maskSystemMessages() + "]";
+                + ", chunkContext=<masked, " + contextChars + " chars>, systemMessages=" + maskSystemMessages()
+                + ", responseFormat=" + maskNullable(responseFormat) + ", jsonSchema=" + maskNullable(jsonSchema) + "]";
     }
 
     private String maskSystemMessages() {
@@ -42,5 +54,9 @@ public record JobPayload(String diff, String promptVersion, String chunkContext,
         }
         int totalChars = systemMessages.stream().mapToInt(m -> m == null ? 0 : m.length()).sum();
         return "<masked, " + systemMessages.size() + " msg, " + totalChars + " chars>";
+    }
+
+    private String maskNullable(String value) {
+        return value == null ? "null" : "<masked, " + value.length() + " chars>";
     }
 }

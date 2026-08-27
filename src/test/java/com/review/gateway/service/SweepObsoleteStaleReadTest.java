@@ -91,7 +91,7 @@ class SweepObsoleteStaleReadTest extends AbstractPostgresIntegrationTest {
         return new ReviewService(reviewRepository, reviewInputRepository, reviewChunkRepository,
                 reviewJobRepository, reviewCommentRepository, reviewPromptSectionRepository, deduplicationService,
                 diffSizeValidator, diffChunker, chunkContextRenderer, promptManager, eventService, stateMachine,
-                jobStateMachine, entityManager, transactionManager);
+                jobStateMachine, new StructuredPathValidator(), properties, entityManager, transactionManager);
     }
 
     @Test

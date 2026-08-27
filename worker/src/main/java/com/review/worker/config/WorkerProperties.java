@@ -139,6 +139,7 @@ public class WorkerProperties {
         requirePositive("worker.limits.maxDiffBytes", worker.getLimits().getMaxDiffBytes());
         requirePositive("worker.limits.maxResponseBytes", worker.getLimits().getMaxResponseBytes());
         requirePositive("worker.limits.maxSystemMessages", worker.getLimits().getMaxSystemMessages());
+        requirePositive("worker.limits.maxConstraintBytes", worker.getLimits().getMaxConstraintBytes());
         if (worker.getLog().getIdleSummaryIntervalSec() < 0) {
             throw new IllegalStateException("worker.log.idleSummaryIntervalSec must be >= 0 (0 disables it) — refusing to start");
         }
@@ -416,6 +417,18 @@ public class WorkerProperties {
              * {@link #maxDiffBytes} for the total-size check (diff + chunkContext + systemMessages).
              */
             private int maxSystemMessages = 8;
+            /**
+             * Structured Review Output (SRO-13, threat model SOR-06 CRITICAL): independent Worker-side
+             * bound on the Gateway-supplied {@code responseFormat}/{@code jsonSchema} text, measured on
+             * <b>UTF-8 bytes of the raw text before {@code readTree}</b> — never {@code String.length()},
+             * never post-parse. Deliberately set above {@code gateway.structured.max-schema-bytes}
+             * (65536) by at least the largest wire wrapper (~70 bytes for
+             * {@code RESPONSE_FORMAT_JSON_SCHEMA}'s {@code {"type":"json_schema","json_schema":{"name":
+             * "code_review","strict":true,"schema":...}}} envelope) — the two bounds measure different
+             * quantities, and setting them equal would produce a fleet-wide {@code CONSTRAINT_INVALID}
+             * loop at the top of the range.
+             */
+            private long maxConstraintBytes = 69_632L;
 
             public long getMaxDiffBytes() {
                 return maxDiffBytes;
@@ -439,6 +452,14 @@ public class WorkerProperties {
 
             public void setMaxSystemMessages(int maxSystemMessages) {
                 this.maxSystemMessages = maxSystemMessages;
+            }
+
+            public long getMaxConstraintBytes() {
+                return maxConstraintBytes;
+            }
+
+            public void setMaxConstraintBytes(long maxConstraintBytes) {
+                this.maxConstraintBytes = maxConstraintBytes;
             }
         }
     }
@@ -466,6 +487,20 @@ public class WorkerProperties {
         private int maxTokens = 4096;
         /** WSR-06: suppresses the non-loopback warning for an intentional non-loopback deployment. */
         private boolean allowNonLoopback = false;
+        /**
+         * {@code true} (default) sends no {@code chat_template_kwargs} at all -- byte-identical to every
+         * existing request, no behavior change without an explicit operator opt-in. {@code false} sends
+         * {@code chat_template_kwargs: {"enable_thinking": false}} on every request, unconditionally
+         * suppressing a reasoning model's hidden "thinking" pass (a Qwen3-family build otherwise spends
+         * part of {@code max_tokens} on a hidden {@code reasoning_content} block before the actual answer,
+         * which can exhaust the whole budget on a large diff and leave {@code message.content} empty --
+         * surfaces as {@code LLM_EMPTY_RESPONSE} even though the backend is healthy). Prefer tuning
+         * {@code reasoning_effort} via the backend's own {@code --chat-template-kwargs} startup flag
+         * first (bounds thinking without removing it); this flag is the blunt, always-off fallback for a
+         * backend where that isn't available. llama-server ignores the field for chat templates that
+         * don't support it.
+         */
+        private boolean enableThinking = true;
 
         public String getUrl() {
             return url;
@@ -505,6 +540,14 @@ public class WorkerProperties {
 
         public void setAllowNonLoopback(boolean allowNonLoopback) {
             this.allowNonLoopback = allowNonLoopback;
+        }
+
+        public boolean isEnableThinking() {
+            return enableThinking;
+        }
+
+        public void setEnableThinking(boolean enableThinking) {
+            this.enableThinking = enableThinking;
         }
     }
 

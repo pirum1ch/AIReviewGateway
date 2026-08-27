@@ -19,5 +19,10 @@ public record MetricsResponse(
         long promptDisabledCount,
         long promptSectionMissingCount,
         Map<String, Long> ownershipMismatches,
-        long workerFailureReportsIgnored) {
+        long workerFailureReportsIgnored,
+        long legacyParseFallback,
+        Map<String, Long> structuredValidationFailures,
+        Map<String, Long> structuredConstraintSent,
+        long structuredFallbackUsed,
+        Map<String, Long> structuredFieldTruncated) {
 }

@@ -19,6 +19,18 @@ public enum JobFailureReason {
     LLM_RESPONSE_TOO_LARGE,
     PROMPT_INVALID,
     WORKER_ERROR,
+    /** Structured Review Output (SRO-13): the Worker's own defensive decoder-constraint re-check failed. */
+    CONSTRAINT_INVALID,
+    /**
+     * Structured Output Grammar Budget (SGB-06, threat model SOGT-03/SOGB-05..08): llama-server rejected
+     * the decoder-constraint grammar at compile time (a fixed, backend-controlled error-body token match,
+     * never the raw text itself — {@code WorkerLoop.DETAIL_BY_REASON} carries a Worker-side-constant
+     * sentence for this reason, same as every other value here). Audit-only, exactly like every other
+     * {@code JobFailureReason}: {@code RetryManager}'s requeue-vs-fail decision never depends on it
+     * (WOC-24) — see {@code docs/security/feature-structured-output-grammar-budget-sast-report.md} once
+     * filed.
+     */
+    CONSTRAINT_REJECTED,
     /** Not a wire value — the safe fallback for anything unrecognized. */
     UNKNOWN;
 

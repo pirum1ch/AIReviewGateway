@@ -140,7 +140,7 @@ class ReviewServicePromptManagerIntegrationTest extends AbstractPostgresIntegrat
         return new ReviewService(reviewRepository, reviewInputRepository, reviewChunkRepository,
                 reviewJobRepository, reviewCommentRepository, reviewPromptSectionRepository, deduplicationService,
                 diffSizeValidator, diffChunker, chunkContextRenderer, promptManager, eventService, stateMachine,
-                jobStateMachine, entityManager, transactionManager);
+                jobStateMachine, new StructuredPathValidator(), properties, entityManager, transactionManager);
     }
 
     private QueueManager newQueueManager(GatewayProperties properties) {
@@ -159,7 +159,8 @@ class ReviewServicePromptManagerIntegrationTest extends AbstractPostgresIntegrat
         return new QueueManager(reviewRepository, reviewJobRepository, reviewChunkRepository,
                 reviewPromptSectionRepository, backendDispatcher, jobStateMachine, chunkCoordinator, eventService,
                 Mockito.mock(ResultProcessor.class), chunkContextRenderer, promptMessageFormatter, retryManager,
-                new TextSanitizer(), new MetricsCounters(), entityManager, transactionManager);
+                new TextSanitizer(), new MetricsCounters(), new ReviewSchemaBuilder(), new DecoderConstraintRenderer(),
+                properties, entityManager, transactionManager);
     }
 
     private Backend persistBackend(String name, String promptMessageFormat) {

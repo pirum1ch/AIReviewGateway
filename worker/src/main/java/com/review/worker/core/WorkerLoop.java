@@ -10,6 +10,8 @@ import com.review.worker.gateway.ResultOutcome;
 import com.review.worker.gateway.dto.ClaimResponse;
 import com.review.worker.gateway.dto.FailRequest;
 import com.review.worker.gateway.dto.ResultRequest;
+import com.review.worker.llama.DecoderConstraint;
+import com.review.worker.llama.DecoderConstraintResolver;
 import com.review.worker.llama.LlamaClient;
 import com.review.worker.metrics.WorkerMetrics;
 import com.review.worker.prompt.PromptTemplateService;
@@ -63,12 +65,20 @@ public class WorkerLoop {
         map.put(JobFailureReason.PROMPT_INVALID, "prompt resolution failed (invalid promptVersion, oversized "
                 + "diff, or missing template)");
         map.put(JobFailureReason.WORKER_ERROR, "unclassified worker-side failure");
+        map.put(JobFailureReason.CONSTRAINT_INVALID, "Gateway-supplied decoder constraint failed the "
+                + "Worker's defensive re-check (both fields set, oversized, invalid JSON, or not an object)");
+        // SGB-06/SOGB-07 (Structured Output Grammar Budget): a fixed, Worker-side-constant sentence --
+        // never the backend's actual error body text, which is scanned for a token match and then
+        // discarded (LlamaClient never returns/logs/stores it).
+        map.put(JobFailureReason.CONSTRAINT_REJECTED, "llama-server refused the decoder-constraint grammar "
+                + "(compile-time rejection)");
         return map;
     }
 
     private final GatewayClient gatewayClient;
     private final LlamaClient llamaClient;
     private final PromptTemplateService promptTemplateService;
+    private final DecoderConstraintResolver decoderConstraintResolver;
     private final HeartbeatScheduler heartbeatScheduler;
     private final WorkerMetrics metrics;
     private final WorkerProperties properties;
@@ -90,12 +100,14 @@ public class WorkerLoop {
     public WorkerLoop(GatewayClient gatewayClient,
                        LlamaClient llamaClient,
                        PromptTemplateService promptTemplateService,
+                       DecoderConstraintResolver decoderConstraintResolver,
                        HeartbeatScheduler heartbeatScheduler,
                        WorkerMetrics metrics,
                        WorkerProperties properties) {
         this.gatewayClient = gatewayClient;
         this.llamaClient = llamaClient;
         this.promptTemplateService = promptTemplateService;
+        this.decoderConstraintResolver = decoderConstraintResolver;
         this.heartbeatScheduler = heartbeatScheduler;
         this.metrics = metrics;
         this.properties = properties;
@@ -246,10 +258,16 @@ public class WorkerLoop {
         try {
             ResolvedPrompt prompt = promptTemplateService.resolve(job.payload().promptVersion(),
                     job.payload().diff(), job.payload().chunkContext(), job.payload().systemMessages());
+            // Structured Review Output (SRO-13): resolved directly from the claim payload, never through
+            // PromptTemplateService/substitute() (SOR-07) -- the constraint is transport, not template
+            // input. Resolved before the heartbeat starts, same as prompt resolution above, so an invalid
+            // constraint never wastes a heartbeat cycle.
+            DecoderConstraint constraint = decoderConstraintResolver.resolve(
+                    job.payload().responseFormat(), job.payload().jsonSchema());
 
             heartbeatScheduler.start(job.jobId(), workerId, abortSignal);
             try {
-                runInference(job, workerId, prompt, abortSignal);
+                runInference(job, workerId, prompt, constraint, abortSignal);
             } finally {
                 heartbeatScheduler.stop();
             }
@@ -308,7 +326,8 @@ public class WorkerLoop {
         }
     }
 
-    private void runInference(ClaimResponse job, String workerId, ResolvedPrompt prompt, AbortSignal abortSignal) {
+    private void runInference(ClaimResponse job, String workerId, ResolvedPrompt prompt, DecoderConstraint constraint,
+                               AbortSignal abortSignal) {
         // WOC-03/WOR-17: sizes/counts only, never the raw systemMessages/messages content -- closes the
         // gap between "Job claimed" and the first heartbeat tick (up to 60s of silence today).
         int diffChars = job.payload().diff() == null ? 0 : job.payload().diff().length();
@@ -317,7 +336,7 @@ public class WorkerLoop {
                 job.jobId(), job.reviewId(), diffChars, systemMessageCount, prompt.model(), prompt.maxTokens());
 
         LlamaClient.AsyncCompletion call = llamaClient.startChatCompletion(
-                prompt.messages(), prompt.model(), prompt.temperature(), prompt.maxTokens());
+                prompt.messages(), prompt.model(), prompt.temperature(), prompt.maxTokens(), constraint);
         abortSignal.attach(call.future());
 
         HttpResponse<InputStream> httpResponse = awaitLlamaResponse(call, abortSignal);
@@ -407,7 +426,7 @@ public class WorkerLoop {
      */
     private RedeliveryOutcome submitResultWithRedelivery(long jobId, String workerId, LlamaResult result) {
         ResultRequest request = new ResultRequest(workerId, result.rawResponse(), result.promptTokens(),
-                result.completionTokens(), result.durationMs(), result.model());
+                result.completionTokens(), result.durationMs(), result.model(), result.finishReason());
         long backoffMs = 0;
         while (true) {
             try {

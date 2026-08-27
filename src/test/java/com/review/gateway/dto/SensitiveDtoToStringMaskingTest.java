@@ -27,10 +27,11 @@ class SensitiveDtoToStringMaskingTest {
     private static final String SECRET_CHUNK_CONTEXT = "part 2 of 6\nSECRET-FILE-PATH-CONTENT.java";
     private static final String SECRET_SYSTEM_MESSAGE_1 = "SECRET-CORPORATE-RULEBOOK-CONTENT";
     private static final String SECRET_SYSTEM_MESSAGE_2 = "SECRET-PROJECT-ARCHITECTURE-CONTENT";
+    private static final String SECRET_SCHEMA = "{\"required\":[\"src/SECRET-PATH.java\"]}";
 
     @Test
     void jobPayloadToStringNeverContainsTheRawDiffOrChunkContext() {
-        JobPayload payload = new JobPayload(SECRET_DIFF, "v2", SECRET_CHUNK_CONTEXT, null);
+        JobPayload payload = new JobPayload(SECRET_DIFF, "v2", SECRET_CHUNK_CONTEXT, null, null, null);
 
         String rendered = payload.toString();
 
@@ -46,7 +47,7 @@ class SensitiveDtoToStringMaskingTest {
 
     @Test
     void jobPayloadAccessorsStillReturnFullContentUnmasked() {
-        JobPayload payload = new JobPayload(SECRET_DIFF, "v2", SECRET_CHUNK_CONTEXT, null);
+        JobPayload payload = new JobPayload(SECRET_DIFF, "v2", SECRET_CHUNK_CONTEXT, null, null, null);
 
         assertThat(payload.diff()).isEqualTo(SECRET_DIFF);
         assertThat(payload.chunkContext()).isEqualTo(SECRET_CHUNK_CONTEXT);
@@ -54,7 +55,7 @@ class SensitiveDtoToStringMaskingTest {
 
     @Test
     void jobPayloadToStringHandlesNullChunkContextGracefully() {
-        JobPayload payload = new JobPayload(SECRET_DIFF, "v1", null, null);
+        JobPayload payload = new JobPayload(SECRET_DIFF, "v1", null, null, null, null);
 
         assertThat(payload.toString()).contains("chunkContext=<masked, 0 chars>");
     }
@@ -62,7 +63,7 @@ class SensitiveDtoToStringMaskingTest {
     @Test
     void jobPayloadToStringNeverContainsRawSystemMessages() {
         JobPayload payload = new JobPayload(SECRET_DIFF, "v2", null,
-                List.of(SECRET_SYSTEM_MESSAGE_1, SECRET_SYSTEM_MESSAGE_2));
+                List.of(SECRET_SYSTEM_MESSAGE_1, SECRET_SYSTEM_MESSAGE_2), null, null);
 
         String rendered = payload.toString();
 
@@ -75,8 +76,8 @@ class SensitiveDtoToStringMaskingTest {
     @Test
     void jobPayloadToStringDistinguishesNullFromEmptySystemMessages() {
         // PMR-24: null (legacy/kill-switch-off) vs empty list must render distinguishably.
-        JobPayload nullMessages = new JobPayload(SECRET_DIFF, "v1", null, null);
-        JobPayload emptyMessages = new JobPayload(SECRET_DIFF, "v1", null, List.of());
+        JobPayload nullMessages = new JobPayload(SECRET_DIFF, "v1", null, null, null, null);
+        JobPayload emptyMessages = new JobPayload(SECRET_DIFF, "v1", null, List.of(), null, null);
 
         assertThat(nullMessages.toString()).contains("systemMessages=null");
         assertThat(emptyMessages.toString()).contains("systemMessages=<masked, 0 msg, 0 chars>");
@@ -85,14 +86,47 @@ class SensitiveDtoToStringMaskingTest {
     @Test
     void jobPayloadAccessorStillReturnsSystemMessagesUnmasked() {
         List<String> messages = List.of(SECRET_SYSTEM_MESSAGE_1, SECRET_SYSTEM_MESSAGE_2);
-        JobPayload payload = new JobPayload(SECRET_DIFF, "v2", null, messages);
+        JobPayload payload = new JobPayload(SECRET_DIFF, "v2", null, messages, null, null);
 
         assertThat(payload.systemMessages()).isEqualTo(messages);
     }
 
+    // ---- Structured Review Output (SRO-10/SRO-11): responseFormat/jsonSchema masking ----
+
+    @Test
+    void jobPayloadToStringNeverContainsTheRawResponseFormatOrJsonSchema() {
+        JobPayload responseFormatSet = new JobPayload(SECRET_DIFF, "v3", null, null, SECRET_SCHEMA, null);
+        JobPayload jsonSchemaSet = new JobPayload(SECRET_DIFF, "v3", null, null, null, SECRET_SCHEMA);
+
+        assertThat(responseFormatSet.toString()).doesNotContain("SECRET-PATH");
+        assertThat(responseFormatSet.toString()).contains("responseFormat=<masked, " + SECRET_SCHEMA.length() + " chars>");
+        assertThat(responseFormatSet.toString()).contains("jsonSchema=null");
+        assertThat(jsonSchemaSet.toString()).doesNotContain("SECRET-PATH");
+        assertThat(jsonSchemaSet.toString()).contains("jsonSchema=<masked, " + SECRET_SCHEMA.length() + " chars>");
+        assertThat(jsonSchemaSet.toString()).contains("responseFormat=null");
+    }
+
+    @Test
+    void jobPayloadAccessorsStillReturnResponseFormatAndJsonSchemaUnmasked() {
+        JobPayload payload = new JobPayload(SECRET_DIFF, "v3", null, null, SECRET_SCHEMA, null);
+
+        assertThat(payload.responseFormat()).isEqualTo(SECRET_SCHEMA);
+        assertThat(payload.jsonSchema()).isNull();
+    }
+
+    @Test
+    void claimedJobToStringNeverContainsTheRawResponseFormatOrJsonSchema() {
+        ClaimedJob claimedJob = new ClaimedJob(10L, 20L, SECRET_DIFF, "v3", null, null, null, SECRET_SCHEMA);
+
+        String rendered = claimedJob.toString();
+
+        assertThat(rendered).doesNotContain("SECRET-PATH");
+        assertThat(rendered).contains("jsonSchema=<masked, " + SECRET_SCHEMA.length() + " chars>");
+    }
+
     @Test
     void claimedJobToStringNeverContainsTheRawDiffOrChunkContext() {
-        ClaimedJob claimedJob = new ClaimedJob(10L, 20L, SECRET_DIFF, "v2", SECRET_CHUNK_CONTEXT, null);
+        ClaimedJob claimedJob = new ClaimedJob(10L, 20L, SECRET_DIFF, "v2", SECRET_CHUNK_CONTEXT, null, null, null);
 
         String rendered = claimedJob.toString();
 
@@ -105,7 +139,7 @@ class SensitiveDtoToStringMaskingTest {
 
     @Test
     void claimedJobAccessorsStillReturnFullContentUnmasked() {
-        ClaimedJob claimedJob = new ClaimedJob(10L, 20L, SECRET_DIFF, "v2", SECRET_CHUNK_CONTEXT, null);
+        ClaimedJob claimedJob = new ClaimedJob(10L, 20L, SECRET_DIFF, "v2", SECRET_CHUNK_CONTEXT, null, null, null);
 
         assertThat(claimedJob.diff()).isEqualTo(SECRET_DIFF);
         assertThat(claimedJob.chunkContext()).isEqualTo(SECRET_CHUNK_CONTEXT);
@@ -114,7 +148,7 @@ class SensitiveDtoToStringMaskingTest {
     @Test
     void claimedJobToStringNeverContainsRawSystemMessages() {
         ClaimedJob claimedJob = new ClaimedJob(10L, 20L, SECRET_DIFF, "v2", null,
-                List.of(SECRET_SYSTEM_MESSAGE_1, SECRET_SYSTEM_MESSAGE_2));
+                List.of(SECRET_SYSTEM_MESSAGE_1, SECRET_SYSTEM_MESSAGE_2), null, null);
 
         String rendered = claimedJob.toString();
 

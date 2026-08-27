@@ -70,6 +70,11 @@ GitLab CI job  ──POST /reviews──▶  Review Gateway  ──▶  PostgreS
   per-project architecture/code-style rules from the reviewed project itself (or an operator-configured
   override repo) — see [§4.4](#44-prompt-manager-v3-optional) and
   [§6.1b](#61b-prompt-manager-and-system-prompt-assembly).
+- **Structured Review Output (V5, `promptVersion: v3`)** gives the model a Gateway-computed per-file
+  coverage list and, on a capable backend, a decoder-level JSON Schema constraint — every file listed
+  must appear in the response or the job is retried/failed rather than silently missing coverage. `v3`
+  is opt-in per Review and not allowlisted by default — see [§4.5](#45-structured-review-output-v5-optional)
+  and [§6.1c](#61c-structured-review-output-and-response-validation).
 
 Target scale (per the requirements document): **20–30 merge requests/day**, long-running LLM tasks (up
 to tens of minutes), and **1–10** backend servers, each typically paired with one Worker on its own host
@@ -176,6 +181,8 @@ kill-switch at its default, this token is never required and `validatePromptOnSt
 | `gateway.backend.defer-demotion-while-busy` | `true` | A failed probe does not demote a backend that is at capacity with at least one `RUNNING` job whose heartbeat is still fresh (dispatch-neutral: an at-capacity backend is already unclaimable). |
 | `gateway.backend.defer-demotion-max` | `45m` | Upper bound on how long the deferral above may postpone a demotion; past it, demotion proceeds regardless of capacity/heartbeat freshness. |
 | `worker.log.idle-summary-interval-sec` (`WORKER_IDLE_SUMMARY_INTERVAL_SEC`, **Worker module**) | `300` | At most one INFO idle-liveness summary line per this many seconds while a Worker finds no job to claim; `0` disables it. See [§9](#9-worker-protocol). |
+| `gateway.diff.max-paths-per-section` | `64` | **Structured Review Output (V5).** Unconditional (every `promptVersion`) memory-safety bound on the number of distinct file paths `DiffChunker` extracts from **one** `diff --git` section, regardless of whether that section is ever used for coverage — never fires on real `git diff` output (one section = one file); only reachable via a crafted diff. |
+| `gateway.review.allowed-prompt-versions` (`ALLOWED_PROMPT_VERSIONS`) | `v1,v2` | **Structured Review Output (V5, threat model SOR-08, CRITICAL).** Allowlist of `promptVersion` values accepted at `POST /reviews`; any other value is rejected immediately with `422 STRUCTURED_OUTPUT_UNSUPPORTED` (see [§6.1](#61-post-reviews--create-a-review)) — checked before any other work, including the cheap diff-size guard. `v3` is deliberately **absent** from the shipped default: an operator adds it explicitly, only after every Worker in the fleet already serves `v3.yml` (see [§4.5](#45-structured-review-output-v5-optional)). |
 
 ### 4.3 Deployment must-dos (from `docs/security/feature-03-sast-report.md`)
 
@@ -226,6 +233,73 @@ see [§6.1b](#61b-prompt-manager-and-system-prompt-assembly) for the full model.
 | `gateway.prompt.limits.max-system-prompt-tokens` | — | `6000` | Aggregate cap over all assembled sections; exceeding it is `422 PROMPT_TOO_LARGE`, distinct from `DIFF_TOO_LARGE`. Subtracted from the diff's own token budget dynamically, per Review — `gateway.diff.prompt-reserve` no longer covers the whole system prompt, only the Worker's fixed `user`-template wrapper text. |
 | `gateway.prompt.limits.max-file-bytes` | — | `262144` | Per-file streaming read bound (enforced while reading, not after buffering). |
 | `gateway.prompt.total-timeout` | — | `20s` | Wall-clock deadline across all GitLab calls for one Review's resolution; a bounded concurrency permit (`max-concurrent-resolutions`, default `4`) additionally caps how many resolutions run at once, so a slow/unavailable GitLab can never exhaust the Gateway's request-handling threads. |
+
+### 4.5 Structured Review Output (V5, optional)
+
+**`promptVersion: "v3"`, not a global switch** — everything below is additive and per-Review; `v1`/`v2`
+Reviews are byte-for-byte unaffected. `v3` is **not** in the shipped default allowlist
+(`gateway.review.allowed-prompt-versions`, [§4.2](#42-everything-else-has-a-working-default)); an
+operator adds it explicitly, and only after **every Worker in the fleet already ships `v3.yml`**
+(Workers-first, Gateway second — see `worker/README.md` §10 and `DEPLOYMENT.md`'s upgrade section). Full
+design docs: [`docs/structured-review-output-architecture.md`](docs/structured-review-output-architecture.md)
+and [`docs/structured-review-output-threat-model.md`](docs/structured-review-output-threat-model.md)
+(SOR-01..23, SOR-INH-1/2/3).
+
+For a `v3` Review, the Gateway computes a per-chunk **coverage list** (every changed file path) and
+renders it into the prompt whether or not a decoder constraint is used — this is what makes the feature
+work at all under the shipped `default-mode: OFF`. On a backend whose `structured_output_mode` is not
+`OFF`, the Gateway additionally attaches a JSON Schema (built from the same coverage list, never
+string-templated) to the outbound `/v1/chat/completions` call, so the model's response shape is
+constrained at decode time, not just requested in prose. Either way, the response is **strictly
+validated** against the coverage list on receipt (`StructuredResponseParser`) — a response that omits or
+invents a file, isn't valid JSON, or violates a length/count bound is a retryable validation failure, not
+a silently-accepted partial review. See [§6.1c](#61c-structured-review-output-and-response-validation)
+for the full validation/retry/failure-kind model.
+
+| Property | Env var | Default | Purpose |
+|---|---|---|---|
+| `gateway.structured.enabled` | `STRUCTURED_OUTPUT_ENABLED` | `true` | Kill switch. `false` = no decoder constraint is ever sent (the coverage list is still rendered in the prompt and the response is still strictly validated) — a `v3` Review behaves exactly like `v2`, parsed by the same legacy `CommentParser`. The correct incident response to a structured-output-related production issue is this flag, not `on-invalid-response` below. |
+| `gateway.structured.default-mode` | `STRUCTURED_OUTPUT_DEFAULT_MODE` | `OFF` | Used whenever a backend's own `backends.structured_output_mode` column is `NULL`. `OFF` means "nothing about the bytes sent to llama-server changes" until an operator opts a specific backend in — see the rollout ladder below. |
+| `gateway.structured.max-files-per-chunk` | — | `40` | Upper bound on distinct files in one structured chunk; also bounds the coverage list/schema/response size. Coupled with `gateway.diff.max-paths-per-section` (must be `≥` this value) and with `gateway.diff.max-chunks` (a diff needing more than `max-chunks × max-files-per-chunk` distinct files is rejected at the edge with `422 DIFF_TOO_LARGE`). |
+| `gateway.structured.max-path-chars` | — | `256` | Max length of a file path accepted as a schema key (after sanitization); longer is `422 STRUCTURED_OUTPUT_UNSUPPORTED`. Must stay `≤ 300` (`ChunkContextRenderer`'s own, more generous path-length cap) — enforced at startup. |
+| `gateway.structured.max-schema-bytes` | — | `65536` | Backstop only — with the edge validation above in force, this should never fire; if it does, it is logged as a bug and the job fails closed with `SCHEMA_TOO_LARGE`. **Coupled with the Worker's `worker.limits.max-constraint-bytes` (default `69632`)** — the Worker's bound must stay comfortably above this one, since the wire-level `response_format`/`json_schema` wrapper llama-server expects adds bytes on top of the raw schema; see `worker/README.md` §5.2. |
+| `gateway.structured.max-findings-per-file` | — | `20` | Schema's `maxItems` for one file's `findings` array; re-checked on the received response too (never trusts the decoder constraint alone). **Must stay `≤ 200`** — enforced at startup (Structured Output Grammar Budget, SGB-02): above that, this repetition site risks tripping llama.cpp's grammar-parser complexity guard (`MAX_REPETITION_THRESHOLD = 2000`). |
+| `gateway.structured.max-comment-chars` / `max-suggestion-chars` | — | `1200` / `2000` | **Receipt-side truncation bounds only** — as of the Structured Output Grammar Budget fix, `ReviewSchemaBuilder` no longer emits `maxLength` in the schema at all (a bounded string repetition is exactly what tripped llama.cpp's grammar-parser complexity guard in production — see `docs/structured-output-grammar-budget-architecture.md` §1). An over-length `comment`/`suggestion` is truncated to this cap on receipt and published (never a `SCHEMA_MISMATCH`), with a `structuredFieldTruncated{field}` metrics counter and, for a truncated suggestion, the same `ALTERED_CODE_MARKER` a sanitizer-altered block gets. |
+| `gateway.structured.per-file-summary` | — | `true` | Requires a non-empty per-file `summary` field — an anti-skip device (a model that silently drops a file is more likely to also skip its summary). `false` saves tokens at the cost of a weaker signal. |
+| `gateway.structured.on-invalid-response` | — | `RETRY_THEN_FAIL` | `RETRY_THEN_FAIL` (default) or `RETRY_THEN_FALLBACK`. **`RETRY_THEN_FALLBACK` is a documented risk re-acceptance, not a quality knob** — see the callout below. |
+| `gateway.structured.include-diff-context` / `diff-context-lines` | — | `true` / `3` | Whether a rendered finding includes a fenced `diff`-language excerpt (±N lines) around its line, taken only from that finding's own file section of the **locked job row's own chunk diff** — never from anything in the model's response. |
+
+`gateway.diff.answer-reserve` (default `4000`) sizes the diff-chunking budget for **both** v1/v2 and
+structured (`v3`) Reviews — there is no separate `structured.answer-reserve` (a formerly-separate
+property was merged into this one, `chore/answer-reserve-consolidation`, after repeatedly causing an
+operator to raise one and forget the other). **Must match `v3.yml`'s `maxTokens` (`8192`)** — the two
+are read by different processes (Gateway budgeting vs. the Worker's actual `llama-server` request) and a
+mismatch is silent: nothing fails loudly, a too-small `answer-reserve` just risks a truncated completion
+under a large chunk. See `DEPLOYMENT.md`'s "Бюджет LLM-токенов: сводная таблица" for the full
+cross-process picture.
+
+**`RETRY_THEN_FALLBACK` re-accepts a residual, on an attacker-reachable path.** When the attempt budget
+is exhausted, this setting makes the Gateway fall back to the legacy `CommentParser`'s genuine
+JSON-array branch (never the raw-transcript placeholder — the published comment is always prefixed with
+a fixed `**UNVALIDATED**` line) rather than ending the Review `FAILED`. That fallback comment goes
+through the same prose pipeline v1/v2 always has, which does **not** strip control/format characters
+(the SR-08/SR-09 residual documented in the baseline threat model) — and reaching the fallback at all
+can be forced by an MR author (a crafted diff that deterministically fails structured validation). Treat
+enabling this as accepting that residual on a now-reachable path, not merely as "publish more often". If
+an incident traces back to this fallback, the correct response is `gateway.structured.enabled=false`
+(which stops the fallback from ever firing, since there is no structured validation left to fall back
+*from*), not toggling this setting off in isolation.
+
+**Rollout ladder** (from the architecture doc §11 — every stage past the initial deploy is a data/CI
+change, never a redeploy):
+
+| Stage | Change | What it proves |
+|---|---|---|
+| 0 — baseline | Deploy this branch. Every backend `OFF`, `v3` not allowlisted. | `legacyParseFallback`/`averageFileCoverageRatio` on real v2 traffic — the "before" baseline, at zero cost. |
+| 1 — schema validation only | Workers updated (**prerequisite for every stage past this one**); `v3` allowlisted; one pilot project's CI sends `promptVersion: v3`. Backends stay `OFF`. | How often the model conforms **without** decoder help — meaningful only because the coverage list is always rendered, even unconstrained. |
+| 2 — canary constraint | `UPDATE backends SET structured_output_mode='RESPONSE_FORMAT_JSON_SCHEMA' WHERE name='...'` on **one** backend. | Whether that `llama-server` build actually honors the constraint — see the capability-verification recipe in `DEPLOYMENT.md`. Rollback: the same `UPDATE` back to `'OFF'`. |
+| 3 — fleet | All backends on the mode that worked in stage 2. | Steady-state failure rate. |
+| 4 — default | CI templates switch to `promptVersion: v3` (with `git -c core.quotePath=false diff` — see [§6.1c](#61c-structured-review-output-and-response-validation)). | — |
 
 ## 5. Deployment
 
@@ -329,8 +403,11 @@ curl -s -X POST http://localhost:8080/reviews \
 Request fields (`CreateReviewRequest`): `projectId` (positive `Long`, required), `mergeRequestId`
 (positive `Long`, required — this is the **MR IID**, not GitLab's global MR id), `headSha` (non-blank
 `String`, required), `baseSha` (non-blank `String`, required), `diff` (non-blank `String`, required —
-raw diff text, not structured), `promptVersion` (non-blank `String`, required), `priority` (`Integer`,
-optional — defaults to `10`; higher values are claimed first).
+raw diff text, not structured), `promptVersion` (non-blank `String`, required — checked against
+`gateway.review.allowed-prompt-versions` **before any other work**, [§4.2](#42-everything-else-has-a-working-default);
+`v1`/`v2` by default, `v3` only once an operator adds it — see
+[§4.5](#45-structured-review-output-v5-optional)), `priority` (`Integer`, optional — defaults to `10`;
+higher values are claimed first).
 
 - **`201 Created`** — a genuinely new Review was queued:
   ```json
@@ -354,6 +431,31 @@ optional — defaults to `10`; higher values are claimed first).
   ```json
   { "error": "PROMPT_VERSION_INCOMPATIBLE_WITH_CHUNKING", "message": "promptVersion 'v1' is not chunk-context-aware; this diff requires chunking. Use one of [v2] or submit a smaller diff." }
   ```
+- **`422 Unprocessable Entity` — `STRUCTURED_OUTPUT_UNSUPPORTED`** (Structured Review Output, V5). Checked
+  before any Review/chunk/job is persisted, in five cases, all sharing this one code (no new error code per
+  case) and never echoing the offending path/value itself — only which property or character class it
+  violated:
+  1. `promptVersion` is not in `gateway.review.allowed-prompt-versions` at all (checked first, before even
+     the diff-size guard).
+  2. `promptVersion` is `v3` but the diff has no `diff --git` headers to derive a per-file coverage list
+     from (submit a real `git diff`, or use `v2`).
+  3. At least one changed file's path does not survive sanitization, or **two different paths collide onto
+     the same sanitized value** — either way a file would be silently uncovered.
+  4. A path contains a character outside the conservative alphabet Structured Review Output requires
+     (`{ } " \ ` [ ] |` and whitespace are rejected, along with a leading `/` or a `..` segment), or exceeds
+     `gateway.structured.max-path-chars` (default 256). If your Git config uses `core.quotePath` (the
+     default), a non-ASCII filename is quoted/escaped by `git diff` and will trip this — resubmit with
+     `git -c core.quotePath=false diff` (see [§6.1c](#61c-structured-review-output-and-response-validation)).
+  5. The diff's coverage list can never fit `gateway.structured.max-files-per-chunk`/`gateway.diff.max-chunks`
+     no matter how it is packed (this shares `422 DIFF_TOO_LARGE`'s shape, not this one — listed here since
+     it is a structured-output-only condition).
+
+  Every case in this list, except the last, uses:
+  ```json
+  { "error": "STRUCTURED_OUTPUT_UNSUPPORTED", "message": "promptVersion 'v3' requires file paths free of the characters { } \" \\ ` [ ] | and whitespace, with no '..' segment, no leading '/', and at most 256 characters — use promptVersion 'v2' or rename the affected file(s)." }
+  ```
+  In every case the stated fallback is the same: use `promptVersion: v2` (unconstrained, unaffected by
+  any of the above), or fix the offending file name/path.
 - **`400 Bad Request`** — a required field is missing/blank (e.g. empty `diff`):
   ```json
   { "error": "VALIDATION_ERROR", "message": "diff: must not be blank" }
@@ -431,6 +533,67 @@ New failure responses at `POST /reviews` (in addition to [§6.1](#61-post-review
 | `422` | `PROMPT_TOO_LARGE` | The assembled system prompt exceeds `gateway.prompt.limits.max-system-prompt-tokens`, or leaves too little diff budget (`min-diff-budget-tokens`). |
 | `503` | `PROMPT_RESOLUTION_SATURATED` | Too many concurrent resolutions in flight (`max-concurrent-resolutions`); retry shortly — this bounds worst-case load rather than queuing requests indefinitely. |
 
+### 6.1c Structured Review Output and response validation
+
+**Only relevant for `promptVersion: "v3"` ([§4.5](#45-structured-review-output-v5-optional)).** Two
+independent mechanisms, both driven by the same per-chunk coverage list (the exact set of changed file
+paths for that chunk):
+
+1. **Coverage list in the prompt (always).** Every `v3` job's rendered prompt includes the full list of
+   files it must cover, regardless of chunk count or decoder-constraint mode — this is what makes the
+   feature work under the shipped `default-mode: OFF`, where no decoder constraint is applied at all.
+2. **Decoder constraint (only on a capable, opted-in backend).** When the claiming backend's
+   `structured_output_mode` is not `OFF`, the Gateway additionally builds a JSON Schema from the same
+   coverage list and attaches it to the outbound `llama-server` request (`responseFormat`/`jsonSchema` on
+   the claim payload, see [§6.4](#64-post-jobsclaim--claim-the-next-queued-job-worker)) — this is a
+   per-backend capability the Gateway discovers by configuration, never by probing; **no llama.cpp version
+   is pinned by this repository**, and a build that silently fails to honor the constraint is a known,
+   documented risk (a fail-open backend still passes validation whenever the model happens to comply by
+   luck — see `DEPLOYMENT.md`'s capability-verification recipe for how to actually confirm a given backend
+   enforces it).
+
+**Every response, constrained or not, is strictly validated on receipt** — `StructuredResponseParser`
+never trusts the decoder constraint, the backend's mode, or `finish_reason` to shortcut this. A response
+must be valid JSON, contain exactly the expected file keys (no more, no fewer), and every finding must
+satisfy its own field/length bounds; anything else is one of four failure kinds:
+
+| Kind | Meaning |
+|---|---|
+| `NOT_JSON` | The response isn't parseable JSON at all (includes a duplicate JSON key, which the parser's strict-mode parser rejects outright rather than silently keeping only the last occurrence). |
+| `SCHEMA_MISMATCH` | Valid JSON, but the wrong shape — a missing/extra top-level key, a finding missing a required field, an out-of-enum `severity`, or a `findings`/`comment`/`suggestion` bound exceeded. |
+| `COVERAGE_SHORTFALL` | The `files` object's key set doesn't exactly match the expected coverage list — a file is missing, or the response names a file that isn't in this chunk. |
+| `TRUNCATED` | `finish_reason: "length"`, or the raw response was itself truncated by the Gateway's own size cap before validation ran. |
+
+A validation failure is a **retryable job failure** (`RetryManager.requeueOrFail`, exactly the same
+attempts/`not_before` machinery as an infrastructure failure), not an immediate `FAILED` — see
+[§8](#8-review-lifecycle). `last_error` carries a diagnosis (e.g. `structured-output: COVERAGE_SHORTFALL;
+missing=[src/B.java]; unexpected=[none]`) capped and sanitized, never the model's raw text.
+`gateway.structured.on-invalid-response` (default `RETRY_THEN_FAIL`) decides what happens once attempts
+are exhausted — see [§4.5](#45-structured-review-output-v5-optional) for the `RETRY_THEN_FALLBACK`
+escape hatch and its documented risk re-acceptance.
+
+**A published `v3` comment's body is a fixed, Gateway-owned template** — header (severity + file + line)
+plus the model's prose, plus an optional fenced `diff`-language context excerpt and an optional
+suggested-fix block, never the fence language `suggestion` (which GitLab treats specially) and never
+markdown/HTML the model's own text could use to escape the intended structure. The *shape* of a v3
+comment body is decided entirely by the Gateway; the model only ever supplies the text that goes inside
+it.
+
+**CI must produce a `git diff` the coverage list can trust.** If your Git configuration uses
+`core.quotePath` (the default), a non-ASCII file name is quoted/escaped in `diff --git` headers, which
+trips the character-alphabet check in [§6.1](#61-post-reviews--create-a-review)'s
+`STRUCTURED_OUTPUT_UNSUPPORTED` list — submit `git -c core.quotePath=false diff` instead (see
+[§7](#7-gitlab-ci-integration)). Falling back to `promptVersion: v2` always works regardless.
+
+**`finish_reason` (and the raw response it came from) describes only the first attempt.**
+`review_results` is write-once per `(review_id, chunk_index)` (unchanged since before this feature,
+`SRO-37`) — a retry's raw response and `finish_reason` are never stored, only the first attempt's are.
+A `TRUNCATED` classification is always derived from the **in-flight** submission being validated, never
+from a previously-stored value that could belong to a different attempt. The model's chunk-level
+`summary` field is validated (bounded, must be a string) but **not currently persisted anywhere** —
+`review_results.summary` stays `NULL` for every Review, `v3` included; this is a known, accepted gap
+(not a bug), tracked for a future change.
+
 ### 6.2 `GET /reviews/{id}` — status
 
 ```bash
@@ -501,7 +664,7 @@ heartbeat/result call for this job).
   {
     "jobId": 456,
     "reviewId": 123,
-    "payload": { "diff": "diff --git a/Foo.java b/Foo.java\n...", "promptVersion": "v1", "chunkContext": null, "systemMessages": null }
+    "payload": { "diff": "diff --git a/Foo.java b/Foo.java\n...", "promptVersion": "v1", "chunkContext": null, "systemMessages": null, "responseFormat": null, "jsonSchema": null }
   }
   ```
   As of diff chunking (V2), `jobId` identifies one **chunk** of the Review (`review_jobs` is now 1:N per
@@ -510,12 +673,22 @@ heartbeat/result call for this job).
   header text (`null` for the common single-chunk case); the Worker substitutes it into the resolved
   prompt template's `{{CHUNK_CONTEXT}}` placeholder exactly like `diff`/`{{DIFF}}`, with no other
   chunk-awareness required on its side (it stays a fully stateless, chunk-ignorant HTTP client).
+  **Structured Review Output (V5): `payload.chunkContext` is never `null` for a `v3` job**, regardless of
+  chunk count — it always carries the per-file coverage-obligation block the model must satisfy (see
+  [§6.1c](#61c-structured-review-output-and-response-validation)); the "`null` for single-chunk" rule
+  above applies only to `v1`/`v2`.
   `payload.systemMessages` (V3, Prompt Manager) is `null` for a legacy Review or when
   `gateway.prompt.enabled=false` (use the Worker's own bundled template, exactly pre-V3 behavior) — a
   non-null value is one or more already-fully-assembled system-prompt strings to wrap verbatim into
   `ChatMessage(role=system, ...)`, **never** run through the `{{DIFF}}`/`{{CHUNK_CONTEXT}}` substitution
   logic (that stays scoped to the `user`-role template only). See
   [§6.1b](#61b-prompt-manager-and-system-prompt-assembly) and [§9](#9-worker-protocol).
+  `payload.responseFormat`/`payload.jsonSchema` (V5, Structured Review Output) are the Gateway-computed
+  decoder constraint — **at most one of the two is ever non-null**, and both are `null` unless this is a
+  `v3` job claimed against a backend whose `structured_output_mode` is not `OFF`
+  ([§4.5](#45-structured-review-output-v5-optional)). The Worker attaches whichever is set **verbatim**
+  to its outbound `llama-server` call and never inspects, edits, or re-derives either — see
+  [§9](#9-worker-protocol) and `worker/README.md` §2.
 - **`204 No Content`** — nothing to claim right now. This covers five indistinguishable situations by
   design: the queue is empty, the named backend is not `ACTIVE`, the backend is already at capacity, a
   claimed job turned out to belong to a Review that had already gone `CANCELLED`/`OBSOLETE` moments
@@ -556,15 +729,22 @@ curl -s -X POST http://localhost:8080/jobs/456/result \
         "promptTokens": 3200,
         "completionTokens": 180,
         "durationMs": 45000,
-        "model": "llama-3.1-8b-instruct"
+        "model": "llama-3.1-8b-instruct",
+        "finishReason": "stop"
       }'
 ```
 
 Request fields (`SubmitResultRequest`): `workerId` (non-blank, required), `rawResponse` (non-blank,
-required — the model's raw text output; the Gateway tries to parse it as a JSON array of
+required — the model's raw text output; for `v1`/`v2` the Gateway tries to parse it as a JSON array of
 `{file, line, severity, comment}` objects and falls back to treating the whole response as a single
-comment if it isn't), `promptTokens`/`completionTokens` (`Integer`, optional), `durationMs` (`Long`,
-optional), `model` (`String`, optional).
+comment if it isn't; for `v3` it is parsed strictly, see
+[§6.1c](#61c-structured-review-output-and-response-validation)), `promptTokens`/`completionTokens`
+(`Integer`, optional), `durationMs` (`Long`, optional), `model` (`String`, optional), `finishReason`
+(`String`, optional, `≤32` chars — the backend's own completion-stop reason, e.g. `stop`/`length`;
+whitelist-parsed against a closed vocabulary before storage, an unrecognized value is stored as
+`unknown` rather than rejected. Used by Structured Review Output to classify `finish_reason: "length"`
+as a `TRUNCATED` validation failure before even attempting to parse the response — see
+[§6.1c](#61c-structured-review-output-and-response-validation); ignored entirely for `v1`/`v2`).
 
 - **`200 OK`** — accepted, whether this is the first delivery or a retried one (idempotent):
   ```json
@@ -594,10 +774,12 @@ curl -s -X POST http://localhost:8080/jobs/456/fail \
 
 Request fields (`FailJobRequest`): `workerId` (non-blank, `≤64` chars, `^[A-Za-z0-9._:-]{1,64}$`),
 `reason` (non-blank, `≤32` chars — one of `LLM_EMPTY_RESPONSE`/`LLM_ERROR`/`LLM_TIMEOUT`/
-`LLM_RESPONSE_TOO_LARGE`/`PROMPT_INVALID`/`WORKER_ERROR`; the Gateway whitelist-parses this and treats
-any other value as `UNKNOWN` — it **never** rejects an unrecognized code with `400`, so an
-independently-versioned Worker fleet degrades safely), `detail` (optional, `≤500` chars — a fixed,
-Worker-side-constant description **never** derived from an exception message; sanitized and truncated to
+`LLM_RESPONSE_TOO_LARGE`/`PROMPT_INVALID`/`WORKER_ERROR`/`CONSTRAINT_INVALID` (the last one added by
+Structured Review Output, V5 — the Worker's own defensive re-check of a Gateway-supplied decoder
+constraint failed); the Gateway whitelist-parses this and treats any other value as `UNKNOWN` — it
+**never** rejects an unrecognized code with `400`, so an independently-versioned Worker fleet degrades
+safely), `detail` (optional, `≤500` chars — a fixed, Worker-side-constant description **never** derived
+from an exception message; sanitized and truncated to
 200 chars server-side before it can reach a log line, `review_events.details`, or
 `review_jobs.last_error`).
 
@@ -658,10 +840,37 @@ curl -s http://localhost:8080/metrics -H "Authorization: Bearer $ADMIN_TOKEN"
   "avgRunMs": 96340.2,
   "totalComments": 214,
   "retries": 5,
+  "promptManagerEnabled": false,
+  "promptDisabledCount": 0,
+  "promptSectionMissingCount": 0,
   "ownershipMismatches": { "heartbeat": 0, "result": 0, "fail": 0 },
-  "workerFailureReportsIgnored": 0
+  "workerFailureReportsIgnored": 0,
+  "legacyParseFallback": 0,
+  "structuredValidationFailures": { "NOT_JSON": 0, "SCHEMA_MISMATCH": 0, "COVERAGE_SHORTFALL": 0, "TRUNCATED": 0 },
+  "structuredConstraintSent": { "OFF": 0 },
+  "structuredFallbackUsed": 0
 }
 ```
+`promptManagerEnabled`/`promptDisabledCount`/`promptSectionMissingCount` (Prompt Manager, V3) mirror
+`gateway.prompt.enabled` and the `PROMPT_DISABLED`/`PROMPT_SECTION_MISSING` `review_events` rows,
+derived from PostgreSQL like every field above them.
+
+**Structured Review Output (V5), all four process-local, in-memory counters** (reset on a Gateway
+restart, same caveat as `ownershipMismatches` below): `legacyParseFallback` increments on **every**
+Review (`v1`/`v2` included) whenever `CommentParser`'s strict JSON-array parse fails and it falls back
+to the whole-response-as-one-comment path — this is the cheapest available "format-compliance" baseline,
+measured on existing traffic at zero cost, and is the "before" number the rollout ladder in
+[§4.5](#45-structured-review-output-v5-optional) compares `v3`'s `structuredValidationFailures` against.
+`structuredValidationFailures` is keyed by the four failure kinds from
+[§6.1c](#61c-structured-review-output-and-response-validation). `structuredConstraintSent` is keyed by
+wire mode (`OFF`/`RESPONSE_FORMAT_JSON_SCHEMA`/`RESPONSE_FORMAT_SCHEMA`/`TOP_LEVEL_JSON_SCHEMA`, plus the
+pseudo-key `KILL_SWITCH_OFF` when `gateway.structured.enabled=false`) — "how many claims reached the
+constraint decision", distinguishing "the model is good without help" from "we never turned the
+constraint on" at a glance. `structuredFallbackUsed` counts every time
+`gateway.structured.on-invalid-response=RETRY_THEN_FALLBACK` actually published a fallback comment. Every
+one of these four is keyed only on a closed, Gateway-defined vocabulary — never a file path, project id,
+backend URL, or any model-supplied string.
+
 `ownershipMismatches` (broken down by endpoint) and `workerFailureReportsIgnored` (Worker Observability &
 Claim Latency, WOR-03) are process-local, in-memory counters — they reset on a Gateway restart, unlike
 every other field on this endpoint, which is derived from PostgreSQL. This is deliberate: writing a
@@ -722,6 +931,15 @@ job that blocks the pipeline until the review is actually `PUBLISHED`) is at
 [`examples/.gitlab-ci.yml`](examples/.gitlab-ci.yml) — copy it into the *target* project being
 reviewed, not into this repository.
 
+**The Gateway never calls out to GitLab to compute or fetch a diff.** `GitLabClientImpl` has exactly
+four methods — `postDiscussion` (publish a comment), and, only when Prompt Manager is enabled,
+`resolveCommitSha`/`fetchRawFile`/`resolveDefaultBranch` (read system-prompt source files, [§6.1b](#61b-prompt-manager-and-system-prompt-assembly)).
+There is no `GET .../merge_requests/{iid}/diffs` or `/changes` call anywhere in the Gateway, and no
+inbound GitLab webhook receiver either. The `diff` field in `POST /reviews` is the **entire** contract:
+whoever calls the endpoint (normally this CI job, via `git diff`) must compute the unified diff itself
+and push it in the request body — the Gateway is a purely passive receiver of diff text, never an
+initiator of a GitLab diff fetch.
+
 ```yaml
 ai-review:
   stage: review
@@ -779,6 +997,16 @@ Notes on dedup/obsolete semantics, so the pipeline author doesn't need to add an
   Review is queued; the Gateway posts comments to the MR on its own schedule (via `GITLAB_TOKEN`),
   independent of the CI job's lifetime.
 
+**Using `promptVersion: "v3"` (Structured Review Output, [§4.5](#45-structured-review-output-v5-optional)):**
+only change the `git diff` invocation and the `promptVersion` field above —
+`git -c core.quotePath=false diff "$CI_MERGE_REQUEST_DIFF_BASE_SHA" "$CI_COMMIT_SHA" > diff.txt`. Without
+`core.quotePath=false`, Git quotes/escapes any non-ASCII file name in `diff --git` headers, which the
+structured-output coverage-list validation rejects at `POST /reviews` (`422
+STRUCTURED_OUTPUT_UNSUPPORTED`, see [§6.1](#61-post-reviews--create-a-review)); `v1`/`v2` are unaffected
+either way since they never parse file paths out of the diff at all. `v3` is not in the default
+`gateway.review.allowed-prompt-versions` allowlist — an unallowlisted value also gets `422
+STRUCTURED_OUTPUT_UNSUPPORTED`, at the very first check `POST /reviews` performs.
+
 An **optional** polling step, if a pipeline wants to gate on the review actually completing:
 
 ```yaml
@@ -793,6 +1021,60 @@ An **optional** polling step, if a pipeline wants to gate on the review actually
         sleep 20
       done
 ```
+
+### 7.1 Manually reproducing a CI submission (local / ad-hoc testing)
+
+To submit a Review by hand for a real GitLab merge request, without running the CI job above, replicate
+the same three inputs the CI job derives automatically: the numeric `projectId`, the MR's `diff_refs`
+(`baseSha`/`headSha`), and the diff text itself.
+
+1. **Resolve the numeric `projectId`** from the project's path (GitLab accepts a URL-encoded path in
+   place of the numeric id for this one lookup only — `POST /reviews` itself always requires the
+   numeric id):
+   ```bash
+   curl -sS --header "PRIVATE-TOKEN: $GITLAB_PAT" \
+     "https://<gitlab-host>/api/v4/projects/<group>%2F<subgroup>%2F<project>" | jq '.id'
+   ```
+2. **Resolve `baseSha`/`headSha`** from the MR's own `diff_refs` — not a local `git merge-base`, which
+   can disagree with GitLab's view if the target branch has moved. `mr_iid` is the number shown in the
+   MR's URL (`.../-/merge_requests/<iid>`), not GitLab's internal global MR id:
+   ```bash
+   curl -sS --header "PRIVATE-TOKEN: $GITLAB_PAT" \
+     "https://<gitlab-host>/api/v4/projects/<projectId>/merge_requests/<mr_iid>" | jq '.diff_refs'
+   # → { "base_sha": "...", "head_sha": "...", "start_sha": "..." }
+   ```
+3. **Produce the diff locally**, exactly as the CI job does (`git diff <base> <head>`), from a clone that
+   actually has both commits. If `head_sha` belongs to a since-deleted source branch, fetch GitLab's
+   per-MR ref instead of the branch:
+   ```bash
+   git fetch origin "refs/merge-requests/<mr_iid>/head:refs/mr/<mr_iid>/head"
+   git diff --no-color <base_sha> refs/mr/<mr_iid>/head > diff.patch
+   ```
+   `DiffChunker` parses standard `git diff` output (preferring `diff --git a/... b/...` headers, falling
+   back to plain `--- `/`+++ `); `--no-color` is required, ANSI escapes are not diff syntax.
+4. **Submit it**, same shape as [§7](#7-gitlab-ci-integration)'s CI job:
+   ```bash
+   jq -n --argjson projectId <projectId> --argjson mergeRequestId <mr_iid> \
+     --arg headSha "<head_sha>" --arg baseSha "<base_sha>" --arg promptVersion "v1" \
+     --rawfile diff diff.patch \
+     '{projectId:$projectId, mergeRequestId:$mergeRequestId, headSha:$headSha,
+       baseSha:$baseSha, diff:$diff, promptVersion:$promptVersion, priority:10}' \
+     | curl -sS -X POST "$REVIEW_GATEWAY_URL/reviews" \
+         -H "Authorization: Bearer $REVIEW_GATEWAY_CI_TOKEN" \
+         -H "Content-Type: application/json" --data @-
+   ```
+
+Notes: the dedup key ([§8](#8-review-lifecycle)) means resubmitting the same `(projectId,
+mergeRequestId, headSha)` while a prior Review is still active just returns the existing `reviewId`
+(`200`, not `201`) — pick a different `headSha` to force a fresh Review for repeated manual testing.
+`promptVersion` must be in `gateway.review.allowed-prompt-versions` — an unallowlisted value now fails
+**immediately** at `POST /reviews` time (`422 STRUCTURED_OUTPUT_UNSUPPORTED`,
+[§6.1](#61-post-reviews--create-a-review)), not on the Worker side once a job is claimed (Structured
+Review Output's SOR-08 allowlist, [§4.5](#45-structured-review-output-v5-optional)) — it must *also*
+name a template that actually exists in the Worker's bundle
+(`worker/src/main/resources/.../<promptVersion>.yml`), which the Gateway has no way to verify at request
+time; an allowlisted `promptVersion` whose template is missing from a given Worker still fails only once
+a job reaches that Worker.
 
 ## 8. Review lifecycle
 
@@ -860,19 +1142,26 @@ access at all.
 1. **Claim.** `POST /jobs/claim` with your registered backend's `name` (as `backendId`) and a
    self-chosen `workerId` string.
    - `200` → you have `jobId`, `reviewId`, and a `payload` with `diff` + `promptVersion` +
-     `chunkContext` (V2, diff chunking — `null` unless this job is one chunk of a larger, split diff) +
-     `systemMessages` (V3, Prompt Manager — `null` unless the Gateway has one enabled and resolved).
+     `chunkContext` (V2, diff chunking — `null` unless this job is one chunk of a larger, split diff, or
+     unless this is a `v3` job — see below) + `systemMessages` (V3, Prompt Manager — `null` unless the
+     Gateway has one enabled and resolved) + `responseFormat`/`jsonSchema` (V5, Structured Review Output —
+     at most one non-null, both `null` unless this is a `v3` job claimed against a
+     `structured_output_mode`-opted-in backend).
      Substitute `chunkContext` into the resolved template's `{{CHUNK_CONTEXT}}` placeholder exactly like
      `diff`/`{{DIFF}}` if the template has one and it's non-null. If `systemMessages` is non-null, use
      each string **verbatim** as its own `system`-role chat message (or concatenate them if your backend
      only accepts one `system` message) instead of your own bundled system template — do **not** run
      these strings through any placeholder-substitution logic; they are already fully assembled. If it's
-     `null`, fall back to your own bundled system template exactly as before V3. You never need to know
-     whether `jobId` represents a whole Review or one chunk of it — treat every claimed job identically.
+     `null`, fall back to your own bundled system template exactly as before V3. If `responseFormat`/
+     `jsonSchema` is non-null, attach it **verbatim** to your outbound `llama-server` chat-completion call
+     under the corresponding wire field — never inspect, edit, or re-derive it, and never run it through
+     any template-substitution logic either. You never need to know whether `jobId` represents a whole
+     Review or one chunk of it — treat every claimed job identically.
    - `204` → nothing to claim right now (empty queue, your backend isn't `ACTIVE`/is at capacity, or a
      transient lock contention). Wait (e.g. a few seconds) and poll again.
 2. **Run inference** against your local `llama-server` using the claimed
-   `diff`/`promptVersion`/`chunkContext`/`systemMessages`.
+   `diff`/`promptVersion`/`chunkContext`/`systemMessages`, with `responseFormat`/`jsonSchema` attached
+   verbatim to the request when present.
 3. **Heartbeat roughly every 60 seconds** while generating: `POST /jobs/{id}/heartbeat` with the *same*
    `workerId` you claimed with.
    - `shouldContinue: false` → **stop generating immediately** and move on to claiming the next job; the
@@ -1015,6 +1304,19 @@ non-terminal chunk job in the same step for a multi-chunk Review.
   default branch, wrapped in a non-forgeable delimiter, and framed by a fixed preamble/trailer the LLM
   is told takes precedence. Full threat model: `docs/prompt-manager-threat-model.md` (PMT-01..25,
   PMR-01..30) and its companion `docs/security/feature-prompt-manager-sast-report.md`.
+- **Structured Review Output (V5, optional) — `promptVersion` allowlisted at the edge, response never
+  trusted.** `v3` is rejected at `POST /reviews` unless an operator has explicitly added it to
+  `gateway.review.allowed-prompt-versions`, and adding it is only safe once every Worker in the fleet
+  already ships `v3.yml` (Workers-first deployment order) — see
+  [§4.5](#45-structured-review-output-v5-optional). File paths that become the JSON Schema's keys are
+  restricted to a conservative character alphabet (checked at `POST /reviews`, independent of and in
+  addition to the general path sanitization every diff already goes through) before ever reaching a
+  third-party grammar compiler. The decoder-level constraint, when used, is treated as an optimization,
+  never a trust boundary: every response is strictly re-validated against the same coverage list
+  regardless of whether a constraint was applied, which backend served it, or what `finish_reason` it
+  reported — see [§6.1c](#61c-structured-review-output-and-response-validation). Full threat model:
+  `docs/structured-review-output-threat-model.md` (SOR-01..23, SOR-INH-1/2/3) and its companion
+  `docs/security/feature-structured-review-output-sast-report.md`.
 - **CI security gate** (this project's own build, not the product's GitLab integration):
   `.github/workflows/security-gate.yml` runs on every PR and push to `master` — `gitleaks` (secret
   scanning, full git history), `osv-scanner` over a CycloneDX SBOM (blocks on High/Critical CVEs),

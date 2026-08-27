@@ -12,8 +12,9 @@ import java.util.function.Supplier;
 /**
  * Two {@code RestClient} beans (not the deprecated {@code RestTemplate}), per architecture §11/§7:
  * {@code gitLabRestClient} (fixed, admin-configured base URL + token) and
- * {@code backendProbeRestClient} (per-backend URL supplied at call time by
- * {@code BackendProberImpl}, SSRF-hardened at the transport layer — SR-10: redirects are disabled here
+ * {@code backendProbeRestClientFactory} (a {@code Supplier}, not a shared instance — see its own javadoc;
+ * per-backend URL supplied at call time by {@code BackendProberImpl}), SSRF-hardened at the transport
+ * layer — SR-10: redirects are disabled here
  * so a compromised/malicious backend cannot redirect the probe to an internal target the allowlist
  * would otherwise reject).
  */
@@ -82,7 +83,7 @@ public class RestClientConfig {
      * an empty connection pool.
      *
      * <p>A backend's {@code llama-server} process is expected to restart from time to time (deploy, crash,
-     * model swap — architecture §whatever, one 1:1-paired Mac mini per backend). A shared, long-lived
+     * model swap — one 1:1-paired Mac mini per backend, architecture §11). A shared, long-lived
      * {@code HttpClient} keeps HTTP/1.1 keep-alive connections pooled per host; when the remote process
      * restarts, a pooled connection to the old process can outlive it and get silently poisoned — reused on
      * the next probe, it fails (or worse, appears to hang) even though a brand-new connection to the same

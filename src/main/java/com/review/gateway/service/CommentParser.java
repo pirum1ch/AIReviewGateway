@@ -50,9 +50,11 @@ public class CommentParser {
 
     private final ObjectMapper objectMapper = new ObjectMapper();
     private final GatewayProperties properties;
+    private final MetricsCounters metricsCounters;
 
-    public CommentParser(GatewayProperties properties) {
+    public CommentParser(GatewayProperties properties, MetricsCounters metricsCounters) {
         this.properties = properties;
+        this.metricsCounters = metricsCounters;
     }
 
     public List<ParsedComment> parse(String rawResponse) {
@@ -72,9 +74,15 @@ public class CommentParser {
         }
 
         List<RawComment> jsonComments = tryParseJsonArray(rawResponse);
-        List<RawComment> candidates = (jsonComments != null && !jsonComments.isEmpty())
-                ? jsonComments
-                : List.of(new RawComment(null, null, Severity.INFO, rawResponse));
+        boolean fellBackToWholeResponse = jsonComments == null || jsonComments.isEmpty();
+        if (fellBackToWholeResponse) {
+            // SRO-45: the single cheapest instrument for symptom 2 -- measures today's v1/v2 traffic too,
+            // giving a genuine "before" baseline that costs nothing (architecture §11 stage 0).
+            metricsCounters.incrementLegacyParseFallback();
+        }
+        List<RawComment> candidates = fellBackToWholeResponse
+                ? List.of(new RawComment(null, null, Severity.INFO, rawResponse))
+                : jsonComments;
 
         int maxCount = Math.max(0, maxCountOverride);
         List<ParsedComment> sanitized = new ArrayList<>();
@@ -95,6 +103,48 @@ public class CommentParser {
         }
         if (sanitized.isEmpty()) {
             sanitized.add(new ParsedComment(null, null, Severity.INFO, "(model response contained no publishable content)"));
+        }
+        return sanitized;
+    }
+
+    /**
+     * Structured Review Output (SRO-68, threat model SOR-05, BLOCKING-derived): the {@code
+     * RETRY_THEN_FALLBACK} escape hatch's <b>only</b> permitted parse path for a structured (v3)
+     * response — the genuine JSON-array branch only. Deliberately never falls through to the
+     * whole-response-as-one-{@code INFO}-comment branch {@link #parse} uses (which, on a v3-shaped
+     * response, would publish the model's raw transcript essentially always) — an explicit, separate
+     * entry point rather than a flag on {@link #parse}, so every existing v1/v2 call site is untouched
+     * (SRO-30: "{@code CommentParser} is not modified").
+     *
+     * @return the parsed, sanitized comments, or an <b>empty list</b> (never the raw-transcript
+     *         placeholder) if the genuine JSON-array branch did not yield anything — the caller
+     *         (ResultProcessor) treats an empty return as "the fallback itself failed too", proceeding
+     *         exactly as {@code RETRY_THEN_FAIL}
+     */
+    public List<ParsedComment> parseStructuredFallback(String rawResponse, int maxCountOverride) {
+        if (rawResponse == null || rawResponse.isBlank()) {
+            return List.of();
+        }
+        List<RawComment> jsonComments = tryParseJsonArray(rawResponse);
+        if (jsonComments == null || jsonComments.isEmpty()) {
+            return List.of();
+        }
+        int maxCount = Math.max(0, maxCountOverride);
+        List<ParsedComment> sanitized = new ArrayList<>();
+        int dropped = 0;
+        for (RawComment candidate : jsonComments) {
+            ParsedComment comment = sanitize(candidate);
+            if (comment == null) {
+                continue;
+            }
+            if (sanitized.size() >= maxCount) {
+                dropped++;
+                continue;
+            }
+            sanitized.add(comment);
+        }
+        if (dropped > 0) {
+            log.warn("Dropped {} parsed comment(s) beyond the configured cap of {} (structured fallback)", dropped, maxCount);
         }
         return sanitized;
     }
@@ -204,14 +254,27 @@ public class CommentParser {
         // at all -- it only bounds the pre-escape length, defeating the SR-09 guarantee on the value
         // that actually reaches the DB/GitLab. Same class of defect as the filePath VARCHAR(1024)
         // overflow this fix's sibling method (sanitizeFilePath) also had (F02-04/KD-2).
-        String mentionsNeutralized = neutralizeMentions(trimmed);
-        String escaped = HtmlUtils.htmlEscape(mentionsNeutralized);
-        String capped = capLength(escaped, properties.getPublish().getMaxCommentLength());
+        String capped = sanitizeProseText(trimmed);
 
         String sanitizedFilePath = sanitizeFilePath(candidate.filePath());
         Integer normalizedLine = normalizeLineNumber(candidate.lineNumber());
 
         return new ParsedComment(sanitizedFilePath, normalizedLine, candidate.severity(), capped);
+    }
+
+    /**
+     * Structured Review Output (SRO-54): exposes the identical prose-sanitization pipeline v1/v2
+     * comments already go through (mention-neutralization, HTML-escaping, then length-capping last per
+     * F02-08) so {@code CommentRenderer}'s prose part runs through the <em>same code</em>, not a
+     * re-implementation — no regression to SR-08/SR-09/F02-08. Callers are expected to have already
+     * decided the text is non-blank (unlike {@link #sanitize}, this never returns {@code null} — an
+     * already-trimmed empty input simply sanitizes to an empty string).
+     */
+    public String sanitizeProseText(String text) {
+        String trimmed = text == null ? "" : text.trim();
+        String mentionsNeutralized = neutralizeMentions(trimmed);
+        String escaped = HtmlUtils.htmlEscape(mentionsNeutralized);
+        return capLength(escaped, properties.getPublish().getMaxCommentLength());
     }
 
     /**
@@ -228,7 +291,9 @@ public class CommentParser {
      *
      * @return the sanitized file path, or {@code null} if nothing remains after sanitation
      */
-    private String sanitizeFilePath(String filePath) {
+    // Package-private (not private): CommentRenderer (SOR-10) reuses this exact method for the v3
+    // published-comment file_path column, so both versions store the same shape (escape then cap).
+    String sanitizeFilePath(String filePath) {
         if (filePath == null) {
             return null;
         }
@@ -247,7 +312,9 @@ public class CommentParser {
      * {@link JsonNode#isInt()} values or values that parse cleanly as {@code int}). Normalizes any
      * invalid value to {@code null} rather than persisting/publishing a misleading line reference.
      */
-    private Integer normalizeLineNumber(Integer lineNumber) {
+    // Package-private (not private): StructuredResponseParser (SRO-23) reuses this exact normalization
+    // for the schema's "line: 0 = file-level" sentinel -- deliberately no second implementation.
+    Integer normalizeLineNumber(Integer lineNumber) {
         return (lineNumber != null && lineNumber > 0) ? lineNumber : null;
     }
 
@@ -271,6 +338,13 @@ public class CommentParser {
             return text;
         }
         int cut = Math.max(0, max - TRUNCATION_SUFFIX.length());
+        // F-SOGB-02 (extended sweep): a bare substring here can land mid-surrogate-pair on the v1/v2
+        // model-comment path, which has no downstream safe re-cut (unlike v3's CommentRenderer.capLength).
+        // Back off one char, exactly like TextSanitizer.truncateSafely, without changing the "..." suffix
+        // shape v1/v2 output has always had (SRO-54/SR-09).
+        if (cut > 0 && Character.isHighSurrogate(text.charAt(cut - 1))) {
+            cut--;
+        }
         return text.substring(0, cut) + TRUNCATION_SUFFIX;
     }
 
