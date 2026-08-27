@@ -105,7 +105,7 @@ class ResultProcessorTest extends AbstractPostgresIntegrationTest {
                 commentParser, commentRenderer, new TextSanitizer(), properties, new MetricsCounters());
         return new ResultProcessor(reviewRepository, reviewJobRepository, reviewChunkRepository, reviewResultRepository,
                 commentParser, structuredResponseParser, jobStateMachine, chunkCoordinator, retryManager,
-                new MetricsCounters(), properties, entityManager, transactionManager);
+                new MetricsCounters(), properties, new TextSanitizer(), entityManager, transactionManager);
     }
 
     private Review persistRunningReview(String headSha) {

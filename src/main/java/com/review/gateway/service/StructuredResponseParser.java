@@ -294,6 +294,9 @@ public class StructuredResponseParser {
             return ValidationResult.fail(FailureKind.SCHEMA_MISMATCH, "'findings' is missing or not an array for a file entry");
         }
         if (options.perFileSummary()) {
+            // SOGB-10 (Info, TRACKED): only existence-checked, never read/bounded -- unbounded because it
+            // is discarded (never collected into `out`/RawFinding). If a future change starts reading it,
+            // route it through TextSanitizer.truncateSafely first, same as `comment`/`suggestion` below.
             JsonNode fileSummaryNode = fileNode.get("summary");
             if (fileSummaryNode == null || !fileSummaryNode.isTextual()) {
                 return ValidationResult.fail(FailureKind.SCHEMA_MISMATCH, "per-file 'summary' is missing or not a string");

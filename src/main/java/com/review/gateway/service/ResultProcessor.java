@@ -72,6 +72,7 @@ public class ResultProcessor {
     private final RetryManager retryManager;
     private final MetricsCounters metricsCounters;
     private final GatewayProperties properties;
+    private final TextSanitizer textSanitizer;
     private final EntityManager entityManager;
     private final TransactionTemplate requiresNewTransactionTemplate;
 
@@ -86,6 +87,7 @@ public class ResultProcessor {
                             RetryManager retryManager,
                             MetricsCounters metricsCounters,
                             GatewayProperties properties,
+                            TextSanitizer textSanitizer,
                             EntityManager entityManager,
                             PlatformTransactionManager transactionManager) {
         this.reviewRepository = reviewRepository;
@@ -99,6 +101,7 @@ public class ResultProcessor {
         this.retryManager = retryManager;
         this.metricsCounters = metricsCounters;
         this.properties = properties;
+        this.textSanitizer = textSanitizer;
         this.entityManager = entityManager;
         this.requiresNewTransactionTemplate = new TransactionTemplate(transactionManager);
         this.requiresNewTransactionTemplate.setPropagationBehavior(TransactionTemplate.PROPAGATION_REQUIRES_NEW);
@@ -332,7 +335,10 @@ public class ResultProcessor {
         List<ParsedComment> prefixed = new ArrayList<>();
         for (ParsedComment comment : comments) {
             String combined = UNVALIDATED_FALLBACK_PREFIX + comment.text();
-            String capped = combined.length() > maxLength ? combined.substring(0, maxLength) : combined;
+            // F-SOGB-02: was a bare substring(0, maxLength) on model-derived text with no downstream safe
+            // re-cut on this path -- could land mid-surrogate-pair and produce a String Jackson refuses to
+            // serialize, permanently stuck at COMPLETED. truncateSafely is a no-op when already within budget.
+            String capped = textSanitizer.truncateSafely(combined, maxLength).text();
             prefixed.add(new ParsedComment(comment.filePath(), comment.lineNumber(), comment.severity(), capped));
         }
         return prefixed;
@@ -389,8 +395,10 @@ public class ResultProcessor {
             return new CappedRawResponse(rawResponse, false, originalLength, max);
         }
         String suffix = "...[TRUNCATED by Gateway: raw response exceeded configured limit]";
-        int cut = Math.max(0, max - suffix.length());
-        String truncated = rawResponse.substring(0, cut) + suffix;
+        int budget = Math.max(0, max - suffix.length());
+        // F-SOGB-02 (extended sweep): also on the raw-model-response cut site -- same surrogate-split
+        // risk as withUnvalidatedPrefix above, backed off the same way rather than a bare substring.
+        String truncated = textSanitizer.truncateSafely(rawResponse, budget).text() + suffix;
         log.warn("Raw response for reviewId processing exceeded the configured cap ({} > {} chars); truncating (SR-21)",
                 originalLength, max);
         return new CappedRawResponse(truncated, true, originalLength, max);
@@ -400,6 +408,9 @@ public class ResultProcessor {
         Integer totalTokens = (command.promptTokens() != null && command.completionTokens() != null)
                 ? command.promptTokens() + command.completionTokens()
                 : null;
+        // SOGB-10 (Info, TRACKED): `summary` is unbounded here because it is discarded (hardcoded null,
+        // never the chunk's own structured summary) -- if a future change starts wiring the chunk summary
+        // through, route it through TextSanitizer.truncateSafely first, same as `comment`/`suggestion`.
         ReviewResult result = new ReviewResult(reviewId, chunkIndex, jobId, command.rawResponse(), null,
                 command.promptTokens(), command.completionTokens(), totalTokens,
                 command.durationMs(), command.model(), backendId, normalizeFinishReason(command.finishReason()));

@@ -3,6 +3,8 @@ package com.review.gateway.service;
 import com.review.gateway.config.GatewayProperties;
 import com.review.gateway.model.enums.Severity;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -427,6 +429,41 @@ class CommentRendererTest {
                     .as("maxCommentLength=%d: the Gateway's own four-backtick fence marker must still pair up", maxLength)
                     .isEqualTo(0);
         }
+    }
+
+    // ---- F-SOGB-03 (appsec SAST fix round): assembleWithTruncatedProse must never ship a PARTIAL
+    // TRUNCATED_COMMENT_MARKER. The prior fix round's javadoc claimed the marker is either whole or
+    // dropped entirely, but the code capped the marker-bearing `prose` string instead of the marker-free
+    // `base`, so at maxCommentLength values around header.length()+2+2*marker.length() the marker itself
+    // got sliced (e.g. "... _" / "..._("). 34..39 straddles that exact boundary for this test's fixed
+    // header ("**INFO** — `A.java`:1", length 21) and prose ("hello world", marker length 14):
+    // proseBudget = maxLength - 21 - 2, which crosses 14 (marker.length()) right around maxLength == 37.
+
+    @ParameterizedTest
+    @ValueSource(ints = {32, 33, 34, 35, 36, 37, 38, 39, 40})
+    void truncatedProseMarkerIsNeverPartiallySliced(int maxLength) {
+        GatewayProperties properties = new GatewayProperties();
+        properties.getPublish().setMaxCommentLength(maxLength);
+        CommentParser commentParser = new CommentParser(properties, new MetricsCounters());
+        CommentRenderer renderer = new CommentRenderer(commentParser, new TextSanitizer(), properties);
+
+        String rendered = renderer.renderIndexed("A.java", 1, Severity.INFO, "hello world", true, "", false,
+                renderer.prepareChunkDiffIndex(null));
+
+        // Duplicated literal on purpose: CommentRenderer.TRUNCATED_COMMENT_MARKER is private, and this
+        // assertion is exactly the contract the constant's value must keep -- if the marker text ever
+        // changes, this literal must be updated deliberately, not silently kept in sync via a shared field.
+        String marker = " _(truncated)_";
+        boolean hasFullMarker = rendered.endsWith(marker);
+        boolean hasPartialMarker = false;
+        for (int len = 1; len < marker.length() && !hasPartialMarker; len++) {
+            hasPartialMarker = rendered.endsWith(marker.substring(0, len));
+        }
+
+        assertThat(hasPartialMarker && !hasFullMarker)
+                .as("maxCommentLength=%d must never ship a partial truncation marker; rendered body: [%s]",
+                        maxLength, rendered)
+                .isFalse();
     }
 
     private boolean isEncodableUtf8(String text) {

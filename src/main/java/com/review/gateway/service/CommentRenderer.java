@@ -465,8 +465,12 @@ public class CommentRenderer {
         }
 
         String cappedProse;
-        if (marker.isEmpty() || marker.length() >= proseBudget) {
+        if (marker.isEmpty()) {
             cappedProse = capLength(prose, proseBudget);
+        } else if (marker.length() >= proseBudget) {
+            // F-SOGB-03: budget too small even for the marker alone -- drop it entirely and cap the
+            // marker-free base, never the marker-bearing `prose` (which would slice the marker in half).
+            cappedProse = capLength(base, proseBudget);
         } else {
             cappedProse = capLength(base, proseBudget - marker.length()) + marker;
         }

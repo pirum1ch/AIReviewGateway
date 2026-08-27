@@ -338,6 +338,13 @@ public class CommentParser {
             return text;
         }
         int cut = Math.max(0, max - TRUNCATION_SUFFIX.length());
+        // F-SOGB-02 (extended sweep): a bare substring here can land mid-surrogate-pair on the v1/v2
+        // model-comment path, which has no downstream safe re-cut (unlike v3's CommentRenderer.capLength).
+        // Back off one char, exactly like TextSanitizer.truncateSafely, without changing the "..." suffix
+        // shape v1/v2 output has always had (SRO-54/SR-09).
+        if (cut > 0 && Character.isHighSurrogate(text.charAt(cut - 1))) {
+            cut--;
+        }
         return text.substring(0, cut) + TRUNCATION_SUFFIX;
     }
 

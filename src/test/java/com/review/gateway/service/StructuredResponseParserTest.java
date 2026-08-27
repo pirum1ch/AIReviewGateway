@@ -1,12 +1,21 @@
 package com.review.gateway.service;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.review.gateway.config.GatewayProperties;
+import com.review.gateway.model.Backend;
 import com.review.gateway.model.enums.Severity;
+import com.review.gateway.model.enums.StructuredOutputMode;
 import com.review.gateway.service.StructuredResponseParser.FailureKind;
 import com.review.gateway.service.StructuredResponseParser.ValidationResult;
 import org.junit.jupiter.api.Test;
+import org.slf4j.Logger;
 
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.util.List;
+import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
@@ -551,38 +560,74 @@ class StructuredResponseParserTest {
     // ---- SOR-11: structurally un-shortcuttable -- no Backend/StructuredOutputMode dependency ----
 
     /**
-     * SOGB-04 (Structured Output Grammar Budget, threat model): tightened from a deny-list ("no Backend/
-     * StructuredOutputMode field") to an allow-list -- the parser gained {@code MetricsCounters} as a
-     * collaborator in this branch (its first new collaborator since SOR-11 was written), so the next one
-     * added must fail this test until someone deliberately justifies it, rather than being silently
-     * permitted by a deny-list that never mentioned it.
+     * F-SOGB-01 (appsec SAST fix round): the prior allow-list scanned {@code getDeclaredFields()} only,
+     * and one of its entries ({@code "com.review.gateway.model.enums."}) was broad enough to re-permit
+     * the exact type ({@link StructuredOutputMode}) the original SOR-11 deny-list forbade by name --
+     * the "tightening" was strictly weaker than what it replaced on the one dimension SOR-11 exists to
+     * protect. Fixed the same shape {@link RetryManagerNoJobFailureReasonDependencyTest} uses: an
+     * <em>exact</em>-type allow-list (no package prefixes -- every entry is a {@code Class<?>} actually
+     * needed by a declared field/constructor-param/method-param/return-type today, so the list is
+     * falsifiable), plus explicit constructors/methods/return-type coverage (not just fields), plus the
+     * nested-type carve-out below for this class's own {@code ValidationResult}/{@code Success}/
+     * {@code Failure}/{@code RawFinding}/{@code FailureKind} (safe by construction: anything declared
+     * *inside* {@code StructuredResponseParser} is visible to a reviewer right here, unlike a
+     * same-package sibling such as {@link StructuredOutputMode} or {@link Backend}).
+     *
+     * <p>Belt-and-braces (SAST's own recommendation): also re-asserts the original SOR-11 deny-list
+     * wording by name, so a future reader immediately sees which two types this test exists to keep out,
+     * not just an abstract "not on the list".
      */
     @Test
     void classOnlyReferencesItsApprovedCollaboratorSet() {
-        List<String> allowedTypePrefixes = List.of(
-                "com.review.gateway.service.CommentParser",
-                "com.review.gateway.service.CommentRenderer",
-                "com.review.gateway.service.TextSanitizer",
-                "com.review.gateway.service.MetricsCounters",
-                "com.review.gateway.config.GatewayProperties",
-                "com.review.gateway.model.enums.",
-                "com.review.gateway.service.dto.",
-                "com.fasterxml.jackson.",
-                "org.slf4j.Logger",
-                "java.util.Set",
-                "java.lang.String");
-        for (var field : StructuredResponseParser.class.getDeclaredFields()) {
-            Class<?> type = field.getType();
-            String typeName = type.getName();
-            boolean allowed = type.isPrimitive()
-                    || allowedTypePrefixes.stream().anyMatch(typeName::startsWith);
-            assertThat(allowed)
-                    .as("StructuredResponseParser.%s (type %s) is not on the SOR-11/SOGB-04 allow-list -- "
-                            + "adding a new collaborator here needs a deliberate justification, since this "
-                            + "class's un-shortcuttable validation is the property SOR-11 protects",
-                            field.getName(), typeName)
-                    .isTrue();
+        Set<Class<?>> allowedTypes = Set.of(
+                CommentParser.class,
+                CommentRenderer.class,
+                TextSanitizer.class,
+                MetricsCounters.class,
+                GatewayProperties.class,
+                ObjectMapper.class,
+                JsonNode.class,
+                Logger.class,
+                Set.class,
+                List.class,
+                String.class,
+                Severity.class,
+                ReviewSchemaBuilder.SchemaOptions.class);
+
+        for (Field field : StructuredResponseParser.class.getDeclaredFields()) {
+            assertAllowed(field.getType(), "field '" + field.getName() + "'", allowedTypes);
         }
+        for (Constructor<?> constructor : StructuredResponseParser.class.getDeclaredConstructors()) {
+            for (Class<?> paramType : constructor.getParameterTypes()) {
+                assertAllowed(paramType, "constructor parameter", allowedTypes);
+            }
+        }
+        for (Method method : StructuredResponseParser.class.getDeclaredMethods()) {
+            for (Class<?> paramType : method.getParameterTypes()) {
+                assertAllowed(paramType, "method '" + method.getName() + "' parameter", allowedTypes);
+            }
+            assertAllowed(method.getReturnType(), "method '" + method.getName() + "' return type", allowedTypes);
+        }
+    }
+
+    private void assertAllowed(Class<?> type, String where, Set<Class<?>> allowedTypes) {
+        // Explicit, named deny assertions first (SAST's "belt-and-braces" recommendation) -- these fail
+        // with a message naming the exact SOR-11 threat, rather than the generic allow-list message below.
+        assertThat(type)
+                .as("StructuredResponseParser's %s must never be typed as StructuredOutputMode (SOR-11/SOGB-04)", where)
+                .isNotEqualTo(StructuredOutputMode.class);
+        assertThat(type)
+                .as("StructuredResponseParser's %s must never be typed as Backend (SOR-11/SOGB-04)", where)
+                .isNotEqualTo(Backend.class);
+
+        boolean allowed = type.isPrimitive()
+                || type.getEnclosingClass() == StructuredResponseParser.class
+                || allowedTypes.contains(type);
+        assertThat(allowed)
+                .as("StructuredResponseParser's %s (type %s) is not on the SOR-11/SOGB-04 allow-list -- "
+                        + "adding a new collaborator here needs a deliberate justification, since this "
+                        + "class's un-shortcuttable validation is the property SOR-11 protects", where, type.getName())
+                .isTrue();
     }
 
     @Test
