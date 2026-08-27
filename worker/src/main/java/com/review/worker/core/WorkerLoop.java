@@ -67,6 +67,11 @@ public class WorkerLoop {
         map.put(JobFailureReason.WORKER_ERROR, "unclassified worker-side failure");
         map.put(JobFailureReason.CONSTRAINT_INVALID, "Gateway-supplied decoder constraint failed the "
                 + "Worker's defensive re-check (both fields set, oversized, invalid JSON, or not an object)");
+        // SGB-06/SOGB-07 (Structured Output Grammar Budget): a fixed, Worker-side-constant sentence --
+        // never the backend's actual error body text, which is scanned for a token match and then
+        // discarded (LlamaClient never returns/logs/stores it).
+        map.put(JobFailureReason.CONSTRAINT_REJECTED, "llama-server refused the decoder-constraint grammar "
+                + "(compile-time rejection)");
         return map;
     }
 

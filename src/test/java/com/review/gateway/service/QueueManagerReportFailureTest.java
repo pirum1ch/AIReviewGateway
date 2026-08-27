@@ -184,6 +184,48 @@ class QueueManagerReportFailureTest extends AbstractPostgresIntegrationTest {
         assertThat(outcome).isEqualTo(FailureReportOutcome.NOT_FOUND);
     }
 
+    /**
+     * SGB-06/SOGB-07 (Structured Output Grammar Budget): {@code CONSTRAINT_REJECTED} requeues via the
+     * exact SAME attempts-based path as any other reason -- no special-casing, no branch, same as
+     * {@code reportOnRunningOwnedJobRequeuesTheJobAndSetsLastErrorAndNotBefore} above. This is the
+     * functional half of the SOGB-07 inertness guarantee ({@code RetryManagerNoJobFailureReasonDependencyTest}
+     * is the structural half).
+     */
+    @Test
+    void constraintRejectedReasonRequeuesIdenticallyToAnyOtherWorkerReportedReason() {
+        Review review = persistRunningReview("sha-report-constraint-rejected");
+        ReviewJob job = persistRunningJob(review, 1, "worker-owner");
+
+        FailureReportOutcome outcome = report(newQueueManager(3), job.getId(), "worker-owner",
+                "CONSTRAINT_REJECTED", "llama-server refused the decoder-constraint grammar (compile-time rejection)");
+
+        assertThat(outcome).isEqualTo(FailureReportOutcome.ACCEPTED);
+        ReviewJob reloaded = reviewJobRepository.findById(job.getId()).orElseThrow();
+        assertThat(reloaded.getStatus()).isEqualTo(JobStatus.QUEUED);
+        assertThat(reloaded.getLastError()).contains("worker-reported: reason=CONSTRAINT_REJECTED");
+        assertThat(reloaded.getNotBefore()).isNotNull();
+    }
+
+    /**
+     * SOGB-07: no backend-supplied raw error text ever reaches {@code review_jobs.last_error} un-
+     * sanitized via this new reason -- the Worker's own {@code detail} for {@code CONSTRAINT_REJECTED} is
+     * always one of {@code WorkerLoop.DETAIL_BY_REASON}'s fixed constants, never backend-echoed text, but
+     * this proves the Gateway's existing generic sanitize/cap still applies to this value too, exactly as
+     * it does for every other reason ({@code detailWithCrlfAndControlCharsIsSanitizedAndTruncated} below).
+     */
+    @Test
+    void constraintRejectedDetailIsSanitizedAndCappedLikeAnyOtherReason() {
+        Review review = persistRunningReview("sha-report-constraint-rejected-sanitize");
+        ReviewJob job = persistRunningJob(review, 1, "worker-owner");
+        String maliciousDetail = "failed to parse grammar\r\nFORGED line" + "x".repeat(400);
+
+        report(newQueueManager(3), job.getId(), "worker-owner", "CONSTRAINT_REJECTED", maliciousDetail);
+
+        ReviewJob reloaded = reviewJobRepository.findById(job.getId()).orElseThrow();
+        assertThat(reloaded.getLastError()).doesNotContain("\r").doesNotContain("\n");
+        assertThat(reloaded.getLastError().length()).isLessThanOrEqualTo(512);
+    }
+
     // T-3.10
     @Test
     void unknownReasonCodeIsAcceptedAndClassifiedAsUnknown() {

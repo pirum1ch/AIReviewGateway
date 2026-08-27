@@ -21,5 +21,14 @@ public enum JobFailureReason {
      * SOR-06), not valid JSON, or not a JSON object. A defensive bound against a misbehaving/compromised
      * Gateway, exactly like {@code worker.limits.max-diff-bytes} (WSR-03).
      */
-    CONSTRAINT_INVALID
+    CONSTRAINT_INVALID,
+    /**
+     * Structured Output Grammar Budget (SGB-06, threat model SOGT-03/SOGB-05..08): {@code LlamaClient}
+     * classified a non-2xx llama-server response as a compile-time grammar rejection (a fixed,
+     * case-insensitive, backend-controlled error-body token match against a small {@code static final}
+     * list — never a regex, never the matched text itself). Audit-only, same as every other value here —
+     * {@code WorkerLoop.DETAIL_BY_REASON} carries a fixed Worker-side sentence for it, never the
+     * backend's actual error text (WOR-05).
+     */
+    CONSTRAINT_REJECTED
 }
