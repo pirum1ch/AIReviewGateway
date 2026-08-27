@@ -418,6 +418,71 @@ class StructuredResponseParserTest {
                 .doesNotThrowAnyException();
     }
 
+    /**
+     * QA round (task item 2, "no false positives"): a comment/suggestion exactly AT the configured cap
+     * must never be reported as truncated and must never carry either truncation marker. The existing
+     * dev tests only exercise the over-length side of this boundary.
+     */
+    @Test
+    void commentAndSuggestionExactlyAtTheCapAreNotTruncatedAndCarryNoMarker() {
+        String exactComment = "c".repeat(12);
+        String exactSuggestion = "s".repeat(20);
+        String raw = "{\"files\":{\"A.java\":{\"findings\":[{\"line\":1,\"severity\":\"info\",\"comment\":\""
+                + exactComment + "\",\"suggestion\":\"" + exactSuggestion + "\"}],\"summary\":\"s\"}},\"summary\":\"y\"}";
+        StructuredResponseParser parser = newParser();
+        ReviewSchemaBuilder.SchemaOptions tightOptions = new ReviewSchemaBuilder.SchemaOptions(20, 12, 20, true);
+
+        ValidationResult result = parser.validate(raw, List.of("A.java"), false, null, null, tightOptions, NO_EFFECTIVE_CAP);
+
+        assertThat(result.isSuccess()).isTrue();
+        String published = result.success().comments().get(0).text();
+        assertThat(published).doesNotContain("_(truncated)_")
+                .doesNotContain("_(normalized for display; not a verbatim quotation)_");
+        assertThat(metricsCounters.structuredFieldTruncatedSnapshot()).isEmpty();
+    }
+
+    /** QA round: one character BELOW the cap -- same expectation, the other side of the off-by-one risk. */
+    @Test
+    void commentAndSuggestionOneCharBelowTheCapAreNotTruncatedAndCarryNoMarker() {
+        String belowComment = "c".repeat(11);
+        String belowSuggestion = "s".repeat(19);
+        String raw = "{\"files\":{\"A.java\":{\"findings\":[{\"line\":1,\"severity\":\"info\",\"comment\":\""
+                + belowComment + "\",\"suggestion\":\"" + belowSuggestion + "\"}],\"summary\":\"s\"}},\"summary\":\"y\"}";
+        StructuredResponseParser parser = newParser();
+        ReviewSchemaBuilder.SchemaOptions tightOptions = new ReviewSchemaBuilder.SchemaOptions(20, 12, 20, true);
+
+        ValidationResult result = parser.validate(raw, List.of("A.java"), false, null, null, tightOptions, NO_EFFECTIVE_CAP);
+
+        assertThat(result.isSuccess()).isTrue();
+        String published = result.success().comments().get(0).text();
+        assertThat(published).doesNotContain("_(truncated)_")
+                .doesNotContain("_(normalized for display; not a verbatim quotation)_");
+        assertThat(metricsCounters.structuredFieldTruncatedSnapshot()).isEmpty();
+    }
+
+    /**
+     * QA round (task item 2, "prose case" check): confirms what the architecture/threat-model docs say
+     * an over-length PROSE comment must do -- SOGB-01 explicitly calls for "a Gateway-constant
+     * ellipsis/marker" on truncated prose, distinct from {@code ALTERED_CODE_MARKER} (which is reserved
+     * for code blocks per SRO-52). This pins that the two markers are never conflated: a truncated
+     * comment gets ONLY the prose marker, never the code-block one.
+     */
+    @Test
+    void truncatedProseCommentNeverCarriesTheCodeBlockAlteredMarker() {
+        String longComment = "This prose comment is long enough to exceed a small configured cap.";
+        String raw = "{\"files\":{\"A.java\":{\"findings\":[{\"line\":1,\"severity\":\"info\",\"comment\":\""
+                + longComment + "\",\"suggestion\":\"\"}],\"summary\":\"s\"}},\"summary\":\"y\"}";
+        StructuredResponseParser parser = newParser();
+        ReviewSchemaBuilder.SchemaOptions tightOptions = new ReviewSchemaBuilder.SchemaOptions(20, 15, 2000, true);
+
+        ValidationResult result = parser.validate(raw, List.of("A.java"), false, null, null, tightOptions, NO_EFFECTIVE_CAP);
+
+        assertThat(result.isSuccess()).isTrue();
+        String published = result.success().comments().get(0).text();
+        assertThat(published).contains("_(truncated)_")
+                .doesNotContain("_(normalized for display; not a verbatim quotation)_");
+    }
+
     private long countOccurrences(String haystack, String needle) {
         long count = 0;
         int index = 0;

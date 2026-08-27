@@ -393,4 +393,54 @@ class CommentRendererTest {
 
         assertThat(rendered).doesNotContain("````diff");
     }
+
+    // ---- QA round (task item 2, "double truncation"): a field already truncated upstream by
+    // StructuredResponseParser (SGB-03, marker appended) can ALSO get cut again downstream by
+    // CommentRenderer's own independent gateway.publish.max-comment-length cap (SRO-53's pre-existing
+    // block-dropping/assembleWithTruncatedProse fallback). Confirms the assembled body is still
+    // fence-balanced and never contains an unpaired UTF-16 surrogate across a wide range of length
+    // budgets -- brute-forced rather than a single hand-picked offset, since the exact byte where a
+    // surrogate pair straddles the cut depends on header length, which this test does not hard-code.
+
+    @Test
+    void doubleTruncationNeverProducesAnUnpairedSurrogateOrUnbalancedFenceAcrossManyLengthBudgets() {
+        GatewayProperties properties = new GatewayProperties();
+        CommentParser commentParser = new CommentParser(properties, new MetricsCounters());
+        CommentRenderer renderer = new CommentRenderer(commentParser, new TextSanitizer(), properties);
+        String emoji = "😀"; // U+1F600, a two-char UTF-16 surrogate pair
+        // Already truncated upstream (commentTruncatedUpstream=true) -- CommentRenderer appends
+        // TRUNCATED_COMMENT_MARKER to this BEFORE its own maxCommentLength cap ever runs, so the marker
+        // itself is part of what the second (downstream) cut can land on too.
+        String rawComment = "x".repeat(40) + emoji + "y".repeat(40);
+
+        for (int maxLength = 5; maxLength <= 140; maxLength++) {
+            properties.getPublish().setMaxCommentLength(maxLength);
+
+            String rendered = renderer.renderIndexed("A.java", 1, Severity.INFO, rawComment, true, "", false,
+                    renderer.prepareChunkDiffIndex(null));
+
+            assertThat(isEncodableUtf8(rendered))
+                    .as("maxCommentLength=%d must never leave an unpaired surrogate in the published body", maxLength)
+                    .isTrue();
+            long fenceCount = countOccurrences(rendered, "````");
+            assertThat(fenceCount % 2)
+                    .as("maxCommentLength=%d: the Gateway's own four-backtick fence marker must still pair up", maxLength)
+                    .isEqualTo(0);
+        }
+    }
+
+    private boolean isEncodableUtf8(String text) {
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
+            if (Character.isHighSurrogate(c)) {
+                if (i + 1 >= text.length() || !Character.isLowSurrogate(text.charAt(i + 1))) {
+                    return false;
+                }
+                i++;
+            } else if (Character.isLowSurrogate(c)) {
+                return false;
+            }
+        }
+        return true;
+    }
 }

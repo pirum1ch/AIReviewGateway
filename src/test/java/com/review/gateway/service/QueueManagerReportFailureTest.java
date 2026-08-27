@@ -226,6 +226,61 @@ class QueueManagerReportFailureTest extends AbstractPostgresIntegrationTest {
         assertThat(reloaded.getLastError().length()).isLessThanOrEqualTo(512);
     }
 
+    /**
+     * QA round (task item 6): the developer's own {@code constraintRejectedReasonRequeuesIdenticallyTo
+     * AnyOtherWorkerReportedReason} above only exercises the requeue (attempts &lt; max) branch. This
+     * proves the OTHER branch too -- exhaustion -&gt; FAILED -&gt; sibling cascade -- is byte-identical in
+     * behavior to {@code reportAtMaxAttemptsFailsTheJobAndCascadesToSiblings} (T-3.2) with
+     * {@code reason=LLM_ERROR}, completing the functional (not just structural/reflection-based)
+     * inertness proof that {@code RetryManager}'s decision never depends on which {@code JobFailureReason}
+     * was reported.
+     */
+    @Test
+    void constraintRejectedAtMaxAttemptsFailsTheJobAndCascadesToSiblingsJustLikeAnyOtherReason() {
+        Review review = persistRunningReview("sha-report-constraint-rejected-exhausted");
+        ReviewJob failingJob = persistRunningJob(review, 3, "worker-owner");
+        ReviewJob sibling = new ReviewJob(review.getId(), null, 1, 10, "worker-b", failingJob.getBackendId());
+        sibling.setStatus(JobStatus.RUNNING);
+        sibling = reviewJobRepository.saveAndFlush(sibling);
+
+        report(newQueueManager(3), failingJob.getId(), "worker-owner", "CONSTRAINT_REJECTED",
+                "llama-server refused the decoder-constraint grammar (compile-time rejection)");
+
+        ReviewJob reloadedFailing = reviewJobRepository.findById(failingJob.getId()).orElseThrow();
+        assertThat(reloadedFailing.getStatus()).isEqualTo(JobStatus.FAILED);
+        ReviewJob reloadedSibling = reviewJobRepository.findById(sibling.getId()).orElseThrow();
+        assertThat(reloadedSibling.getStatus()).isEqualTo(JobStatus.CANCELLED);
+        Review reloadedReview = reviewRepository.findById(review.getId()).orElseThrow();
+        assertThat(reloadedReview.getStatus()).isEqualTo(ReviewStatus.FAILED);
+    }
+
+    /**
+     * QA round (task item 6): a direct side-by-side comparison at the SAME attempt count, asserting the
+     * resulting job state (status, notBefore null-ness, attempts) is identical regardless of which
+     * {@code JobFailureReason} was reported -- the only permitted difference is the reason token embedded
+     * in {@code last_error}'s free-text portion.
+     */
+    @Test
+    void constraintRejectedAndLlmErrorProduceIdenticalJobStateAtTheSameAttemptCount() {
+        Review reviewA = persistRunningReview("sha-report-equivalence-a");
+        ReviewJob jobA = persistRunningJob(reviewA, 1, "worker-owner");
+        Review reviewB = persistRunningReview("sha-report-equivalence-b");
+        ReviewJob jobB = persistRunningJob(reviewB, 1, "worker-owner");
+
+        report(newQueueManager(3), jobA.getId(), "worker-owner", "CONSTRAINT_REJECTED", "detail-a");
+        report(newQueueManager(3), jobB.getId(), "worker-owner", "LLM_ERROR", "detail-a");
+
+        ReviewJob reloadedA = reviewJobRepository.findById(jobA.getId()).orElseThrow();
+        ReviewJob reloadedB = reviewJobRepository.findById(jobB.getId()).orElseThrow();
+
+        assertThat(reloadedA.getStatus()).isEqualTo(reloadedB.getStatus()).isEqualTo(JobStatus.QUEUED);
+        assertThat(reloadedA.getAttempts()).isEqualTo(reloadedB.getAttempts());
+        assertThat(reloadedA.getNotBefore() != null).isEqualTo(reloadedB.getNotBefore() != null);
+        // Same shape of last_error, differing only in the reason token itself.
+        assertThat(reloadedA.getLastError().replace("CONSTRAINT_REJECTED", "X"))
+                .isEqualTo(reloadedB.getLastError().replace("LLM_ERROR", "X"));
+    }
+
     // T-3.10
     @Test
     void unknownReasonCodeIsAcceptedAndClassifiedAsUnknown() {

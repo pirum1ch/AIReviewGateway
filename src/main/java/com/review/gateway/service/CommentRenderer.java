@@ -445,10 +445,32 @@ public class CommentRenderer {
         return body.toString();
     }
 
+    /**
+     * SGB-04 (fix round, QA finding 4): {@code prose} may already carry a trailing {@link
+     * #TRUNCATED_COMMENT_MARKER} appended upstream (line ~144) -- a naive cap here could slice through
+     * the middle of that marker (e.g. leaving {@code "..._(trunc"}), which is misleading though not a
+     * crash. The marker, if present, is peeled off first, the remaining prose is cut to leave room for
+     * it, and the marker is reattached whole; only if the budget is too small even for the marker alone
+     * does it get dropped and the raw prose safely cut instead.
+     */
     private String assembleWithTruncatedProse(String header, String prose, int maxLength) {
         int separatorLength = 2; // "\n\n"
         int proseBudget = Math.max(0, maxLength - header.length() - separatorLength);
-        return header + "\n\n" + capLength(prose, proseBudget);
+
+        String marker = "";
+        String base = prose;
+        if (prose.endsWith(TRUNCATED_COMMENT_MARKER)) {
+            marker = TRUNCATED_COMMENT_MARKER;
+            base = prose.substring(0, prose.length() - marker.length());
+        }
+
+        String cappedProse;
+        if (marker.isEmpty() || marker.length() >= proseBudget) {
+            cappedProse = capLength(prose, proseBudget);
+        } else {
+            cappedProse = capLength(base, proseBudget - marker.length()) + marker;
+        }
+        return header + "\n\n" + cappedProse;
     }
 
     /**
@@ -468,11 +490,15 @@ public class CommentRenderer {
         return count % 2 == 0;
     }
 
+    /**
+     * SGB-04 (fix round, QA finding 1, BLOCKING): delegates to {@link TextSanitizer#truncateSafely} --
+     * the single code-point-safe truncation implementation in the codebase -- instead of a bare {@code
+     * substring(0, max)}. Now that {@code StructuredResponseParser}'s own SGB-03 truncation makes this
+     * class's second, independent {@code maxCommentLength} cap a routine (not rare) outcome, a plain
+     * substring here can and does slice a UTF-16 surrogate pair in half, producing a body that fails to
+     * encode/persist downstream.
+     */
     private String capLength(String text, int maxLength) {
-        int max = Math.max(0, maxLength);
-        if (text.length() <= max) {
-            return text;
-        }
-        return text.substring(0, max);
+        return textSanitizer.truncateSafely(text, maxLength).text();
     }
 }

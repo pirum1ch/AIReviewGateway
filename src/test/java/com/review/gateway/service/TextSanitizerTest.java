@@ -112,4 +112,91 @@ class TextSanitizerTest {
     void sanitizeSingleLineReturnsNullForNullInput() {
         assertThat(sanitizer.sanitizeSingleLine(null, 200)).isNull();
     }
+
+    // ---- truncateSafely (SGB-03/SOGB-03, Structured Output Grammar Budget) ----
+    //
+    // QA round: no dedicated unit test for this helper existed before (only indirect coverage via
+    // StructuredResponseParserTest). Pins the exact boundary behavior directly, including the one-off
+    // cases an off-by-one in a hand-rolled cut is most likely to hide in.
+
+    @Test
+    void truncateSafelyReturnsUnchangedAndNotTruncatedWhenTextIsShorterThanCap() {
+        TextSanitizer.Truncation result = sanitizer.truncateSafely("short", 100);
+        assertThat(result.truncated()).isFalse();
+        assertThat(result.text()).isEqualTo("short");
+    }
+
+    @Test
+    void truncateSafelyAtExactlyTheCapIsNotTruncated() {
+        String text = "x".repeat(10);
+        TextSanitizer.Truncation result = sanitizer.truncateSafely(text, 10);
+        assertThat(result.truncated()).as("a value exactly at the cap must never be reported as truncated (no false positive)").isFalse();
+        assertThat(result.text()).isEqualTo(text);
+    }
+
+    @Test
+    void truncateSafelyOneCharOverTheCapIsTruncatedToExactlyTheCap() {
+        String text = "x".repeat(11);
+        TextSanitizer.Truncation result = sanitizer.truncateSafely(text, 10);
+        assertThat(result.truncated()).isTrue();
+        assertThat(result.text()).hasSize(10).isEqualTo("x".repeat(10));
+    }
+
+    @Test
+    void truncateSafelyOneCharUnderTheCapIsNotTruncated() {
+        String text = "x".repeat(9);
+        TextSanitizer.Truncation result = sanitizer.truncateSafely(text, 10);
+        assertThat(result.truncated()).isFalse();
+        assertThat(result.text()).isEqualTo(text);
+    }
+
+    @Test
+    void truncateSafelyBacksOffByOneWhenTheNaiveCutWouldSplitASurrogatePair() {
+        String emoji = "😀"; // U+1F600, high+low surrogate pair
+        String text = "x".repeat(9) + emoji + "tail"; // naive cut at 10 lands exactly on the low surrogate
+        TextSanitizer.Truncation result = sanitizer.truncateSafely(text, 10);
+
+        assertThat(result.truncated()).isTrue();
+        // Backed off to 9 chars -- the whole surrogate pair is dropped rather than split.
+        assertThat(result.text()).isEqualTo("x".repeat(9));
+        assertThat(result.text().codePoints().toArray()).doesNotContain((int) '\uD83D');
+    }
+
+    @Test
+    void truncateSafelyCutJustAfterACompleteSurrogatePairIsUnaffected() {
+        String emoji = "😀";
+        String text = "x".repeat(8) + emoji; // cap=10 lands exactly after the complete pair -- no backoff needed
+        TextSanitizer.Truncation result = sanitizer.truncateSafely(text, 10);
+
+        assertThat(result.truncated()).isFalse();
+        assertThat(result.text()).isEqualTo(text);
+    }
+
+    @Test
+    void truncateSafelyWithCapZeroReturnsEmptyStringNeverThrows() {
+        TextSanitizer.Truncation result = sanitizer.truncateSafely("abc", 0);
+        assertThat(result.truncated()).isTrue();
+        assertThat(result.text()).isEmpty();
+    }
+
+    @Test
+    void truncateSafelyWithNegativeCapIsTreatedAsZero() {
+        TextSanitizer.Truncation result = sanitizer.truncateSafely("abc", -5);
+        assertThat(result.truncated()).isTrue();
+        assertThat(result.text()).isEmpty();
+    }
+
+    @Test
+    void truncateSafelyReturnsNullTextUnchangedForNullInput() {
+        TextSanitizer.Truncation result = sanitizer.truncateSafely(null, 100);
+        assertThat(result.truncated()).isFalse();
+        assertThat(result.text()).isNull();
+    }
+
+    @Test
+    void truncateSafelyEmptyStringIsNeverTruncated() {
+        TextSanitizer.Truncation result = sanitizer.truncateSafely("", 10);
+        assertThat(result.truncated()).isFalse();
+        assertThat(result.text()).isEmpty();
+    }
 }
