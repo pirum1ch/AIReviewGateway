@@ -187,7 +187,7 @@ gateway:
   # умолчанию -- оператор добавляет его вручную только после того, как весь парк Worker'ов уже несёт
   # v3.yml (порядок разворачивания: сначала Worker'ы, потом Gateway, §11).
   review:
-    allowed-prompt-versions: ${ALLOWED_PROMPT_VERSIONS:v1,v2,v3}   # allowlist значений promptVersion, принимаемых POST /reviews; "v3" добавляется явно оператором после разворачивания Worker'ов с v3.yml
+    allowed-prompt-versions: ${ALLOWED_PROMPT_VERSIONS:v1,v2}   # allowlist значений promptVersion, принимаемых POST /reviews; "v3" добавляется явно оператором после разворачивания Worker'ов с v3.yml
 
 # ПРИМЕЧАНИЕ: gateway.security.*/gateway.gitlab.token ОБЯЗАНЫ быть длиной >=32 символов (SR-01), а
 # gateway.gitlab.base-url ОБЯЗАН начинаться с https:// (SR-15) -- иначе GatewayProperties прерывает

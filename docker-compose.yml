@@ -159,6 +159,7 @@ services:
       BACKEND_ID: llama-01
       LLAMA_MODEL: ${LLAMA_MODEL:?set LLAMA_MODEL}
       LLAMA_URL: ${LLAMA_URL_1:?set LLAMA_URL_1, e.g. http://192.168.1.101:8000}
+      LLAMA_MAX_TOKENS: ${LLAMA_MAX_TOKENS:-12000}
       WORKER_ALLOW_INSECURE_GATEWAY: "true"
       # Both workers share the Gateway's network namespace (network_mode: service:gateway below),
       # so their Actuator ports would collide on the default 8081 -- pin distinct ports.
@@ -183,6 +184,7 @@ services:
       BACKEND_ID: llama-02
       LLAMA_MODEL: ${LLAMA_MODEL:?set LLAMA_MODEL}
       LLAMA_URL: ${LLAMA_URL_2:?set LLAMA_URL_2, e.g. http://192.168.1.102:8000}
+      LLAMA_MAX_TOKENS: ${LLAMA_MAX_TOKENS:-12000}
       WORKER_ALLOW_INSECURE_GATEWAY: "true"
       # Must differ from worker1's -- see the comment there; both share one network namespace.
       WORKER_HTTP_PORT: "8082"
