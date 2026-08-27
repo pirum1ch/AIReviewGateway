@@ -115,7 +115,11 @@ gateway:
     on-invalid-response: RETRY_THEN_FAIL   # SRO-38/68: RETRY_THEN_FAIL (по умолчанию) | RETRY_THEN_FALLBACK (emergency escape hatch, публикует только генуинный JSON-массив с меткой "UNVALIDATED")
     include-diff-context: true   # SRO-51: включает извлечение и рендер блока ```diff с контекстом вокруг строки finding
     diff-context-lines: 3        # SRO-51: число строк контекста с каждой стороны от строки finding
-    answer-reserve: 8000         # §10: заменяет gateway.diff.answer-reserve при расчёте бюджета ТОЛЬКО для структурированных версий промпта (гарантированная форма ответа многословнее обычного JSON-массива) — ЧАСТЬ ОБЩЕГО БЮДЖЕТА ТОКЕНОВ, должна расти вместе с worker/.../prompts/v3.yml → maxTokens (см. сводную таблицу в DEPLOYMENT.md)
+    # answer-reserve здесь больше НЕТ (V-04, appsec final verification): после chore/config-consolidation
+    # единый gateway.diff.answer-reserve (см. §B выше) считается и для v1/v2, и для v3 -- отдельного
+    # структурированного оверрайда не существует. Не добавляйте его обратно без соответствующего поля в
+    # GatewayProperties.Structured -- иначе ключ будет молча проигнорирован (Spring's ignoreUnknownFields),
+    # ровно как этот был все последние коммиты.
 
   # ---- §C Prompt Manager (V3, опционально) -----------------------------------------------------
   # gateway.prompt.limits.* ниже — тоже часть бюджета LLM-токенов (см. §B и сводную таблицу в
