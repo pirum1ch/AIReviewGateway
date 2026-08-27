@@ -52,6 +52,20 @@ class MetricsCountersTest {
         assertThat(counters.structuredFallbackUsedCount()).isEqualTo(1);
     }
 
+    /** Structured Output Grammar Budget (SGB-03/SOGB-11): keyed on the closed {@code "comment"}/{@code "suggestion"} vocabulary. */
+    @Test
+    void structuredFieldTruncatedIsKeyedByField() {
+        MetricsCounters counters = new MetricsCounters();
+
+        counters.incrementStructuredFieldTruncated("comment");
+        counters.incrementStructuredFieldTruncated("comment");
+        counters.incrementStructuredFieldTruncated("suggestion");
+
+        assertThat(counters.structuredFieldTruncatedSnapshot())
+                .containsEntry("comment", 2L)
+                .containsEntry("suggestion", 1L);
+    }
+
     @Test
     void everyNewCounterStartsAtZero() {
         MetricsCounters counters = new MetricsCounters();
@@ -60,5 +74,6 @@ class MetricsCountersTest {
         assertThat(counters.structuredValidationFailuresSnapshot()).isEmpty();
         assertThat(counters.structuredConstraintSentSnapshot()).isEmpty();
         assertThat(counters.structuredFallbackUsedCount()).isZero();
+        assertThat(counters.structuredFieldTruncatedSnapshot()).isEmpty();
     }
 }

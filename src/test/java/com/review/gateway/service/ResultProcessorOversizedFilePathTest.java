@@ -84,7 +84,7 @@ class ResultProcessorOversizedFilePathTest extends AbstractPostgresIntegrationTe
                 properties, new TextSanitizer(), entityManager, transactionManager);
         CommentRenderer commentRenderer = new CommentRenderer(commentParser, new TextSanitizer(), properties);
         StructuredResponseParser structuredResponseParser = new StructuredResponseParser(
-                commentParser, commentRenderer, new TextSanitizer(), properties);
+                commentParser, commentRenderer, new TextSanitizer(), properties, new MetricsCounters());
         return new ResultProcessor(reviewRepository, reviewJobRepository, reviewChunkRepository, reviewResultRepository,
                 commentParser, structuredResponseParser, jobStateMachine, chunkCoordinator, retryManager,
                 new MetricsCounters(), properties, entityManager, transactionManager);

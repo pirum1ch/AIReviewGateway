@@ -102,7 +102,8 @@ public class StatisticsService {
                 promptDisabledCount, promptSectionMissingCount,
                 metricsCounters.ownershipMismatchSnapshot(), metricsCounters.workerFailureReportsIgnoredCount(),
                 metricsCounters.legacyParseFallbackCount(), metricsCounters.structuredValidationFailuresSnapshot(),
-                metricsCounters.structuredConstraintSentSnapshot(), metricsCounters.structuredFallbackUsedCount());
+                metricsCounters.structuredConstraintSentSnapshot(), metricsCounters.structuredFallbackUsedCount(),
+                metricsCounters.structuredFieldTruncatedSnapshot());
     }
 
     private double nullToZero(Double value) {

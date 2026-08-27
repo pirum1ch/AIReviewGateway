@@ -9,6 +9,7 @@ import org.junit.jupiter.api.Test;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
@@ -19,10 +20,12 @@ class StructuredResponseParserTest {
 
     private final GatewayProperties properties = new GatewayProperties();
 
+    private final MetricsCounters metricsCounters = new MetricsCounters();
+
     private StructuredResponseParser newParser() {
         CommentParser commentParser = new CommentParser(properties, new MetricsCounters());
         CommentRenderer commentRenderer = new CommentRenderer(commentParser, new TextSanitizer(), properties);
-        return new StructuredResponseParser(commentParser, commentRenderer, new TextSanitizer(), properties);
+        return new StructuredResponseParser(commentParser, commentRenderer, new TextSanitizer(), properties, metricsCounters);
     }
 
     private ReviewSchemaBuilder.SchemaOptions defaultOptions() {
@@ -289,9 +292,16 @@ class StructuredResponseParserTest {
         assertThat(result.failure().kind()).isEqualTo(FailureKind.SCHEMA_MISMATCH);
     }
 
+    // ---- SGB-03/SGB-04/T-4.11 (Structured Output Grammar Budget): truncate, never reject ----
+    //
+    // SGB-01 removed maxLength from the emitted schema (a bounded string repetition is what tripped
+    // llama.cpp's grammar-parser complexity guard in production). An over-length comment/suggestion is
+    // therefore now expected, routine shape -- truncated to the configured cap and published, never a
+    // whole-chunk-retryable SCHEMA_MISMATCH (SRO-04's re-check is still unconditional, it just no longer
+    // rejects on this one dimension).
+
     @Test
-    void commentExceedingMaxLengthIsSchemaMismatchEvenIfTheDecoderConstraintWasNotHonored() {
-        // SRO-04: never trust the constraint -- re-checked independently on the Gateway side.
+    void commentExceedingTheConfiguredCapIsTruncatedAndPublishedNeverSchemaMismatch() {
         String longComment = "x".repeat(50);
         String raw = "{\"files\":{\"A.java\":{\"findings\":[{\"line\":1,\"severity\":\"info\",\"comment\":\""
                 + longComment + "\",\"suggestion\":\"\"}],\"summary\":\"s\"}},\"summary\":\"y\"}";
@@ -300,7 +310,137 @@ class StructuredResponseParserTest {
 
         ValidationResult result = parser.validate(raw, List.of("A.java"), false, null, null, tightOptions, NO_EFFECTIVE_CAP);
 
-        assertThat(result.failure().kind()).isEqualTo(FailureKind.SCHEMA_MISMATCH);
+        assertThat(result.isSuccess()).isTrue();
+        assertThat(result.success().comments()).hasSize(1);
+        String published = result.success().comments().get(0).text();
+        // Truncated to the 10-char cap, not the full 50 "x"s.
+        assertThat(published).doesNotContain("x".repeat(11));
+    }
+
+    /**
+     * T-4.11 / SOGB-01 (BLOCKING): the truncated SUGGESTION must still carry {@code ALTERED_CODE_MARKER}
+     * -- the SOGT-01 regression this branch closes is exactly a pre-truncated string silently reaching
+     * {@code CommentRenderer} and coming back {@code altered == false}.
+     */
+    @Test
+    void overLengthSuggestionIsTruncatedAndStillCarriesTheAlteredCodeMarker() {
+        String longSuggestion = "int x = 1;\n".repeat(10); // well over a small configured cap
+        String raw = "{\"files\":{\"A.java\":{\"findings\":[{\"line\":1,\"severity\":\"info\",\"comment\":\"c\","
+                + "\"suggestion\":\"" + longSuggestion.replace("\n", "\\n") + "\"}],\"summary\":\"s\"}},\"summary\":\"y\"}";
+        StructuredResponseParser parser = newParser();
+        ReviewSchemaBuilder.SchemaOptions tightOptions = new ReviewSchemaBuilder.SchemaOptions(20, 1200, 20, true);
+
+        ValidationResult result = parser.validate(raw, List.of("A.java"), false, null, null, tightOptions, NO_EFFECTIVE_CAP);
+
+        assertThat(result.isSuccess()).isTrue();
+        String published = result.success().comments().get(0).text();
+        assertThat(published).as("a truncated suggestion must never read as a verbatim quotation")
+                .contains("_(normalized for display; not a verbatim quotation)_");
+    }
+
+    @Test
+    void overLengthCommentIsTruncatedAndEndsInTheConstantTruncatedMarker() {
+        String longComment = "This is a very long comment that will not fit.";
+        String raw = "{\"files\":{\"A.java\":{\"findings\":[{\"line\":1,\"severity\":\"info\",\"comment\":\""
+                + longComment + "\",\"suggestion\":\"\"}],\"summary\":\"s\"}},\"summary\":\"y\"}";
+        StructuredResponseParser parser = newParser();
+        ReviewSchemaBuilder.SchemaOptions tightOptions = new ReviewSchemaBuilder.SchemaOptions(20, 12, 2000, true);
+
+        ValidationResult result = parser.validate(raw, List.of("A.java"), false, null, null, tightOptions, NO_EFFECTIVE_CAP);
+
+        assertThat(result.isSuccess()).isTrue();
+        String published = result.success().comments().get(0).text();
+        assertThat(published.stripTrailing()).as("prose truncated by SGB-03 must end in the constant marker")
+                .endsWith("_(truncated)_");
+    }
+
+    @Test
+    void incrementsTheStructuredFieldTruncatedCounter() {
+        String raw = "{\"files\":{\"A.java\":{\"findings\":[{\"line\":1,\"severity\":\"info\",\"comment\":\""
+                + "x".repeat(50) + "\",\"suggestion\":\"" + "y".repeat(50) + "\"}],\"summary\":\"s\"}},\"summary\":\"y\"}";
+        StructuredResponseParser parser = newParser();
+        ReviewSchemaBuilder.SchemaOptions tightOptions = new ReviewSchemaBuilder.SchemaOptions(20, 10, 10, true);
+
+        parser.validate(raw, List.of("A.java"), false, null, null, tightOptions, NO_EFFECTIVE_CAP);
+
+        assertThat(metricsCounters.structuredFieldTruncatedSnapshot())
+                .containsEntry("comment", 1L)
+                .containsEntry("suggestion", 1L);
+    }
+
+    /**
+     * SOGB-03: the truncation point must fall safely outside a backtick run -- a cut landing mid-run
+     * (e.g. after two of a four-backtick run) must not leave a partial fence-shaped sequence in the
+     * published body, since {@code sanitizeCodeBlock}'s own backtick-run collapse always runs on
+     * whatever remains AFTER this truncation (SGB-04's load-bearing ordering).
+     */
+    @Test
+    void truncationLandingInsideABacktickRunStillProducesAFenceBalancedBody() {
+        // cap=10: "code here" (9 chars) + "````" (4 backticks) truncates to "code here" + "`" (cap=10) --
+        // landing one backtick INTO what was a 4-backtick run in the raw model output.
+        String rawSuggestion = "code here````moretext";
+        String raw = "{\"files\":{\"A.java\":{\"findings\":[{\"line\":1,\"severity\":\"info\",\"comment\":\"c\","
+                + "\"suggestion\":\"" + rawSuggestion + "\"}],\"summary\":\"s\"}},\"summary\":\"y\"}";
+        StructuredResponseParser parser = newParser();
+        ReviewSchemaBuilder.SchemaOptions tightOptions = new ReviewSchemaBuilder.SchemaOptions(20, 1200, 10, true);
+
+        ValidationResult result = parser.validate(raw, List.of("A.java"), false, null, null, tightOptions, NO_EFFECTIVE_CAP);
+
+        assertThat(result.isSuccess()).isTrue();
+        String published = result.success().comments().get(0).text();
+        long fenceCount = countOccurrences(published, "````");
+        assertThat(fenceCount % 2).as("the Gateway's own four-backtick fence marker must still pair up").isEqualTo(0);
+    }
+
+    /**
+     * SOGB-03/SOGT-02 (CRITICAL): a cut that would otherwise land exactly between a UTF-16 high/low
+     * surrogate pair must back off by one char instead -- never produce a String with a lone surrogate,
+     * which Jackson's UTF-8 writer/the JDBC driver are not obliged to accept.
+     */
+    @Test
+    void truncationAtASurrogatePairBoundaryNeverProducesALoneSurrogate() {
+        String emoji = "😀"; // U+1F600, a two-char UTF-16 surrogate pair
+        // cap=10: 9 ASCII chars + the emoji -- the naive cut point (index 10) lands exactly on the low
+        // surrogate half of the pair.
+        String rawComment = "x".repeat(9) + emoji + "tail";
+        String raw = "{\"files\":{\"A.java\":{\"findings\":[{\"line\":1,\"severity\":\"info\",\"comment\":\""
+                + rawComment + "\",\"suggestion\":\"\"}],\"summary\":\"s\"}},\"summary\":\"y\"}";
+        StructuredResponseParser parser = newParser();
+        ReviewSchemaBuilder.SchemaOptions tightOptions = new ReviewSchemaBuilder.SchemaOptions(20, 10, 2000, true);
+
+        ValidationResult result = parser.validate(raw, List.of("A.java"), false, null, null, tightOptions, NO_EFFECTIVE_CAP);
+
+        assertThat(result.isSuccess()).isTrue();
+        String published = result.success().comments().get(0).text();
+        assertThat(isEncodableUtf8(published)).as("must never contain a lone (unpaired) surrogate").isTrue();
+        // Round-trips through Jackson without throwing.
+        assertThatCode(() -> new com.fasterxml.jackson.databind.ObjectMapper().writeValueAsString(published))
+                .doesNotThrowAnyException();
+    }
+
+    private long countOccurrences(String haystack, String needle) {
+        long count = 0;
+        int index = 0;
+        while ((index = haystack.indexOf(needle, index)) >= 0) {
+            count++;
+            index += needle.length();
+        }
+        return count;
+    }
+
+    private boolean isEncodableUtf8(String text) {
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
+            if (Character.isHighSurrogate(c)) {
+                if (i + 1 >= text.length() || !Character.isLowSurrogate(text.charAt(i + 1))) {
+                    return false;
+                }
+                i++;
+            } else if (Character.isLowSurrogate(c)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     // ---- COVERAGE_SHORTFALL ----
@@ -345,12 +485,38 @@ class StructuredResponseParserTest {
 
     // ---- SOR-11: structurally un-shortcuttable -- no Backend/StructuredOutputMode dependency ----
 
+    /**
+     * SOGB-04 (Structured Output Grammar Budget, threat model): tightened from a deny-list ("no Backend/
+     * StructuredOutputMode field") to an allow-list -- the parser gained {@code MetricsCounters} as a
+     * collaborator in this branch (its first new collaborator since SOR-11 was written), so the next one
+     * added must fail this test until someone deliberately justifies it, rather than being silently
+     * permitted by a deny-list that never mentioned it.
+     */
     @Test
-    void classHasNoReferenceToBackendOrStructuredOutputMode() {
+    void classOnlyReferencesItsApprovedCollaboratorSet() {
+        List<String> allowedTypePrefixes = List.of(
+                "com.review.gateway.service.CommentParser",
+                "com.review.gateway.service.CommentRenderer",
+                "com.review.gateway.service.TextSanitizer",
+                "com.review.gateway.service.MetricsCounters",
+                "com.review.gateway.config.GatewayProperties",
+                "com.review.gateway.model.enums.",
+                "com.review.gateway.service.dto.",
+                "com.fasterxml.jackson.",
+                "org.slf4j.Logger",
+                "java.util.Set",
+                "java.lang.String");
         for (var field : StructuredResponseParser.class.getDeclaredFields()) {
-            String typeName = field.getType().getName();
-            assertThat(typeName).doesNotContain("Backend");
-            assertThat(typeName).doesNotContain("StructuredOutputMode");
+            Class<?> type = field.getType();
+            String typeName = type.getName();
+            boolean allowed = type.isPrimitive()
+                    || allowedTypePrefixes.stream().anyMatch(typeName::startsWith);
+            assertThat(allowed)
+                    .as("StructuredResponseParser.%s (type %s) is not on the SOR-11/SOGB-04 allow-list -- "
+                            + "adding a new collaborator here needs a deliberate justification, since this "
+                            + "class's un-shortcuttable validation is the property SOR-11 protects",
+                            field.getName(), typeName)
+                    .isTrue();
         }
     }
 

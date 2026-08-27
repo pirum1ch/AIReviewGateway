@@ -32,6 +32,9 @@ public class MetricsCounters {
     private final Map<String, AtomicLong> structuredValidationFailures = new ConcurrentHashMap<>();
     private final Map<String, AtomicLong> structuredConstraintSent = new ConcurrentHashMap<>();
     private final AtomicLong structuredFallbackUsed = new AtomicLong();
+    // Structured Output Grammar Budget (SGB-03/SOGB-11): keyed only on the fixed field-name vocabulary
+    // ("comment"/"suggestion") -- never a file path, project id, or any model-supplied string.
+    private final Map<String, AtomicLong> structuredFieldTruncated = new ConcurrentHashMap<>();
 
     /** @param endpoint a short, fixed label — e.g. {@code "heartbeat"}, {@code "result"}, {@code "fail"}. */
     public void incrementOwnershipMismatch(String endpoint) {
@@ -67,6 +70,17 @@ public class MetricsCounters {
         structuredFallbackUsed.incrementAndGet();
     }
 
+    /**
+     * SGB-03/SOGB-11: every time a structured finding's {@code comment}/{@code suggestion} was truncated
+     * to the configured cap on receipt (never a rejection any more, see {@code StructuredResponseParser}).
+     *
+     * @param field a fixed Gateway constant -- {@code "comment"} or {@code "suggestion"} -- never a
+     *              file path, line number, or any model-supplied text.
+     */
+    public void incrementStructuredFieldTruncated(String field) {
+        structuredFieldTruncated.computeIfAbsent(field, key -> new AtomicLong()).incrementAndGet();
+    }
+
     public Map<String, Long> ownershipMismatchSnapshot() {
         Map<String, Long> snapshot = new LinkedHashMap<>();
         ownershipMismatches.forEach((endpoint, count) -> snapshot.put(endpoint, count.get()));
@@ -91,6 +105,10 @@ public class MetricsCounters {
 
     public long structuredFallbackUsedCount() {
         return structuredFallbackUsed.get();
+    }
+
+    public Map<String, Long> structuredFieldTruncatedSnapshot() {
+        return snapshotOf(structuredFieldTruncated);
     }
 
     private Map<String, Long> snapshotOf(Map<String, AtomicLong> counters) {

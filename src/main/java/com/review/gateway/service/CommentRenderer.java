@@ -54,6 +54,14 @@ public class CommentRenderer {
     /** F-SRO-06: labels the diff-context block unconditionally — it is by definition an excerpt (±N lines), never the whole file. */
     private static final String DIFF_CONTEXT_LABEL = "Context (excerpt from the reviewed diff):";
 
+    /**
+     * SOGB-01 (Structured Output Grammar Budget, BLOCKING): a Gateway-constant marker appended to prose
+     * that {@code StructuredResponseParser} already truncated (SGB-03) -- prose has no {@code
+     * ALTERED_CODE_MARKER}-equivalent today, and an over-length comment routinely cut mid-sentence must
+     * not read as complete. Never derived from model output (WOR-04/SRO-41 discipline).
+     */
+    private static final String TRUNCATED_COMMENT_MARKER = " _(truncated)_";
+
     private static final Pattern BACKTICK_RUN = Pattern.compile("`{3,}");
     /** SRO-56: a leading '/' not followed by '/' or '*' -- preserves ordinary comment-opening code lines. */
     private static final Pattern QUICK_ACTION_LINE = Pattern.compile("^\\s*/(?![/*]).*$");
@@ -97,6 +105,28 @@ public class CommentRenderer {
      */
     public String renderIndexed(String filePath, Integer lineNumber, Severity severity, String rawComment,
                                  String rawSuggestion, ChunkDiffIndex diffIndex) {
+        return renderIndexed(filePath, lineNumber, severity, rawComment, false, rawSuggestion, false, diffIndex);
+    }
+
+    /**
+     * Structured Output Grammar Budget (SGB-04, threat model SOGT-01/SOGB-01, BLOCKING): identical to the
+     * six-argument {@link #renderIndexed(String, Integer, Severity, String, String, ChunkDiffIndex)}
+     * overload, except it additionally carries whether {@code rawComment}/{@code rawSuggestion} were
+     * ALREADY truncated upstream by {@code StructuredResponseParser} (SGB-03) before this method ever
+     * saw them.
+     *
+     * <p>Without this flag, {@link #sanitizeCodeBlock}'s {@code altered} computation
+     * (<code>!capped.equals(raw)</code>) runs against a {@code raw} that IS already the truncated
+     * string, so a pre-truncated suggestion would come back {@code altered == false} and silently ship
+     * with no {@link #ALTERED_CODE_MARKER} — a suggestion cut mid-statement, presented as if it were a
+     * verbatim quotation. That is exactly the {@code F-SRO-06}/{@code SOR-22} regression the threat model
+     * flagged (SOGT-01). This overload ORs the upstream flag into the suggestion block's own {@code
+     * altered} decision, and appends {@link #TRUNCATED_COMMENT_MARKER} to prose that was truncated
+     * upstream (prose has no altered-marker mechanism of its own today).
+     */
+    public String renderIndexed(String filePath, Integer lineNumber, Severity severity, String rawComment,
+                                 boolean commentTruncatedUpstream, String rawSuggestion,
+                                 boolean suggestionTruncatedUpstream, ChunkDiffIndex diffIndex) {
         String sanitizedPath = safeHeaderPath(commentParser.sanitizeFilePath(filePath));
         String header = renderHeader(severity, sanitizedPath, lineNumber);
         // F-SRO-07 (appsec SAST fix round): collapse backtick runs in the PROSE too, not only inside code
@@ -108,9 +138,14 @@ public class CommentRenderer {
         // here (not inside CommentParser.sanitizeProseText, which must stay byte-identical for v1/v2 per
         // SRO-54/SR-08/SR-09) on the already-sanitized prose, before assembly and before any cap.
         String prose = collapseBacktickRuns(commentParser.sanitizeProseText(rawComment));
+        if (commentTruncatedUpstream && !prose.isBlank()) {
+            // SOGB-01: prose has no altered-marker mechanism of its own -- a Gateway-constant suffix
+            // stands in for it, never derived from model output.
+            prose = prose + TRUNCATED_COMMENT_MARKER;
+        }
 
         Optional<String> diffBlock = renderDiffContextBlock(diffIndex, filePath, lineNumber);
-        Optional<String> suggestionBlock = renderSuggestionBlock(rawSuggestion);
+        Optional<String> suggestionBlock = renderSuggestionBlock(rawSuggestion, suggestionTruncatedUpstream);
 
         int maxLength = Math.max(0, properties.getPublish().getMaxCommentLength());
 
@@ -177,7 +212,7 @@ public class CommentRenderer {
 
     // ---- suggestion block (SRO-52/55) ----
 
-    private Optional<String> renderSuggestionBlock(String rawSuggestion) {
+    private Optional<String> renderSuggestionBlock(String rawSuggestion, boolean truncatedUpstream) {
         if (rawSuggestion == null || rawSuggestion.isBlank()) {
             return Optional.empty();
         }
@@ -185,9 +220,13 @@ public class CommentRenderer {
         if (sanitized.text().isBlank()) {
             return Optional.empty();
         }
+        // SOGT-01/SOGB-01: OR in the upstream truncation flag -- sanitizeCodeBlock's own `altered` check
+        // compares against ITS input, which may already be the truncated string (see renderIndexed's
+        // truncated-upstream overload javadoc for why that would otherwise silently omit this marker).
+        boolean altered = sanitized.altered() || truncatedUpstream;
         StringBuilder block = new StringBuilder(SUGGESTED_FIX_LABEL).append('\n').append(CODE_FENCE).append('\n')
                 .append(sanitized.text()).append('\n').append(CODE_FENCE);
-        if (sanitized.altered()) {
+        if (altered) {
             block.append('\n').append(ALTERED_CODE_MARKER);
         }
         return Optional.of(block.toString());

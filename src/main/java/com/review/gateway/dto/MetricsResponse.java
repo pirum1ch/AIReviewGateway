@@ -23,5 +23,6 @@ public record MetricsResponse(
         long legacyParseFallback,
         Map<String, Long> structuredValidationFailures,
         Map<String, Long> structuredConstraintSent,
-        long structuredFallbackUsed) {
+        long structuredFallbackUsed,
+        Map<String, Long> structuredFieldTruncated) {
 }

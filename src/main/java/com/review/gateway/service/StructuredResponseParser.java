@@ -100,13 +100,16 @@ public class StructuredResponseParser {
     private final CommentParser commentParser;
     private final CommentRenderer commentRenderer;
     private final TextSanitizer textSanitizer;
+    private final MetricsCounters metricsCounters;
     private final ObjectMapper objectMapper;
 
     public StructuredResponseParser(CommentParser commentParser, CommentRenderer commentRenderer,
-                                     TextSanitizer textSanitizer, GatewayProperties properties) {
+                                     TextSanitizer textSanitizer, GatewayProperties properties,
+                                     MetricsCounters metricsCounters) {
         this.commentParser = commentParser;
         this.commentRenderer = commentRenderer;
         this.textSanitizer = textSanitizer;
+        this.metricsCounters = metricsCounters;
         // Threat model SOR-14 (TRACKED): a dedicated ObjectMapper with explicit StreamReadConstraints,
         // turning inherited Jackson defaults into a stated contract on the one parser that eats
         // adversarial input by design.
@@ -248,8 +251,14 @@ public class StructuredResponseParser {
         for (RawFinding finding : findingsToRender) {
             // SRO-34: a file whose findings is empty simply contributes no entries to `findings` above.
             Integer normalizedLine = commentParser.normalizeLineNumber(finding.line());
+            // SGB-04/SOGT-01 (Structured Output Grammar Budget, BLOCKING): the comment/suggestion may
+            // already have been truncated above (SGB-03) -- that fact is threaded through explicitly
+            // rather than let CommentRenderer re-derive "was this altered?" against text that is already
+            // the truncated string, which would silently omit ALTERED_CODE_MARKER (see renderIndexed's
+            // javadoc).
             String renderedText = commentRenderer.renderIndexed(finding.filePath(), normalizedLine, finding.severity(),
-                    finding.comment(), finding.suggestion(), diffIndex);
+                    finding.comment(), finding.commentTruncated(), finding.suggestion(), finding.suggestionTruncated(),
+                    diffIndex);
             String sanitizedFilePath = commentParser.sanitizeFilePath(finding.filePath());
             comments.add(new ParsedComment(sanitizedFilePath, normalizedLine, finding.severity(), renderedText));
         }
@@ -332,13 +341,30 @@ public class StructuredResponseParser {
         }
         String comment = commentNode.asText();
         String suggestion = suggestionNode.asText();
-        if (comment.length() > Math.max(0, options.maxCommentChars())) {
-            return ValidationResult.fail(FailureKind.SCHEMA_MISMATCH, "finding 'comment' exceeded the configured maxLength");
+
+        // SGB-01/SGB-03 (Structured Output Grammar Budget): ReviewSchemaBuilder no longer emits
+        // maxLength (a bounded string repetition is what tripped llama.cpp's grammar-parser complexity
+        // guard in production), so an over-length comment/suggestion is now a routine, expected shape --
+        // never a whole-chunk-retryable SCHEMA_MISMATCH. It is truncated to the configured cap instead,
+        // on a code-point boundary (SOGB-03: never split a UTF-16 surrogate pair -- TextSanitizer's
+        // shared helper, not a second unsafe substring). SOGB-04: this runs unconditionally, on every
+        // structured result, with no branch on Backend/StructuredOutputMode/finish_reason/whether the
+        // decoder was actually constrained (SOR-11).
+        TextSanitizer.Truncation commentResult = textSanitizer.truncateSafely(comment, options.maxCommentChars());
+        TextSanitizer.Truncation suggestionResult = textSanitizer.truncateSafely(suggestion, options.maxSuggestionChars());
+        if (commentResult.truncated()) {
+            metricsCounters.incrementStructuredFieldTruncated("comment");
+            log.debug("Structured finding 'comment' truncated to the configured cap (originalLength={}, cappedLength={})",
+                    comment.length(), commentResult.text().length());
         }
-        if (suggestion.length() > Math.max(0, options.maxSuggestionChars())) {
-            return ValidationResult.fail(FailureKind.SCHEMA_MISMATCH, "finding 'suggestion' exceeded the configured maxLength");
+        if (suggestionResult.truncated()) {
+            metricsCounters.incrementStructuredFieldTruncated("suggestion");
+            log.debug("Structured finding 'suggestion' truncated to the configured cap (originalLength={}, cappedLength={})",
+                    suggestion.length(), suggestionResult.text().length());
         }
-        out.add(new RawFinding(path, lineNode.asInt(), severity, comment, suggestion));
+
+        out.add(new RawFinding(path, lineNode.asInt(), severity, commentResult.text(), commentResult.truncated(),
+                suggestionResult.text(), suggestionResult.truncated()));
         return null;
     }
 
@@ -391,6 +417,13 @@ public class StructuredResponseParser {
         return rendered.toString();
     }
 
-    private record RawFinding(String filePath, int line, Severity severity, String comment, String suggestion) {
+    /**
+     * SGB-04 (Structured Output Grammar Budget): {@code commentTruncated}/{@code suggestionTruncated}
+     * carry whether {@link #validateFindingAndCollect} already cut that field to its configured cap --
+     * see {@code CommentRenderer.renderIndexed}'s truncated-upstream overload for why this must not be
+     * re-derived downstream.
+     */
+    private record RawFinding(String filePath, int line, Severity severity, String comment,
+                               boolean commentTruncated, String suggestion, boolean suggestionTruncated) {
     }
 }

@@ -44,7 +44,8 @@ public class AdminController {
                 properties.getPrompt().isEnabled(), snapshot.promptDisabledCount(), snapshot.promptSectionMissingCount(),
                 snapshot.ownershipMismatches(), snapshot.workerFailureReportsIgnored(),
                 snapshot.legacyParseFallback(), snapshot.structuredValidationFailures(),
-                snapshot.structuredConstraintSent(), snapshot.structuredFallbackUsed());
+                snapshot.structuredConstraintSent(), snapshot.structuredFallbackUsed(),
+                snapshot.structuredFieldTruncated());
     }
 
     private BackendView toView(BackendSnapshot snapshot) {
