@@ -38,7 +38,7 @@ ai-review:
         --argjson mergeRequestId "$CI_MERGE_REQUEST_IID" \
         --arg headSha "$CI_COMMIT_SHA" \
         --arg baseSha "$CI_MERGE_REQUEST_DIFF_BASE_SHA" \
-        --arg promptVersion "v1" \
+        --arg promptVersion "$CI_PROMPT_VERSION" \
         --rawfile diff diff.txt \
         '{projectId:$projectId, mergeRequestId:$mergeRequestId, headSha:$headSha,
           baseSha:$baseSha, diff:$diff, promptVersion:$promptVersion, priority:10}' \
