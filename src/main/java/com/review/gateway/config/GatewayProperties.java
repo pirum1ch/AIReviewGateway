@@ -126,6 +126,15 @@ public class GatewayProperties {
     private static final Pattern SOURCE_PATH_PATTERN = Pattern.compile("^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$");
     /** WHR-11: same shape as {@code CreateReviewRequest.promptVersion}'s {@code @Pattern}. */
     private static final Pattern PROMPT_VERSION_PATTERN = Pattern.compile("^[A-Za-z0-9._-]{1,32}$");
+    /**
+     * F-WH-06: {@code gateway.webhook.bot-username} reaches {@code GitLabClientImpl}'s reviewer-listing
+     * call as a query parameter (a value like {@code "bot&scope=all"} would inject extra query params
+     * under Spring's {@code TEMPLATE_AND_VALUES} encoding, which encodes illegal-in-query characters but
+     * leaves {@code &}/{@code =} alone). GitLab's own username alphabet, pinned at startup like every
+     * other config value that reaches a URI (PROJECT_REF_PATTERN/REF_PATTERN/SOURCE_PATH_PATTERN/
+     * PROMPT_VERSION_PATTERN).
+     */
+    private static final Pattern BOT_USERNAME_PATTERN = Pattern.compile("^[A-Za-z0-9._-]{1,255}$");
     private static final int MAX_SOURCE_PATH_LENGTH = 200;
     private static final int MAX_OVERRIDES = 500;
     /**
@@ -520,6 +529,11 @@ public class GatewayProperties {
         }
         if (webhook.getPath() == null || !webhook.getPath().startsWith("/")) {
             throw new IllegalStateException("gateway.webhook.path must start with '/' — refusing to start");
+        }
+        if (webhook.getBotUsername() == null || !BOT_USERNAME_PATTERN.matcher(webhook.getBotUsername()).matches()) {
+            throw new IllegalStateException(
+                    "gateway.webhook.bot-username must match " + BOT_USERNAME_PATTERN.pattern()
+                            + " (F-WH-06 — it reaches a GitLab query parameter) — refusing to start");
         }
         requireGitLabToken("gateway.gitlab.diff-token", gitlab.getDiffToken());
 
