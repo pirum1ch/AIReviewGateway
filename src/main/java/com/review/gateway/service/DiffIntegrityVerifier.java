@@ -21,9 +21,10 @@ import java.util.regex.Pattern;
  *       ({@code /repository/compare}) — WHR-16;</li>
  *   <li>per file: path validation before header synthesis — WHR-12;</li>
  *   <li>per file: {@code a_mode}/{@code b_mode} shape — WHR-12;</li>
- *   <li>per file: the WHR-15/15b empty-diff rule (binary marker / same-path mode-only exemption / the
- *       {@code X-Gitlab-Size} HEAD check for new/deleted files) — files that are exempted are excluded
- *       from the returned, coverage-bearing list entirely (WHT-12);</li>
+ *   <li>per file: the WHR-15/15b empty-diff rule (binary marker / same-path mode-only exemption / pure
+ *       rename with unchanged content, F-WH-04 / the {@code X-Gitlab-Size} HEAD check for new/deleted
+ *       files) — files that are exempted are excluded from the returned, coverage-bearing list entirely
+ *       (WHT-12);</li>
  *   <li>per file, when non-empty: the line-prefix invariant inside every hunk — WHR-13 — and hunk
  *       self-consistency, fail-closed on any parse failure — WHR-14.</li>
  * </ol>
@@ -104,14 +105,33 @@ public class DiffIntegrityVerifier {
         validateMode(entry.bMode());
 
         String diff = entry.diff() == null ? "" : entry.diff();
-        boolean binaryMarker = diff.contains("Binary files") && diff.contains("differ");
+        boolean binaryMarker = isBinaryMarker(diff);
         boolean modeOnlySamePathExempt = !binaryMarker && diff.isEmpty()
                 && entry.aMode() != null && entry.bMode() != null && !entry.aMode().equals(entry.bMode())
                 && Objects.equals(entry.oldPath(), entry.newPath())
                 && !entry.newFile() && !entry.deletedFile();
+        // F-WH-04: a pure rename (path changed, content did not) legitimately has an empty diff -- GitLab
+        // has no "content unchanged" flag, so this is verified rather than merely inferred (WHR-15b's
+        // exact discipline, reused): both sides' sizes must agree before the file is accepted as a sound
+        // exemption. Deliberately disjoint from modeOnlySamePathExempt (same path, mode differs) and from
+        // the new/deleted-file branch below (renamedFile is never true for either).
+        boolean pureRenameCandidate = !binaryMarker && diff.isEmpty()
+                && entry.renamedFile() && !Objects.equals(entry.oldPath(), entry.newPath())
+                && entry.aMode() != null && entry.bMode() != null && entry.aMode().equals(entry.bMode())
+                && !entry.newFile() && !entry.deletedFile();
 
         if (binaryMarker || modeOnlySamePathExempt) {
-            // WHR-15: the only two sound exemptions -- excluded from the coverage-bearing set entirely.
+            // WHR-15: the only sound exemptions -- excluded from the coverage-bearing set entirely.
+            // F-WH-01: visible even though this is not itself an error, so a future fail-open here is
+            // at least observable rather than only inferable from files=N/coverageBearing=M arithmetic.
+            // No path/content logged here (WHR-29) -- the reason alone is enough to spot an anomaly.
+            log.debug("Diff integrity: file exempted from coverage (binaryMarker={} modeOnlySamePath={})",
+                    binaryMarker, modeOnlySamePathExempt);
+            return false;
+        }
+        if (pureRenameCandidate) {
+            verifyPureRenameSizesMatch(projectId, baseSha, headSha, entry);
+            log.debug("Diff integrity: file exempted from coverage (pureRename=true)");
             return false;
         }
 
@@ -122,12 +142,44 @@ public class DiffIntegrityVerifier {
             } else {
                 throw new DiffIntegrityException(DiffIntegrityException.Reason.DIFF_TOO_LARGE_OR_TRUNCATED,
                         "Empty diff on a file that is not new/deleted, not a binary-marker file, and not a "
-                                + "same-path mode-only change (WHR-15)");
+                                + "same-path mode-only change or pure rename (WHR-15)");
             }
         } else {
             validateHunkInvariants(diff);
         }
         return true;
+    }
+
+    /**
+     * F-WH-04: GitLab returns an empty {@code diff} identically for a genuine no-content-change rename
+     * and for one whose (theoretically possible, e.g. a rename bundled with a huge content change that
+     * GitLab still reports {@code renamed_file}) patch was silently truncated. Reuses {@link
+     * GitLabClient#headFileSize} (WHR-15b's exact mechanism, fail-closed on any read failure) to compare
+     * the old path's size at {@code baseSha} against the new path's size at {@code headSha}; only an
+     * exact match is accepted as "genuinely no content change".
+     */
+    private void verifyPureRenameSizesMatch(Long projectId, String baseSha, String headSha, GitLabClient.DiffEntry entry) {
+        long oldSize = gitLabClient.headFileSize(projectId, entry.oldPath(), baseSha);
+        long newSize = gitLabClient.headFileSize(projectId, entry.newPath(), headSha);
+        if (oldSize != newSize) {
+            throw new DiffIntegrityException(DiffIntegrityException.Reason.DIFF_TOO_LARGE_OR_TRUNCATED,
+                    "Empty diff on a renamed file whose old/new content sizes differ -- the diff was "
+                            + "silently truncated by GitLab (WHR-15/WHR-15b)");
+        }
+    }
+
+    /**
+     * F-WH-01: GitLab's binary marker is the diff body's <em>entire</em> content, never a substring of
+     * an ordinary hunk. The previous {@code diff.contains("Binary files") && diff.contains("differ")}
+     * check was an unanchored two-substring scan of 100% MR-author-controlled hunk text, silently
+     * exempting (and dropping from the coverage-bearing set) any ordinary file whose diff happened to
+     * contain both words -- e.g. a comment mentioning something "differ"s. A real binary diff has no
+     * hunk header at all, so anchoring on "the whole body is the marker, and there is no {@code @@}
+     * anywhere in it" makes the two mutually exclusive by construction rather than by luck.
+     */
+    private boolean isBinaryMarker(String diff) {
+        return diff.startsWith("Binary files ") && diff.stripTrailing().endsWith(" differ")
+                && !diff.contains("\n@@");
     }
 
     /**

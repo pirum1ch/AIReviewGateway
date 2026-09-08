@@ -215,6 +215,80 @@ class DiffIntegrityVerifierTest {
         assertThat(result).isEmpty();
     }
 
+    /**
+     * F-WH-01 (High, reproduced in the SAST report): the previous {@code diff.contains("Binary files") &&
+     * diff.contains("differ")} check was an unanchored two-substring scan of the whole hunk body, so any
+     * ordinary file whose diff happened to contain both words -- here, a removed authorization check
+     * whose context line mentions binary files being handled "differently" -- was silently exempted and
+     * dropped out of the coverage-bearing set entirely, with no error, log, or metric. This mirrors the
+     * report's exact reproduction fixture: two files, one an authorization-check removal, one ordinary;
+     * both MUST be in the coverage-bearing result.
+     */
+    @Test
+    void aFileWhoseCommentMentionsDifferingBinaryHandlingIsNotExemptedAsBinary() {
+        stubCompare(false,
+                entry("src/Auth.java", "src/Auth.java", "100644", "100644", false, false, false,
+                        "@@ -1,2 +1,2 @@\n"
+                                + " // Binary files are handled differently here\n"
+                                + "-if (user.isAdmin()) check();\n"
+                                + "+// check removed\n"),
+                entry("src/Other.java", "src/Other.java", "100644", "100644", false, false, false,
+                        "@@ -1 +1 @@\n-a\n+b\n"));
+
+        List<GitLabClient.DiffEntry> result = verifier.verify(PROJECT_ID, MR_IID, BASE_SHA, HEAD_SHA, false);
+
+        assertThat(result).extracting(GitLabClient.DiffEntry::newPath)
+                .containsExactlyInAnyOrder("src/Auth.java", "src/Other.java");
+    }
+
+    /** F-WH-01: a genuine GitLab binary marker (the WHOLE diff body, no hunks) is still exempted. */
+    @Test
+    void aGenuineBinaryMarkerWithTrailingWhitespaceIsStillExempted() {
+        stubCompare(false, entry("img.png", "img.png", "100644", "100644", false, false, false,
+                "Binary files a/img.png and b/img.png differ\n"));
+
+        List<GitLabClient.DiffEntry> result = verifier.verify(PROJECT_ID, MR_IID, BASE_SHA, HEAD_SHA, false);
+
+        assertThat(result).isEmpty();
+    }
+
+    // ---- F-WH-04: pure rename with unchanged content (WHR-15's third exemption) ----
+
+    @Test
+    void aPureRenameWithMatchingSizesIsAcceptedAndExcludedFromCoverage() {
+        stubCompare(false, entry("old.txt", "new.txt", "100644", "100644", false, false, true, ""));
+        when(gitLabClient.headFileSize(PROJECT_ID, "old.txt", BASE_SHA)).thenReturn(42L);
+        when(gitLabClient.headFileSize(PROJECT_ID, "new.txt", HEAD_SHA)).thenReturn(42L);
+
+        List<GitLabClient.DiffEntry> result = verifier.verify(PROJECT_ID, MR_IID, BASE_SHA, HEAD_SHA, false);
+
+        assertThat(result).isEmpty();
+    }
+
+    @Test
+    void aPureRenameWithMismatchedSizesIsRejectedAsTruncated() {
+        stubCompare(false, entry("old.txt", "new.txt", "100644", "100644", false, false, true, ""));
+        when(gitLabClient.headFileSize(PROJECT_ID, "old.txt", BASE_SHA)).thenReturn(42L);
+        when(gitLabClient.headFileSize(PROJECT_ID, "new.txt", HEAD_SHA)).thenReturn(99L);
+
+        assertThatThrownBy(() -> verifier.verify(PROJECT_ID, MR_IID, BASE_SHA, HEAD_SHA, false))
+                .isInstanceOf(DiffIntegrityException.class)
+                .extracting(ex -> ((DiffIntegrityException) ex).reason())
+                .isEqualTo(DiffIntegrityException.Reason.DIFF_TOO_LARGE_OR_TRUNCATED);
+    }
+
+    /** A rename bundled with an actual mode change is not the "pure" (mode-unchanged) case -- still exercises the ordinary hunk path once it has content. */
+    @Test
+    void aRenameWithRealContentChangeIsNotTreatedAsAPureRenameExemption() {
+        stubCompare(false, entry("old.txt", "new.txt", "100644", "100644", false, false, true,
+                "@@ -1 +1 @@\n-old\n+new\n"));
+
+        List<GitLabClient.DiffEntry> result = verifier.verify(PROJECT_ID, MR_IID, BASE_SHA, HEAD_SHA, false);
+
+        assertThat(result).hasSize(1); // ordinary coverage-bearing file, hunk validated normally
+        verify(gitLabClient, never()).headFileSize(anyLong(), anyString(), anyString());
+    }
+
     @Test
     void newFileWithEmptyDiffAndNonZeroHeadSizeIsRejectedAsTruncated() {
         stubCompare(false, entry("big.bin", "big.bin", null, "100644", true, false, false, ""));
