@@ -1,5 +1,8 @@
 package com.review.gateway.service;
 
+import com.review.gateway.config.GatewayProperties;
+import com.review.gateway.exception.DiffFetchUnavailableException;
+import com.review.gateway.exception.DiffIntegrityException;
 import com.review.gateway.exception.GitLabPublishException;
 import com.review.gateway.exception.PromptSourceInvalidException;
 import com.review.gateway.exception.PromptSourceUnavailableException;
@@ -9,6 +12,7 @@ import org.springframework.http.MediaType;
 import org.springframework.test.web.client.MockRestServiceServer;
 import org.springframework.web.client.RestClient;
 
+import java.util.List;
 import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -28,6 +32,7 @@ class GitLabClientImplTest {
 
     private MockRestServiceServer mockServer;
     private MockRestServiceServer promptMockServer;
+    private MockRestServiceServer diffMockServer;
     private GitLabClientImpl client;
 
     @BeforeEach
@@ -42,7 +47,13 @@ class GitLabClientImplTest {
                 .defaultHeader("PRIVATE-TOKEN", "test-gitlab-prompt-token-01234567890");
         promptMockServer = MockRestServiceServer.bindTo(promptBuilder).build();
 
-        client = new GitLabClientImpl(builder.build(), promptBuilder.build(), new TextSanitizer());
+        RestClient.Builder diffBuilder = RestClient.builder()
+                .baseUrl(BASE_URL)
+                .defaultHeader("PRIVATE-TOKEN", "test-gitlab-diff-token-012345678901234");
+        diffMockServer = MockRestServiceServer.bindTo(diffBuilder).build();
+
+        client = new GitLabClientImpl(builder.build(), promptBuilder.build(), diffBuilder.build(),
+                new TextSanitizer(), new com.review.gateway.config.GatewayProperties());
     }
 
     // ---- postDiscussion (existing behavior, unchanged) ----
@@ -330,5 +341,247 @@ class GitLabClientImplTest {
         assertThatThrownBy(() -> client.fetchRawFile("42", "base.md", null, 1000))
                 .isInstanceOf(PromptSourceUnavailableException.class);
         promptMockServer.verify(); // no request was ever issued for any of the three
+    }
+
+    // ==================== GitLab Webhook Diff Trigger (WHR-03/06/15b/16/18/19/20) ====================
+
+    // ---- fetchMergeRequest (WHR-03) ----
+
+    @Test
+    void fetchMergeRequestReturnsStateShasAndReviewerIds() {
+        diffMockServer.expect(requestTo(BASE_URL + "/projects/10/merge_requests/5"))
+                .andExpect(method(GET))
+                .andExpect(header("PRIVATE-TOKEN", "test-gitlab-diff-token-012345678901234"))
+                .andRespond(withSuccess("""
+                        {"state": "opened", "reviewers": [{"id": 35}, {"id": 7}],
+                         "diff_refs": {"base_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                                        "head_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}
+                        """, MediaType.APPLICATION_JSON));
+
+        GitLabClient.MergeRequestSnapshot snapshot = client.fetchMergeRequest(10L, 5L);
+
+        assertThat(snapshot.state()).isEqualTo("opened");
+        assertThat(snapshot.baseSha()).isEqualTo("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        assertThat(snapshot.headSha()).isEqualTo("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        assertThat(snapshot.reviewerIds()).containsExactly(35L, 7L);
+    }
+
+    @Test
+    void fetchMergeRequestFailureIsTransient() {
+        diffMockServer.expect(requestTo(BASE_URL + "/projects/10/merge_requests/5"))
+                .andRespond(withStatus(org.springframework.http.HttpStatus.NOT_FOUND));
+
+        assertThatThrownBy(() -> client.fetchMergeRequest(10L, 5L))
+                .isInstanceOf(DiffFetchUnavailableException.class);
+    }
+
+    @Test
+    void fetchMergeRequestMissingDiffRefsIsTransient() {
+        diffMockServer.expect(requestTo(BASE_URL + "/projects/10/merge_requests/5"))
+                .andRespond(withSuccess("""
+                        {"state": "opened", "reviewers": []}
+                        """, MediaType.APPLICATION_JSON));
+
+        assertThatThrownBy(() -> client.fetchMergeRequest(10L, 5L))
+                .isInstanceOf(DiffFetchUnavailableException.class);
+    }
+
+    // ---- compareDiff (WHR-06/WHR-16/WHR-19/WHR-20) ----
+
+    @Test
+    void compareDiffBuildsQueryParamsAndParsesEntries() {
+        diffMockServer.expect(requestTo(BASE_URL
+                        + "/projects/10/repository/compare?from=aaaaaaa&to=bbbbbbb&unidiff=true"))
+                .andExpect(method(GET))
+                .andRespond(withSuccess("""
+                        {"compare_timeout": false, "diffs": [
+                            {"old_path": "a.txt", "new_path": "a.txt", "a_mode": "100644", "b_mode": "100644",
+                             "new_file": false, "deleted_file": false, "renamed_file": false,
+                             "diff": "@@ -1 +1 @@\\n-old\\n+new\\n"}
+                        ]}
+                        """, MediaType.APPLICATION_JSON));
+
+        GitLabClient.CompareResult result = client.compareDiff(10L, "aaaaaaa", "bbbbbbb");
+
+        assertThat(result.compareTimeout()).isFalse();
+        assertThat(result.files()).hasSize(1);
+        assertThat(result.files().get(0).oldPath()).isEqualTo("a.txt");
+        assertThat(result.files().get(0).diff()).contains("+new");
+    }
+
+    @Test
+    void compareDiffRejectsAMalformedShaWithoutIssuingAnyRequest() {
+        assertThatThrownBy(() -> client.compareDiff(10L, "not-hex!!", "bbbbbbb"))
+                .isInstanceOf(DiffFetchUnavailableException.class);
+        diffMockServer.verify(); // zero interactions
+    }
+
+    @Test
+    void compareDiff404IsAnIntegrityFailureNotATransientOne() {
+        // WHR-20: a force-push race (sha pair unreachable) is deterministic, never retried.
+        diffMockServer.expect(requestTo(BASE_URL
+                        + "/projects/10/repository/compare?from=aaaaaaa&to=bbbbbbb&unidiff=true"))
+                .andRespond(withStatus(org.springframework.http.HttpStatus.NOT_FOUND));
+
+        assertThatThrownBy(() -> client.compareDiff(10L, "aaaaaaa", "bbbbbbb"))
+                .isInstanceOf(DiffIntegrityException.class)
+                .extracting(ex -> ((DiffIntegrityException) ex).reason())
+                .isEqualTo(DiffIntegrityException.Reason.DIFF_UNAVAILABLE);
+    }
+
+    @Test
+    void compareDiffOversizedByContentLengthIsRejectedWithoutReadingBody() {
+        GatewayProperties smallLimit = new GatewayProperties();
+        smallLimit.getGitlab().getDiff().setMaxResponseBytes(10);
+        GitLabClientImpl tightClient = new GitLabClientImpl(
+                RestClient.builder().baseUrl(BASE_URL).build(),
+                RestClient.builder().baseUrl(BASE_URL).build(),
+                RestClient.builder().baseUrl(BASE_URL).defaultHeader("PRIVATE-TOKEN", "t").build(),
+                new TextSanitizer(), smallLimit);
+        RestClient.Builder tightDiffBuilder = RestClient.builder().baseUrl(BASE_URL)
+                .defaultHeader("PRIVATE-TOKEN", "t");
+        MockRestServiceServer tightServer = MockRestServiceServer.bindTo(tightDiffBuilder).build();
+        GitLabClientImpl underTest = new GitLabClientImpl(
+                RestClient.builder().baseUrl(BASE_URL).build(),
+                RestClient.builder().baseUrl(BASE_URL).build(),
+                tightDiffBuilder.build(), new TextSanitizer(), smallLimit);
+
+        tightServer.expect(requestTo(BASE_URL
+                        + "/projects/10/repository/compare?from=aaaaaaa&to=bbbbbbb&unidiff=true"))
+                .andRespond(withSuccess("x".repeat(50), MediaType.APPLICATION_JSON)
+                        .header("Content-Length", "50"));
+
+        assertThatThrownBy(() -> underTest.compareDiff(10L, "aaaaaaa", "bbbbbbb"))
+                .isInstanceOf(DiffFetchUnavailableException.class);
+    }
+
+    // ---- fetchOverflowFlag (WHR-16) ----
+
+    @Test
+    void fetchOverflowFlagReturnsTrueWhenSet() {
+        diffMockServer.expect(requestTo(BASE_URL + "/projects/10/merge_requests/5/changes"))
+                .andRespond(withSuccess("{\"overflow\": true}", MediaType.APPLICATION_JSON));
+
+        assertThat(client.fetchOverflowFlag(10L, 5L)).isTrue();
+    }
+
+    @Test
+    void fetchOverflowFlag404IsIntegrityUnverifiable() {
+        diffMockServer.expect(requestTo(BASE_URL + "/projects/10/merge_requests/5/changes"))
+                .andRespond(withStatus(org.springframework.http.HttpStatus.NOT_FOUND));
+
+        assertThatThrownBy(() -> client.fetchOverflowFlag(10L, 5L))
+                .isInstanceOf(DiffIntegrityException.class)
+                .extracting(ex -> ((DiffIntegrityException) ex).reason())
+                .isEqualTo(DiffIntegrityException.Reason.DIFF_UNAVAILABLE);
+    }
+
+    // ---- headFileSize (WHR-15b) ----
+
+    @Test
+    void headFileSizeParsesTheGitlabSizeHeader() {
+        diffMockServer.expect(requestTo(
+                        BASE_URL + "/projects/10/repository/files/a.txt?ref=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"))
+                .andExpect(method(org.springframework.http.HttpMethod.HEAD))
+                .andRespond(withSuccess().header("X-Gitlab-Size", "408000"));
+
+        long size = client.headFileSize(10L, "a.txt", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+
+        assertThat(size).isEqualTo(408000L);
+    }
+
+    @Test
+    void headFileSizeFailsClosedWhenHeaderMissing() {
+        diffMockServer.expect(requestTo(
+                        BASE_URL + "/projects/10/repository/files/a.txt?ref=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"))
+                .andRespond(withSuccess());
+
+        assertThatThrownBy(() -> client.headFileSize(10L, "a.txt", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"))
+                .isInstanceOf(DiffIntegrityException.class)
+                .extracting(ex -> ((DiffIntegrityException) ex).reason())
+                .isEqualTo(DiffIntegrityException.Reason.DIFF_TOO_LARGE_OR_TRUNCATED);
+    }
+
+    @Test
+    void headFileSizeFailsClosedOnNon2xx() {
+        diffMockServer.expect(requestTo(
+                        BASE_URL + "/projects/10/repository/files/a.txt?ref=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"))
+                .andRespond(withStatus(org.springframework.http.HttpStatus.NOT_FOUND));
+
+        assertThatThrownBy(() -> client.headFileSize(10L, "a.txt", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"))
+                .isInstanceOf(DiffIntegrityException.class);
+    }
+
+    @Test
+    void headFileSizeRejectsAMalformedRefWithoutIssuingAnyRequest() {
+        assertThatThrownBy(() -> client.headFileSize(10L, "a.txt", "not-a-sha"))
+                .isInstanceOf(DiffIntegrityException.class);
+        diffMockServer.verify();
+    }
+
+    // ---- listRecentNotes (WHT-20/§4.4: never throws) ----
+
+    @Test
+    void listRecentNotesReturnsAuthorAndBody() {
+        diffMockServer.expect(requestTo(BASE_URL
+                        + "/projects/10/merge_requests/5/notes?per_page=100&page=1"))
+                .andRespond(withSuccess("""
+                        [{"author": {"id": 35}, "body": "hello"}]
+                        """, MediaType.APPLICATION_JSON));
+
+        List<GitLabClient.Note> notes = client.listRecentNotes(10L, 5L);
+
+        assertThat(notes).hasSize(1);
+        assertThat(notes.get(0).authorId()).isEqualTo(35L);
+        assertThat(notes.get(0).body()).isEqualTo("hello");
+    }
+
+    @Test
+    void listRecentNotesReturnsEmptyOnFailureRatherThanThrowing() {
+        diffMockServer.expect(requestTo(BASE_URL
+                        + "/projects/10/merge_requests/5/notes?per_page=100&page=1"))
+                .andRespond(withServerError());
+
+        List<GitLabClient.Note> notes = client.listRecentNotes(10L, 5L);
+
+        assertThat(notes).isEmpty();
+    }
+
+    // ---- listOpenMergeRequestsForReviewer (WHR-18/23) ----
+
+    @Test
+    void listOpenMergeRequestsForReviewerFollowsPaginationUpToTheBound() {
+        diffMockServer.expect(requestTo(BASE_URL
+                        + "/merge_requests?reviewer_username=ai-review-bot&state=opened&scope=all&per_page=100&page=1"))
+                .andRespond(withSuccess("""
+                        [{"project_id": 10, "iid": 5, "sha": "aaa"}]
+                        """, MediaType.APPLICATION_JSON).header("X-Next-Page", "2"));
+        diffMockServer.expect(requestTo(BASE_URL
+                        + "/merge_requests?reviewer_username=ai-review-bot&state=opened&scope=all&per_page=100&page=2"))
+                .andRespond(withSuccess("""
+                        [{"project_id": 11, "iid": 6, "sha": "bbb"}]
+                        """, MediaType.APPLICATION_JSON));
+
+        List<GitLabClient.MergeRequestRef> refs =
+                client.listOpenMergeRequestsForReviewer("ai-review-bot", null, 5, 100);
+
+        assertThat(refs).hasSize(2);
+        assertThat(refs.get(0).projectId()).isEqualTo(10L);
+        assertThat(refs.get(1).projectId()).isEqualTo(11L);
+    }
+
+    @Test
+    void listOpenMergeRequestsForReviewerStopsAtThePageCapEvenIfMorePagesExist() {
+        diffMockServer.expect(requestTo(BASE_URL
+                        + "/merge_requests?reviewer_username=ai-review-bot&state=opened&scope=all&per_page=100&page=1"))
+                .andRespond(withSuccess("""
+                        [{"project_id": 10, "iid": 5, "sha": "aaa"}]
+                        """, MediaType.APPLICATION_JSON).header("X-Next-Page", "2"));
+
+        List<GitLabClient.MergeRequestRef> refs =
+                client.listOpenMergeRequestsForReviewer("ai-review-bot", null, 1, 100);
+
+        assertThat(refs).hasSize(1);
+        diffMockServer.verify(); // only one page was ever requested
     }
 }

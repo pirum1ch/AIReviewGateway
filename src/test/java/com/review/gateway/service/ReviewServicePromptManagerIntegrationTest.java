@@ -120,10 +120,10 @@ class ReviewServicePromptManagerIntegrationTest extends AbstractPostgresIntegrat
         return properties;
     }
 
-    private GitLabClientImpl newGitLabClient() {
+    private GitLabClientImpl newGitLabClient(GatewayProperties properties) {
         RestClient client = RestClient.builder().baseUrl(stub.baseUrl())
                 .defaultHeader("PRIVATE-TOKEN", "test-token-does-not-matter-for-a-stub-0000").build();
-        return new GitLabClientImpl(client, client, new TextSanitizer());
+        return new GitLabClientImpl(client, client, client, new TextSanitizer(), properties);
     }
 
     private ReviewService newReviewService(GatewayProperties properties, GitLabClient gitLabClient) {
@@ -201,7 +201,7 @@ class ReviewServicePromptManagerIntegrationTest extends AbstractPostgresIntegrat
         stub.stubText("GET", "/projects/1500/repository/files/.ai-review%2Fcode-rules.md/raw?ref=" + PROJECT_SHA,
                 200, "PROJECT CODE RULES TEXT");
 
-        ReviewService reviewService = newReviewService(properties, newGitLabClient());
+        ReviewService reviewService = newReviewService(properties, newGitLabClient(properties));
         CreateReviewCommand command = new CreateReviewCommand(1500L, 700L, "sha-happy", "base",
                 diffOf("A.java", "trivial change"), "v1", 10);
 
@@ -249,7 +249,7 @@ class ReviewServicePromptManagerIntegrationTest extends AbstractPostgresIntegrat
         stub.stub404("GET", "/projects/1501/repository/files/.ai-review%2Farchitecture.md/raw?ref=" + PROJECT_SHA);
         stub.stub404("GET", "/projects/1501/repository/files/.ai-review%2Fcode-rules.md/raw?ref=" + PROJECT_SHA);
 
-        ReviewService reviewService = newReviewService(properties, newGitLabClient());
+        ReviewService reviewService = newReviewService(properties, newGitLabClient(properties));
         CreateReviewCommand command = new CreateReviewCommand(1501L, 701L, "sha-absent", "base",
                 diffOf("A.java", "trivial change"), "v1", 10);
 
@@ -289,7 +289,7 @@ class ReviewServicePromptManagerIntegrationTest extends AbstractPostgresIntegrat
         stub.stubText("GET", "/projects/1502/repository/files/code-rules.md/raw?ref=" + PROJECT_SHA,
                 200, "override code rules content");
 
-        ReviewService reviewService = newReviewService(properties, newGitLabClient());
+        ReviewService reviewService = newReviewService(properties, newGitLabClient(properties));
         CreateReviewCommand command = new CreateReviewCommand(1502L, 702L, "sha-override-typo", "base",
                 diffOf("A.java", "trivial change"), "v1", 10);
 
@@ -322,7 +322,7 @@ class ReviewServicePromptManagerIntegrationTest extends AbstractPostgresIntegrat
         stub.stubText("GET", "/projects/900/repository/files/base.md/raw?ref=" + CORPORATE_SHA, 200, "CORP BASE");
         stub.stub404("GET", "/projects/900/repository/files/rules.md/raw?ref=" + CORPORATE_SHA); // typo'd in prod config
 
-        ReviewService reviewService = newReviewService(properties, newGitLabClient());
+        ReviewService reviewService = newReviewService(properties, newGitLabClient(properties));
         CreateReviewCommand command = new CreateReviewCommand(1503L, 703L, "sha-corp-missing", "base",
                 diffOf("A.java", "trivial change"), "v1", 10);
 
@@ -343,7 +343,7 @@ class ReviewServicePromptManagerIntegrationTest extends AbstractPostgresIntegrat
 
         stub.stub500("GET", "/projects/900/repository/commits/main"); // e.g. GitLab down
 
-        ReviewService reviewService = newReviewService(properties, newGitLabClient());
+        ReviewService reviewService = newReviewService(properties, newGitLabClient(properties));
         CreateReviewCommand command = new CreateReviewCommand(1504L, 704L, "sha-corp-down", "base",
                 diffOf("A.java", "trivial change"), "v1", 10);
 
@@ -377,7 +377,7 @@ class ReviewServicePromptManagerIntegrationTest extends AbstractPostgresIntegrat
         stub.stubText("GET", "/projects/1505/repository/files/.ai-review%2Fcode-rules.md/raw?ref=" + PROJECT_SHA,
                 200, "normal project code rules");
 
-        ReviewService reviewService = newReviewService(properties, newGitLabClient());
+        ReviewService reviewService = newReviewService(properties, newGitLabClient(properties));
         CreateReviewCommand command = new CreateReviewCommand(1505L, 705L, "sha-injection", "base",
                 diffOf("A.java", "trivial change"), "v1", 10);
 
@@ -428,7 +428,7 @@ class ReviewServicePromptManagerIntegrationTest extends AbstractPostgresIntegrat
         stubCorporateSections("CORP BASE", "CORP RULES");
         properties.getPrompt().getProject().setEnabled(false); // keep it to 2 sections for a simpler assertion
 
-        ReviewService reviewService = newReviewService(properties, newGitLabClient());
+        ReviewService reviewService = newReviewService(properties, newGitLabClient(properties));
         CreateReviewCommand command = new CreateReviewCommand(1506L, 706L, "sha-single-override", "base",
                 diffOf("A.java", "trivial change"), "v1", 10);
         CreateReviewResult result = reviewService.createReview(command);
@@ -483,7 +483,7 @@ class ReviewServicePromptManagerIntegrationTest extends AbstractPostgresIntegrat
         String diff = gitSection("A.java", "a".repeat(20)) + gitSection("B.java", "b".repeat(20))
                 + gitSection("C.java", "c".repeat(20)) + gitSection("D.java", "d".repeat(20));
 
-        ReviewService reviewServiceWithPrompt = newReviewService(properties, newGitLabClient());
+        ReviewService reviewServiceWithPrompt = newReviewService(properties, newGitLabClient(properties));
         CreateReviewCommand withPrompt = new CreateReviewCommand(1507L, 707L, "sha-budget-with-prompt", "base",
                 diff, "v2", 10);
         CreateReviewResult resultWithPrompt = reviewServiceWithPrompt.createReview(withPrompt);
@@ -513,7 +513,7 @@ class ReviewServicePromptManagerIntegrationTest extends AbstractPostgresIntegrat
 
         stubCorporateSections("x".repeat(200), "y".repeat(200)); // comfortably exceeds a 5-token cap
 
-        ReviewService reviewService = newReviewService(properties, newGitLabClient());
+        ReviewService reviewService = newReviewService(properties, newGitLabClient(properties));
         CreateReviewCommand command = new CreateReviewCommand(1508L, 709L, "sha-prompt-too-large", "base",
                 diffOf("A.java", "trivial"), "v1", 10);
 
@@ -535,7 +535,7 @@ class ReviewServicePromptManagerIntegrationTest extends AbstractPostgresIntegrat
 
         stubCorporateSections("small corp base", "small corp rules");
 
-        ReviewService reviewService = newReviewService(properties, newGitLabClient());
+        ReviewService reviewService = newReviewService(properties, newGitLabClient(properties));
         CreateReviewCommand command = new CreateReviewCommand(1509L, 710L, "sha-min-budget-floor", "base",
                 diffOf("A.java", "trivial"), "v1", 10);
 
