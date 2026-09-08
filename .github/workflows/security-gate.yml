@@ -6,7 +6,8 @@ name: security-gate
 #   2. sca               — osv-scanner over the GATEWAY CycloneDX SBOM, blocking on High/Critical CVSS.
 #                          (This is the control that would have caught the F01-01 EOL-Spring-Boot CVEs.)
 #   3. sca-worker        — same, for the standalone worker/ project (FW-02: worker deps were previously ungated).
-#   4. semgrep           — p/java + p/sql-injection + p/secrets over the whole tree (incl. worker/), block on ERROR.
+#   4. semgrep           — p/java + p/sql-injection + p/secrets + .semgrep/rules.yml (repo-local: WHR-06/WHR-19
+#                          diff-fetch discipline, F-WH-10) over the whole tree (incl. worker/), block on ERROR.
 #   5. build-test        — mvn verify on Temurin JDK 21 for the Gateway (Zonky embedded-postgres, no Docker).
 #   6. build-test-worker — mvn -f worker/pom.xml verify (FW-02: worker tests were previously never run in CI).
 #
@@ -140,12 +141,12 @@ jobs:
       - name: Semgrep — full report (informational, non-blocking)
         run: |
           semgrep scan --metrics off --disable-version-check \
-            --config p/java --config p/sql-injection --config p/secrets \
+            --config p/java --config p/sql-injection --config p/secrets --config .semgrep/rules.yml \
             . || true
       - name: Semgrep — ERROR-severity gate (blocking)
         run: |
           semgrep scan --metrics off --disable-version-check --error --severity ERROR \
-            --config p/java --config p/sql-injection --config p/secrets \
+            --config p/java --config p/sql-injection --config p/secrets --config .semgrep/rules.yml \
             .
 
   build-test:
