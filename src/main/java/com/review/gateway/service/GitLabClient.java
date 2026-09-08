@@ -108,12 +108,14 @@ public interface GitLabClient {
     long headFileSize(Long projectId, String filePath, String ref);
 
     /**
-     * Best-effort anti-duplicate read of recent MR notes (WHT-20/WHR-28): NEVER throws — any failure
-     * (network, oversized response, parse error, page-cap exceeded) returns an empty list, so the
-     * caller's "if the notes read fails or is ambiguous, choose do not post" rule (§4.4) is the natural
-     * default. Paginated read follows {@code X-Next-Page} up to {@code gateway.gitlab.diff.max-pages}.
+     * Best-effort anti-duplicate read of recent MR notes (WHT-20/WHR-28/F-WH-03): NEVER throws — any
+     * failure (network, oversized response, parse error, page-cap exceeded) returns {@link
+     * Optional#empty()} rather than an empty list, so a genuinely-successful read that simply found no
+     * notes cannot be confused with a failed/ambiguous one. The caller's "if the read fails or is
+     * ambiguous, choose do not post" rule (§4.4) must act on that distinction, not on list emptiness.
+     * Paginated read follows {@code X-Next-Page} up to {@code gateway.gitlab.diff.max-pages}.
      */
-    List<Note> listRecentNotes(Long projectId, Long mergeRequestIid);
+    Optional<List<Note>> listRecentNotes(Long projectId, Long mergeRequestIid);
 
     /**
      * {@code GET /merge_requests?reviewer_username=&state=opened&scope=all&updated_after=} for

@@ -160,7 +160,7 @@ class WebhookReviewTriggerServiceIntegrationTest extends AbstractPostgresIntegra
         GitLabClient gitLabClient = mock(GitLabClient.class);
         when(gitLabClient.fetchMergeRequest(PROJECT_ID, MR_IID)).thenReturn(openMrWithBotAsReviewer());
         when(gitLabClient.fetchOverflowFlag(PROJECT_ID, MR_IID)).thenReturn(true); // WHR-16: overflow -> reject
-        when(gitLabClient.listRecentNotes(PROJECT_ID, MR_IID)).thenReturn(List.of());
+        when(gitLabClient.listRecentNotes(PROJECT_ID, MR_IID)).thenReturn(java.util.Optional.of(List.of()));
 
         newTriggerService(properties, gitLabClient).handle(PROJECT_ID, MR_IID, null);
 

@@ -398,12 +398,13 @@ public class GitLabClientImpl implements GitLabClient {
     }
 
     /**
-     * WHT-20/§4.4: NEVER throws — any failure here (network, oversized response, malformed JSON, page-cap
-     * exceeded) is treated as "ambiguous", which the caller's diagnostic-comment logic must read as
-     * "do not post" rather than crash or retry.
+     * WHT-20/§4.4/F-WH-03: NEVER throws — any failure here (network, oversized response, malformed JSON,
+     * page-cap exceeded) returns {@link Optional#empty()}, which the caller's diagnostic-comment logic
+     * must read as "ambiguous, do not post" -- distinct from {@code Optional.of(List.of())}, a genuinely
+     * successful read that simply found zero notes.
      */
     @Override
-    public List<Note> listRecentNotes(Long projectId, Long mergeRequestIid) {
+    public Optional<List<Note>> listRecentNotes(Long projectId, Long mergeRequestIid) {
         try {
             List<Note> notes = new ArrayList<>();
             int maxPages = Math.max(1, properties.getGitlab().getDiff().getMaxPages());
@@ -419,14 +420,23 @@ public class GitLabClientImpl implements GitLabClient {
                     notes.add(new Note(item.author() == null ? null : item.author().id(), item.body()));
                 }
                 if (!result.hasNext()) {
-                    break;
+                    return Optional.of(List.copyOf(notes));
+                }
+                if (page == maxPages) {
+                    // F-WH-07: hitting the page cap without X-Next-Page running out is itself a
+                    // possibly-truncated read for this best-effort call -- never report it as a complete,
+                    // successful note set.
+                    log.warn("GitLab notes read hit the page cap (gateway.gitlab.diff.max-pages={}) for "
+                                    + "project={} mr={}; treating as ambiguous for the anti-duplicate check",
+                            maxPages, projectId, mergeRequestIid);
+                    return Optional.empty();
                 }
             }
-            return List.copyOf(notes);
+            return Optional.of(List.copyOf(notes));
         } catch (RuntimeException failure) {
-            log.warn("GitLab notes read failed for project={} mr={}; treating as empty for the anti-duplicate "
+            log.warn("GitLab notes read failed for project={} mr={}; treating as ambiguous for the anti-duplicate "
                             + "diagnostic-comment check: {}", projectId, mergeRequestIid, failure.getClass().getSimpleName());
-            return List.of();
+            return Optional.empty();
         }
     }
 
@@ -461,6 +471,12 @@ public class GitLabClientImpl implements GitLabClient {
             }
             if (!result.hasNext()) {
                 break;
+            }
+            if (page == effectiveMaxPages) {
+                // F-WH-07: WHR-18's letter ("hitting the cap rejects") does not apply to this best-effort,
+                // non-diff-bearing read, but a silently-truncated candidate list should still be visible.
+                log.warn("GitLab reviewer merge-request listing hit the page cap (gateway.webhook.sweep.max-pages={}); "
+                        + "the sweep candidate set for this tick may be incomplete", effectiveMaxPages);
             }
         }
         return List.copyOf(results);

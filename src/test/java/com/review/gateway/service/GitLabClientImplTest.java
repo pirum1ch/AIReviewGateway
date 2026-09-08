@@ -604,7 +604,7 @@ class GitLabClientImplTest {
         diffMockServer.verify();
     }
 
-    // ---- listRecentNotes (WHT-20/§4.4: never throws) ----
+    // ---- listRecentNotes (WHT-20/§4.4/F-WH-03: never throws; ambiguous read != successful-and-empty) ----
 
     @Test
     void listRecentNotesReturnsAuthorAndBody() {
@@ -614,22 +614,64 @@ class GitLabClientImplTest {
                         [{"author": {"id": 35}, "body": "hello"}]
                         """, MediaType.APPLICATION_JSON));
 
-        List<GitLabClient.Note> notes = client.listRecentNotes(10L, 5L);
+        Optional<List<GitLabClient.Note>> notes = client.listRecentNotes(10L, 5L);
 
-        assertThat(notes).hasSize(1);
-        assertThat(notes.get(0).authorId()).isEqualTo(35L);
-        assertThat(notes.get(0).body()).isEqualTo("hello");
+        assertThat(notes).isPresent();
+        assertThat(notes.get()).hasSize(1);
+        assertThat(notes.get().get(0).authorId()).isEqualTo(35L);
+        assertThat(notes.get().get(0).body()).isEqualTo("hello");
+    }
+
+    /** F-WH-03: a genuinely successful read that finds zero notes must NOT be conflated with a failed read. */
+    @Test
+    void listRecentNotesReturnsAPresentEmptyListWhenThereAreGenuinelyNoNotes() {
+        diffMockServer.expect(requestTo(BASE_URL
+                        + "/projects/10/merge_requests/5/notes?per_page=100&page=1"))
+                .andRespond(withSuccess("[]", MediaType.APPLICATION_JSON));
+
+        Optional<List<GitLabClient.Note>> notes = client.listRecentNotes(10L, 5L);
+
+        assertThat(notes).contains(List.of());
     }
 
     @Test
-    void listRecentNotesReturnsEmptyOnFailureRatherThanThrowing() {
+    void listRecentNotesReturnsEmptyOptionalOnFailureRatherThanThrowing() {
         diffMockServer.expect(requestTo(BASE_URL
                         + "/projects/10/merge_requests/5/notes?per_page=100&page=1"))
                 .andRespond(withServerError());
 
-        List<GitLabClient.Note> notes = client.listRecentNotes(10L, 5L);
+        Optional<List<GitLabClient.Note>> notes = client.listRecentNotes(10L, 5L);
 
         assertThat(notes).isEmpty();
+    }
+
+    /**
+     * F-WH-03/F-WH-07: hitting the page cap while GitLab still reports {@code X-Next-Page} is a possibly
+     * -truncated read -- treated identically to any other read failure (ambiguous, {@code Optional.empty()}),
+     * never as "successfully read everything and found N notes".
+     */
+    @Test
+    void listRecentNotesTreatsHittingThePageCapAsAmbiguousNotAsASuccessfulPartialRead() {
+        GatewayProperties onePage = new GatewayProperties();
+        onePage.getGitlab().getDiff().setMaxPages(1);
+        RestClient.Builder cappedDiffBuilder = RestClient.builder().baseUrl(BASE_URL)
+                .defaultHeader("PRIVATE-TOKEN", "t");
+        MockRestServiceServer cappedServer = MockRestServiceServer.bindTo(cappedDiffBuilder).build();
+        GitLabClientImpl cappedClient = new GitLabClientImpl(
+                RestClient.builder().baseUrl(BASE_URL).build(),
+                RestClient.builder().baseUrl(BASE_URL).build(),
+                cappedDiffBuilder.build(), new TextSanitizer(), onePage);
+
+        cappedServer.expect(requestTo(BASE_URL
+                        + "/projects/10/merge_requests/5/notes?per_page=100&page=1"))
+                .andRespond(withSuccess("""
+                        [{"author": {"id": 35}, "body": "hello"}]
+                        """, MediaType.APPLICATION_JSON).header("X-Next-Page", "2"));
+
+        Optional<List<GitLabClient.Note>> notes = cappedClient.listRecentNotes(10L, 5L);
+
+        assertThat(notes).isEmpty();
+        cappedServer.verify(); // only page 1 was ever requested
     }
 
     // ---- listOpenMergeRequestsForReviewer (WHR-18/23) ----
