@@ -24,5 +24,7 @@ public record MetricsResponse(
         Map<String, Long> structuredValidationFailures,
         Map<String, Long> structuredConstraintSent,
         long structuredFallbackUsed,
-        Map<String, Long> structuredFieldTruncated) {
+        Map<String, Long> structuredFieldTruncated,
+        Map<String, Long> webhookDiffIntegrityFailures,
+        long webhookRateLimited) {
 }

@@ -35,6 +35,11 @@ public class MetricsCounters {
     // Structured Output Grammar Budget (SGB-03/SOGB-11): keyed only on the fixed field-name vocabulary
     // ("comment"/"suggestion") -- never a file path, project id, or any model-supplied string.
     private final Map<String, AtomicLong> structuredFieldTruncated = new ConcurrentHashMap<>();
+    // GitLab Webhook Diff Trigger (WHR-28): keyed only on DiffIntegrityException.Reason's closed
+    // vocabulary -- never a project id, MR iid, head_sha, or any GitLab-supplied string.
+    private final Map<String, AtomicLong> webhookDiffIntegrityFailures = new ConcurrentHashMap<>();
+    /** WHR-22: every webhook/sweep-triggered creation attempt suppressed by the in-memory rate limit. */
+    private final AtomicLong webhookRateLimited = new AtomicLong();
 
     /** @param endpoint a short, fixed label — e.g. {@code "heartbeat"}, {@code "result"}, {@code "fail"}. */
     public void incrementOwnershipMismatch(String endpoint) {
@@ -81,6 +86,21 @@ public class MetricsCounters {
         structuredFieldTruncated.computeIfAbsent(field, key -> new AtomicLong()).incrementAndGet();
     }
 
+    /**
+     * WHR-28: the authoritative, unconditional signal for a deterministic diff-integrity failure — this
+     * fires regardless of whether the best-effort diagnostic MR comment was posted.
+     *
+     * @param reason one of {@code DiffIntegrityException.Reason}'s names.
+     */
+    public void incrementWebhookDiffIntegrityFailure(String reason) {
+        webhookDiffIntegrityFailures.computeIfAbsent(reason, key -> new AtomicLong()).incrementAndGet();
+    }
+
+    /** WHR-22: fires once per suppressed creation attempt (per-project or global bucket, whichever tripped first). */
+    public void incrementWebhookRateLimited() {
+        webhookRateLimited.incrementAndGet();
+    }
+
     public Map<String, Long> ownershipMismatchSnapshot() {
         Map<String, Long> snapshot = new LinkedHashMap<>();
         ownershipMismatches.forEach((endpoint, count) -> snapshot.put(endpoint, count.get()));
@@ -109,6 +129,14 @@ public class MetricsCounters {
 
     public Map<String, Long> structuredFieldTruncatedSnapshot() {
         return snapshotOf(structuredFieldTruncated);
+    }
+
+    public Map<String, Long> webhookDiffIntegrityFailuresSnapshot() {
+        return snapshotOf(webhookDiffIntegrityFailures);
+    }
+
+    public long webhookRateLimitedCount() {
+        return webhookRateLimited.get();
     }
 
     private Map<String, Long> snapshotOf(Map<String, AtomicLong> counters) {

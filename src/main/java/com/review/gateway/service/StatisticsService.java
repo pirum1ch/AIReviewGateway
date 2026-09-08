@@ -103,7 +103,8 @@ public class StatisticsService {
                 metricsCounters.ownershipMismatchSnapshot(), metricsCounters.workerFailureReportsIgnoredCount(),
                 metricsCounters.legacyParseFallbackCount(), metricsCounters.structuredValidationFailuresSnapshot(),
                 metricsCounters.structuredConstraintSentSnapshot(), metricsCounters.structuredFallbackUsedCount(),
-                metricsCounters.structuredFieldTruncatedSnapshot());
+                metricsCounters.structuredFieldTruncatedSnapshot(), metricsCounters.webhookDiffIntegrityFailuresSnapshot(),
+                metricsCounters.webhookRateLimitedCount());
     }
 
     private double nullToZero(Double value) {
