@@ -31,6 +31,15 @@ public interface ReviewRepository extends JpaRepository<Review, Long> {
             Long projectId, Long mergeRequestId, String headSha, Collection<ReviewStatus> activeStatuses);
 
     /**
+     * GitLab Webhook Diff Trigger (WHR-05): the cheap pre-fetch fast path — if a Review already exists
+     * for this exact {@code (projectId, mergeRequestId, headSha)} key (in ANY status, not just the
+     * "active" subset above), a webhook/sweep redelivery can return its coarse outcome with zero further
+     * GitLab calls. Covered by the existing {@code ix_reviews_mr} index plus a {@code head_sha} filter —
+     * zero new Flyway migrations needed.
+     */
+    boolean existsByProjectIdAndMergeRequestIdAndHeadSha(Long projectId, Long mergeRequestId, String headSha);
+
+    /**
      * Claims the next queued Review: highest {@code priority} first, then oldest {@code createdAt}
      * (FIFO within the same priority). Uses {@code FOR UPDATE SKIP LOCKED} so concurrent claimers
      * never contend on the same row — each queued Review is handed to exactly one caller (req.
