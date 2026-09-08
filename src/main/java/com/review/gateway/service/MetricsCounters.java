@@ -40,6 +40,8 @@ public class MetricsCounters {
     private final Map<String, AtomicLong> webhookDiffIntegrityFailures = new ConcurrentHashMap<>();
     /** WHR-22: every webhook/sweep-triggered creation attempt suppressed by the in-memory rate limit. */
     private final AtomicLong webhookRateLimited = new AtomicLong();
+    /** F-WH-02: the {@code catch (RuntimeException)} backstop in {@code WebhookReviewTriggerService.handle} firing. */
+    private final AtomicLong webhookUnexpectedFailure = new AtomicLong();
 
     /** @param endpoint a short, fixed label — e.g. {@code "heartbeat"}, {@code "result"}, {@code "fail"}. */
     public void incrementOwnershipMismatch(String endpoint) {
@@ -101,6 +103,16 @@ public class MetricsCounters {
         webhookRateLimited.incrementAndGet();
     }
 
+    /**
+     * F-WH-02: fires once per webhook/sweep trigger attempt that hit the {@code catch (RuntimeException)}
+     * backstop -- i.e. an exception type neither of {@code doHandle}'s specific catches enumerated. Should
+     * stay at zero in normal operation; a nonzero count means a new {@code ReviewService.createReview}
+     * exception type (or similar) needs its own specific handling, not just the coarse backstop.
+     */
+    public void incrementWebhookUnexpectedFailure() {
+        webhookUnexpectedFailure.incrementAndGet();
+    }
+
     public Map<String, Long> ownershipMismatchSnapshot() {
         Map<String, Long> snapshot = new LinkedHashMap<>();
         ownershipMismatches.forEach((endpoint, count) -> snapshot.put(endpoint, count.get()));
@@ -137,6 +149,10 @@ public class MetricsCounters {
 
     public long webhookRateLimitedCount() {
         return webhookRateLimited.get();
+    }
+
+    public long webhookUnexpectedFailureCount() {
+        return webhookUnexpectedFailure.get();
     }
 
     private Map<String, Long> snapshotOf(Map<String, AtomicLong> counters) {

@@ -29,5 +29,6 @@ public record MetricsSnapshot(
         long structuredFallbackUsed,
         Map<String, Long> structuredFieldTruncated,
         Map<String, Long> webhookDiffIntegrityFailures,
-        long webhookRateLimited) {
+        long webhookRateLimited,
+        long webhookUnexpectedFailure) {
 }

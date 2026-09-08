@@ -104,7 +104,7 @@ public class StatisticsService {
                 metricsCounters.legacyParseFallbackCount(), metricsCounters.structuredValidationFailuresSnapshot(),
                 metricsCounters.structuredConstraintSentSnapshot(), metricsCounters.structuredFallbackUsedCount(),
                 metricsCounters.structuredFieldTruncatedSnapshot(), metricsCounters.webhookDiffIntegrityFailuresSnapshot(),
-                metricsCounters.webhookRateLimitedCount());
+                metricsCounters.webhookRateLimitedCount(), metricsCounters.webhookUnexpectedFailureCount());
     }
 
     private double nullToZero(Double value) {

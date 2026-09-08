@@ -103,6 +103,30 @@ class ReviewerSweepServiceTest {
         verify(triggerService).handle(3L, 3L, null, false); // budget of 2 exhausted by the first two
     }
 
+    /**
+     * F-WH-02: {@code WebhookReviewTriggerService.handle} already has its own catch-all backstop, but
+     * this defends in depth -- a candidate that somehow still throws must not abort the rest of the tick
+     * (the {@link com.review.gateway.service.PublishRetryService} per-item pattern).
+     */
+    @Test
+    void aCandidateThatThrowsDoesNotAbortTheRestOfTheTick() {
+        List<GitLabClient.MergeRequestRef> refs = List.of(
+                new GitLabClient.MergeRequestRef(1L, 1L, null),
+                new GitLabClient.MergeRequestRef(2L, 2L, null),
+                new GitLabClient.MergeRequestRef(3L, 3L, null));
+        when(gitLabClient.listOpenMergeRequestsForReviewer(anyString(), any(Instant.class), anyInt(), anyInt()))
+                .thenReturn(refs);
+        org.mockito.Mockito.doThrow(new IllegalStateException("boom"))
+                .when(triggerService).handle(2L, 2L, null, true);
+
+        int attempted = sweepService.sweep();
+
+        assertThat(attempted).isEqualTo(3);
+        verify(triggerService).handle(1L, 1L, null, true);
+        verify(triggerService).handle(2L, 2L, null, true);
+        verify(triggerService).handle(3L, 3L, null, false); // budget of 2 (setUp) exhausted by the first two
+    }
+
     @Test
     void aTransientListingFailureIsALoggedNoOp() {
         when(gitLabClient.listOpenMergeRequestsForReviewer(anyString(), any(Instant.class), anyInt(), anyInt()))

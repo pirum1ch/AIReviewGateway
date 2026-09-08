@@ -97,7 +97,15 @@ public class ReviewerSweepService {
                 continue;
             }
             boolean allowComment = diagnosticCommentBudget.getAndUpdate(n -> Math.max(0, n - 1)) > 0;
-            triggerService.handle(candidate.projectId(), candidate.iid(), candidate.sha(), allowComment);
+            try {
+                triggerService.handle(candidate.projectId(), candidate.iid(), candidate.sha(), allowComment);
+            } catch (RuntimeException unexpected) {
+                // F-WH-02: WebhookReviewTriggerService.handle already has its own catch-all backstop, but
+                // this defends in depth so one poisoned candidate can never abort the rest of the tick --
+                // the PublishRetryService per-item pattern this class otherwise mirrors.
+                log.warn("Reviewer sweep: candidate project={} mr={} failed unexpectedly, continuing tick: {}",
+                        candidate.projectId(), candidate.iid(), unexpected.getClass().getSimpleName());
+            }
             attempted++;
         }
         if (attempted > 0) {

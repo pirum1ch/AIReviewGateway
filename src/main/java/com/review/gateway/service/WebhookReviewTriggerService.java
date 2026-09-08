@@ -13,6 +13,7 @@ import org.springframework.stereotype.Service;
 
 import java.time.Duration;
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Semaphore;
@@ -122,6 +123,18 @@ public class WebhookReviewTriggerService {
             }
             try {
                 doHandle(projectId, mergeRequestIid, allowDiagnosticComment);
+            } catch (RuntimeException unexpected) {
+                // F-WH-02: doHandle's own two catches (DiffFetchUnavailableException/DiffIntegrityException)
+                // are an enumeration, and an enumeration is only ever as complete as its last edit --
+                // ReviewService.createReview alone can throw several unrelated types (DiffTooLargeException,
+                // PromptTooLargeException, IncompatiblePromptVersionException, StructuredOutputUnsupportedException,
+                // a re-thrown DataIntegrityViolationException, ...) for a legitimately-reachable input. This
+                // backstop is what actually guarantees WHR-07 ("never throws") rather than the enumeration
+                // merely making it likely: class name only, per WHR-29, never the message (which may carry
+                // GitLab response detail).
+                log.warn("Webhook trigger: unexpected failure handling project={} mr={}: {}",
+                        projectId, mergeRequestIid, unexpected.getClass().getSimpleName());
+                metricsCounters.incrementWebhookUnexpectedFailure();
             } finally {
                 fetchPermits.release();
             }
@@ -167,6 +180,14 @@ public class WebhookReviewTriggerService {
         try {
             List<GitLabClient.DiffEntry> coverageBearing =
                     diffIntegrityVerifier.verify(projectId, mergeRequestIid, baseSha, headSha, structured);
+            if (coverageBearing.isEmpty()) {
+                // F-WH-05: every file was a sound WHR-15 exemption (binary/mode-only/pure-rename) --
+                // there is nothing to review, so don't spend a Review row and Worker minutes on an empty
+                // diff, coarse no-op consistent with the other "nothing to do" outcomes on this path.
+                log.info("Webhook trigger: nothing reviewable (all files exempt) for project={} mr={}",
+                        projectId, mergeRequestIid);
+                return;
+            }
             String assembledDiff = diffAssembler.assemble(coverageBearing);
             CreateReviewCommand command = new CreateReviewCommand(
                     projectId, mergeRequestIid, headSha, baseSha, assembledDiff, promptVersion, null);
@@ -202,16 +223,22 @@ public class WebhookReviewTriggerService {
     }
 
     /**
-     * WHT-20/WHR-28: filters notes by {@code author.id} (server-side field) AND the Gateway-constant
-     * marker AND this exact {@code head_sha} — never by body text alone. {@link
-     * GitLabClient#listRecentNotes} already returns an empty list (never throws) on any read failure,
-     * which naturally falls into "do not post" here.
+     * WHT-20/WHR-28/F-WH-03: filters notes by {@code author.id} (server-side field) AND the
+     * Gateway-constant marker AND this exact {@code head_sha} — never by body text alone. {@link
+     * GitLabClient#listRecentNotes} returns {@link Optional#empty()} (never throws) on any
+     * read failure or ambiguity — that case, and only that case, means "do not post" (§4.4): it must
+     * never be conflated with a genuinely-successful read that simply found no matching prior comment.
      */
     private void postDiagnosticCommentIfNotAlreadyPosted(Long projectId, Long mergeRequestIid, String headSha,
                                                            DiffIntegrityException.Reason reason) {
         Long botUserId = properties.getWebhook().getBotUserId();
-        List<GitLabClient.Note> notes = gitLabClient.listRecentNotes(projectId, mergeRequestIid);
-        boolean alreadyPosted = notes.stream().anyMatch(note ->
+        Optional<List<GitLabClient.Note>> notes = gitLabClient.listRecentNotes(projectId, mergeRequestIid);
+        if (notes.isEmpty()) {
+            log.warn("Webhook trigger: notes read was unreadable/ambiguous for project={} mr={}; "
+                    + "not posting a diagnostic comment (WHR-28 fail-safe direction)", projectId, mergeRequestIid);
+            return;
+        }
+        boolean alreadyPosted = notes.get().stream().anyMatch(note ->
                 botUserId.equals(note.authorId())
                         && note.body() != null
                         && note.body().contains(DiagnosticCommentRenderer.MARKER)
