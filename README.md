@@ -234,6 +234,29 @@ change, never a redeploy):
 | 3 — fleet | All backends on the mode that worked in stage 2. | Steady-state failure rate. |
 | 4 — default | CI templates switch to `promptVersion: v3` (with `git -c core.quotePath=false diff` — see [§6.1c](#61c-structured-review-output-and-response-validation)). | — |
 
+### 4.6 GitLab webhook diff trigger (optional)
+
+**Off by default** (`WEBHOOK_ENABLED=false`). Turning it on replaces the CI runner as the source of the
+diff: GitLab posts a `merge_request` webhook, and the Gateway fetches, verifies and assembles the diff
+itself over the GitLab REST API before creating the Review. Nothing about the `POST /reviews` CI path
+changes, and the two can run side by side. When it is off, no webhook route, security matcher, filter or
+sweep job exists at all.
+
+Turning it on makes four things **required** at startup (the Gateway refuses to boot without them):
+`WEBHOOK_SECRET_TOKENS` (comma-separated set, ≥32 chars each — a set so the secret can be rotated
+without a delivery gap), `WEBHOOK_BOT_USER_ID` (the *numeric* GitLab user id of the reviewer bot — never
+a username), `GITLAB_DIFF_TOKEN` (a **third** GitLab credential, `read_api` only, scoped as narrowly as
+possible — never the comment-publishing token, never the Prompt Manager token), and a
+`WEBHOOK_PROMPT_VERSION` that is present in `ALLOWED_PROMPT_VERSIONS`.
+
+The one decision to make deliberately: `WEBHOOK_ALLOWED_PROJECT_IDS`. Left empty, *any* project where
+someone adds the bot as a reviewer can have its diff fetched into this Gateway's database — the Gateway
+logs a loud WARN at startup for exactly that reason. Set it unless you really do want org-wide
+enrollment. See [§7.2](#72-optional-gitlab-webhook-diff-trigger-default-off) for how the trigger works,
+`DEPLOYMENT.md` for every parameter, and
+[`docs/gitlab-webhook-trigger-threat-model.md`](docs/gitlab-webhook-trigger-threat-model.md) for the
+security rationale behind each one.
+
 ## 5. Deployment
 
 There is no install script in this repository; the primary artifact is a plain executable Spring Boot
@@ -864,14 +887,15 @@ job that blocks the pipeline until the review is actually `PUBLISHED`) is at
 [`examples/.gitlab-ci.yml`](examples/.gitlab-ci.yml) — copy it into the *target* project being
 reviewed, not into this repository.
 
-**The Gateway never calls out to GitLab to compute or fetch a diff.** `GitLabClientImpl` has exactly
-four methods — `postDiscussion` (publish a comment), and, only when Prompt Manager is enabled,
-`resolveCommitSha`/`fetchRawFile`/`resolveDefaultBranch` (read system-prompt source files, [§6.1b](#61b-prompt-manager-and-system-prompt-assembly)).
-There is no `GET .../merge_requests/{iid}/diffs` or `/changes` call anywhere in the Gateway, and no
-inbound GitLab webhook receiver either. The `diff` field in `POST /reviews` is the **entire** contract:
-whoever calls the endpoint (normally this CI job, via `git diff`) must compute the unified diff itself
-and push it in the request body — the Gateway is a purely passive receiver of diff text, never an
-initiator of a GitLab diff fetch.
+**In the default configuration the Gateway never calls out to GitLab to compute or fetch a diff.** The
+`diff` field in `POST /reviews` is the **entire** contract: whoever calls the endpoint (normally this CI
+job, via `git diff`) must compute the unified diff itself and push it in the request body. With
+`gateway.webhook.enabled=false` (the shipped default) `GitLabClientImpl` only ever issues
+`postDiscussion` (publish a comment) and, when Prompt Manager is enabled,
+`resolveCommitSha`/`fetchRawFile`/`resolveDefaultBranch` (read system-prompt source files,
+[§6.1b](#61b-prompt-manager-and-system-prompt-assembly)); there is no inbound webhook endpoint at all —
+the path is not registered as a route, a security matcher, or a filter (see [§7.2](#72-optional-gitlab-webhook-diff-trigger-default-off)).
+
 
 ```yaml
 ai-review:
@@ -1008,6 +1032,57 @@ name a template that actually exists in the Worker's bundle
 (`worker/src/main/resources/.../<promptVersion>.yml`), which the Gateway has no way to verify at request
 time; an allowlisted `promptVersion` whose template is missing from a given Worker still fails only once
 a job reaches that Worker.
+
+### 7.2 Optional: GitLab webhook diff trigger (default off)
+
+An alternative trigger path exists behind a kill-switch: instead of a CI job pushing `git diff`, GitLab
+sends a `merge_request` webhook and the **Gateway fetches the diff itself** over the GitLab REST API.
+It is off by default (`gateway.webhook.enabled=false`); nothing below is registered, validated or
+required until an operator turns it on. Both trigger paths can coexist — the webhook path calls exactly
+the same `ReviewService.createReview(...)` the CI path does, with the same
+`(project_id, merge_request_id, head_sha)` deduplication, so a project running both does not get two
+Reviews.
+
+How it works when enabled:
+
+1. GitLab `POST`s a `merge_request` event to `gateway.webhook.path` (default `/webhooks/gitlab`) with an
+   `X-Gitlab-Token` header. The header is checked against the `gateway.webhook.secret-tokens` **set**
+   (comma-separated, ≥32 chars each — a set, so rotation is add → re-point GitLab → remove, with no
+   delivery gap) and, on success, authorizes the request as `ROLE_WEBHOOK` inside the normal Spring
+   Security chain. Everything else still falls through to `anyRequest().denyAll()`.
+2. **Only `project.id` and `object_attributes.iid` are read out of the body** (plus
+   `object_attributes.last_commit.id` as an untrusted dedup *hint*, never persisted). Every fact the
+   Gateway acts on — whether the bot is a reviewer, the MR state, `base_sha`, `head_sha` — comes from the
+   Gateway's own authenticated `GET /projects/{id}/merge_requests/{iid}`. The bot is matched by numeric
+   `gateway.webhook.bot-user-id`, never by username.
+3. `gateway.webhook.allowed-project-ids` (deploy-time only) gates which projects may be fetched at all,
+   *before* any GitLab call. Empty means "any project the bot can see as a reviewer" and logs a loud
+   startup WARN.
+4. The diff is fetched via `GET /projects/{id}/repository/compare?from=&to=&unidiff=true` using a
+   **third, separate** GitLab credential (`gateway.gitlab.diff-token`, `read_api`, group-scoped —
+   never the write token, never the Prompt Manager token), verified fail-closed
+   (`DiffIntegrityVerifier`: whole-MR `overflow`/`compare_timeout`, per-hunk self-consistency,
+   line-prefix invariant, empty-diff rules incl. an `X-Gitlab-Size` `HEAD` check for new/deleted files),
+   and only then assembled into unified-diff text (`DiffAssembler` synthesizes the `diff --git`/`---`/
+   `+++`/mode lines GitLab does not return). **Any** integrity check failing means no Review is created
+   at all — the Gateway never repairs or partially accepts a diff.
+5. A deterministic integrity failure produces an ERROR log line
+   (`event=diff_integrity_failed project_id=… mr_iid=… head_sha=… reason=…`), a `/metrics` counter, and
+   a best-effort constant-template comment on the MR. It never writes a Review row.
+6. `ReviewerSweepService` runs every `gateway.scheduler.reviewer-sweep-interval` (default 1h) as a
+   backstop in case a delivery is lost or GitLab auto-disables the hook. It is a no-op when the feature
+   is off.
+
+The endpoint always answers the same coarse `202` for everything it accepted (created, deduplicated, bot
+not a reviewer, not an interesting event, rate-limited) — it never tells its caller whether a project
+exists, is reachable, or failed an integrity check.
+
+Config: `gateway.webhook.*` (`enabled`, `secret-tokens`, `path`, `bot-user-id`, `bot-username`,
+`allowed-project-ids`, `max-request-body-bytes`, `prompt-version`, `max-reviews-per-project-per-hour`,
+`max-reviews-per-hour`, `max-concurrent-fetches`, `sweep.*`), `gateway.gitlab.diff-token`,
+`gateway.gitlab.diff.*`, `gateway.scheduler.reviewer-sweep-interval` — the full parameter-by-parameter
+reference is in `DEPLOYMENT.md`, and the security rationale for each is in
+`docs/gitlab-webhook-trigger-threat-model.md`.
 
 ## 8. Review lifecycle
 
