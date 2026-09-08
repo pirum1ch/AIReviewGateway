@@ -274,4 +274,27 @@ class SecurityMatrixTest {
         ResponseEntity<Map> none = restTemplate.exchange("/metrics", HttpMethod.GET, entity(null, null), Map.class);
         assertThat(none.getStatusCode().value()).isEqualTo(401);
     }
+
+    // -------------------------------------------------- /webhooks/gitlab (WHT-24) -
+
+    /**
+     * GitLab Webhook Diff Trigger, WHT-24/WHR-02: with {@code gateway.webhook.enabled=false} (this
+     * test suite's default, matching the shipped default), the webhook path is not registered as a
+     * distinct matcher at all in {@code SecurityConfig} -- it falls through to the same
+     * {@code anyRequest().denyAll()} backstop as any unrelated unknown path. Never a 200, regardless of
+     * whether a (guessed) {@code X-Gitlab-Token} header is presented.
+     */
+    @Test
+    void webhookPathDoesNotExistWhenFeatureDisabled() {
+        ResponseEntity<Map> none = restTemplate.exchange("/webhooks/gitlab", HttpMethod.POST,
+                new HttpEntity<>(Map.of(), new HttpHeaders()), Map.class);
+        assertThat(none.getStatusCode().value()).isIn(401, 403, 404);
+
+        HttpHeaders withToken = new HttpHeaders();
+        withToken.set("X-Gitlab-Token", "guessed-secret-value");
+        withToken.setContentType(org.springframework.http.MediaType.APPLICATION_JSON);
+        ResponseEntity<Map> withGitlabToken = restTemplate.exchange("/webhooks/gitlab", HttpMethod.POST,
+                new HttpEntity<>(Map.of(), withToken), Map.class);
+        assertThat(withGitlabToken.getStatusCode().value()).isIn(401, 403, 404);
+    }
 }

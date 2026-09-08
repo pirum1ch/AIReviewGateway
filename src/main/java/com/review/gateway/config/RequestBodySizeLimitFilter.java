@@ -50,9 +50,18 @@ public class RequestBodySizeLimitFilter extends OncePerRequestFilter {
     private static final PathPattern FAIL_PATTERN = new PathPatternParser().parse("/jobs/{id}/fail");
 
     private final GatewayProperties properties;
+    /**
+     * GitLab Webhook Diff Trigger (WHR-08): matched against the configured {@code gateway.webhook.path}
+     * at construction time (mirroring {@code SecurityConfig}'s matcher) — {@code null} when
+     * {@code gateway.webhook.enabled=false}, so no pattern is ever matched for the disabled path (WHT-24).
+     */
+    private final PathPattern webhookPattern;
 
     public RequestBodySizeLimitFilter(GatewayProperties properties) {
         this.properties = properties;
+        this.webhookPattern = properties.getWebhook().isEnabled()
+                ? new PathPatternParser().parse(properties.getWebhook().getPath())
+                : null;
     }
 
     @Override
@@ -86,6 +95,9 @@ public class RequestBodySizeLimitFilter extends OncePerRequestFilter {
         }
         if (FAIL_PATTERN.matches(decodedPath)) {
             return properties.getJob().getMaxFailBodyBytes();
+        }
+        if (webhookPattern != null && webhookPattern.matches(decodedPath)) {
+            return properties.getWebhook().getMaxRequestBodyBytes();
         }
         return null;
     }

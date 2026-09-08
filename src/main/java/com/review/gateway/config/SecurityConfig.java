@@ -40,24 +40,41 @@ public class SecurityConfig {
         this.objectMapper = objectMapper;
     }
 
+    /**
+     * GitLab Webhook Diff Trigger (WHT-23/WHR-02): authorization stays inside {@code
+     * authorizeHttpRequests}, never {@code permitAll} + a side filter — the webhook path is added to the
+     * matcher with {@code .hasRole("WEBHOOK")} ONLY when {@code gateway.webhook.enabled=true}, so the
+     * surviving {@code .anyRequest().denyAll()} backstop applies to it exactly like every other path when
+     * the feature is off (WHT-24: with the kill-switch off, the path is not merely unauthenticated — it
+     * does not exist as a distinct matcher at all, and falls through to the same deny-all as any other
+     * unknown path).
+     */
     @Bean
     public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+        boolean webhookEnabled = properties.getWebhook().isEnabled();
         http
                 .csrf(AbstractHttpConfigurer::disable)
                 .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
-                .authorizeHttpRequests(auth -> auth
-                        .requestMatchers("/health").permitAll()
-                        .requestMatchers(EndpointRequest.to("health")).permitAll()
-                        .requestMatchers(HttpMethod.DELETE, "/reviews/**").hasRole("ADMIN")
-                        .requestMatchers(HttpMethod.GET, "/backends", "/backends/**").hasRole("ADMIN")
-                        .requestMatchers(HttpMethod.GET, "/metrics", "/metrics/**").hasRole("ADMIN")
-                        .requestMatchers("/reviews/**").hasRole("CI")
-                        .requestMatchers("/jobs/**").hasRole("WORKER")
-                        .anyRequest().denyAll())
+                .authorizeHttpRequests(auth -> {
+                    auth.requestMatchers("/health").permitAll()
+                            .requestMatchers(EndpointRequest.to("health")).permitAll()
+                            .requestMatchers(HttpMethod.DELETE, "/reviews/**").hasRole("ADMIN")
+                            .requestMatchers(HttpMethod.GET, "/backends", "/backends/**").hasRole("ADMIN")
+                            .requestMatchers(HttpMethod.GET, "/metrics", "/metrics/**").hasRole("ADMIN")
+                            .requestMatchers("/reviews/**").hasRole("CI")
+                            .requestMatchers("/jobs/**").hasRole("WORKER");
+                    if (webhookEnabled) {
+                        auth.requestMatchers(HttpMethod.POST, properties.getWebhook().getPath()).hasRole("WEBHOOK");
+                    }
+                    auth.anyRequest().denyAll();
+                })
                 .exceptionHandling(handling -> handling
                         .authenticationEntryPoint(this::handleUnauthenticated)
                         .accessDeniedHandler(this::handleForbidden))
                 .addFilterBefore(new TokenAuthenticationFilter(properties), UsernamePasswordAuthenticationFilter.class);
+        if (webhookEnabled) {
+            http.addFilterBefore(new GitLabWebhookSecretFilter(properties), UsernamePasswordAuthenticationFilter.class);
+        }
         return http.build();
     }
 

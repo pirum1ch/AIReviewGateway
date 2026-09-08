@@ -14,9 +14,6 @@ import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.web.filter.OncePerRequestFilter;
 
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.util.List;
 
 /**
@@ -27,10 +24,9 @@ import java.util.List;
  * actually produce 401 (no/garbage token) or 403 (wrong role) for a protected path; {@code /health}
  * stays reachable with no token at all.
  *
- * <p>SR-02: token comparison is constant-time — both sides are first SHA-256-hashed to a fixed-length
- * digest, then compared with {@link MessageDigest#isEqual(byte[], byte[])} (guaranteed by the JDK to
- * take time independent of where a mismatch occurs). Never {@code String.equals}/{@code ==} on raw
- * token values.
+ * <p>SR-02: token comparison is constant-time, via the shared {@link TokenMatcher} helper (WHR-01: also
+ * reused by {@link GitLabWebhookSecretFilter} rather than forking a second implementation). Never
+ * {@code String.equals}/{@code ==} on raw token values.
  *
  * <p>SR-03 (SHOULD, token rotation via a configurable set of valid tokens per role) is not
  * implemented: the architecture's config surface (§9) defines exactly one token per role, and this
@@ -83,18 +79,6 @@ public class TokenAuthenticationFilter extends OncePerRequestFilter {
     }
 
     private boolean constantTimeEquals(String presented, String configured) {
-        if (configured == null || configured.isBlank() || presented == null) {
-            return false;
-        }
-        return MessageDigest.isEqual(sha256(presented), sha256(configured));
-    }
-
-    private byte[] sha256(String value) {
-        try {
-            return MessageDigest.getInstance("SHA-256").digest(value.getBytes(StandardCharsets.UTF_8));
-        } catch (NoSuchAlgorithmException e) {
-            // SHA-256 is a mandatory JDK algorithm (JCA standard names); this can never actually happen.
-            throw new IllegalStateException("SHA-256 MessageDigest unavailable", e);
-        }
+        return TokenMatcher.constantTimeEquals(presented, configured);
     }
 }
