@@ -1,6 +1,8 @@
 package com.review.gateway.controller;
 
 import com.review.gateway.dto.ErrorResponse;
+import com.review.gateway.exception.DiffFetchUnavailableException;
+import com.review.gateway.exception.DiffIntegrityException;
 import com.review.gateway.exception.DiffTooLargeException;
 import com.review.gateway.exception.IncompatiblePromptVersionException;
 import com.review.gateway.exception.InvalidStateTransitionException;
@@ -54,6 +56,29 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ErrorResponse> handleStructuredOutputUnsupported(StructuredOutputUnsupportedException ex) {
         return ResponseEntity.status(HttpStatus.UNPROCESSABLE_ENTITY)
                 .body(new ErrorResponse("STRUCTURED_OUTPUT_UNSUPPORTED", ex.getMessage()));
+    }
+
+    /**
+     * GitLab Webhook Diff Trigger (WHR-07): defense-in-depth mapping only — {@code WebhookController}
+     * never lets this (or {@link DiffIntegrityException}) reach the framework, so this handler is not
+     * observable through the webhook endpoint's actual behavior in shipped code (which always responds
+     * with the same coarse outcome regardless of cause). Kept for consistency with this class's
+     * exception-handling discipline and as a safety net against a future refactor accidentally letting
+     * it propagate.
+     */
+    @ExceptionHandler(DiffFetchUnavailableException.class)
+    public ResponseEntity<ErrorResponse> handleDiffFetchUnavailable(DiffFetchUnavailableException ex) {
+        log.warn("Diff fetch unavailable: {}", ex.getMessage());
+        return ResponseEntity.status(HttpStatus.BAD_GATEWAY)
+                .body(new ErrorResponse("DIFF_FETCH_FAILED", "Failed to fetch the merge request diff from GitLab"));
+    }
+
+    /** GitLab Webhook Diff Trigger (WHR-07) — see {@link #handleDiffFetchUnavailable} javadoc. */
+    @ExceptionHandler(DiffIntegrityException.class)
+    public ResponseEntity<ErrorResponse> handleDiffIntegrity(DiffIntegrityException ex) {
+        log.warn("Diff integrity check failed (reason={}): {}", ex.reason(), ex.getMessage());
+        return ResponseEntity.status(HttpStatus.UNPROCESSABLE_ENTITY)
+                .body(new ErrorResponse("DIFF_INTEGRITY_CHECK_FAILED", "The merge request diff failed an integrity check"));
     }
 
     @ExceptionHandler(ReviewNotFoundException.class)

@@ -78,6 +78,32 @@ public class RestClientConfig {
     }
 
     /**
+     * GitLab Webhook Diff Trigger's dedicated read-only GitLab client (WHR-06/WHR-10): a THIRD, distinct
+     * {@code PRIVATE-TOKEN} ({@code GITLAB_DIFF_TOKEN}, {@code read_api}, group-scoped to the projects
+     * under webhook-triggered review) and its own timeouts ({@code gateway.gitlab.diff.*}) -- never the
+     * write-scoped {@code gitLabRestClient} nor the corporate-prompt-scoped {@code gitLabPromptRestClient}
+     * (PMR-15's blast-radius reasoning extended a third time). Same host as the other two GitLab clients
+     * (no separate URL anywhere in {@code gateway.webhook.*}). {@code followRedirects(NEVER)} set
+     * explicitly, same reasoning as {@code gitLabPromptRestClient}.
+     */
+    @Bean
+    public RestClient gitLabDiffRestClient() {
+        HttpClient httpClient = HttpClient.newBuilder()
+                .connectTimeout(properties.getGitlab().getDiff().getConnectTimeout())
+                .followRedirects(HttpClient.Redirect.NEVER)
+                .build();
+        JdkClientHttpRequestFactory requestFactory = new JdkClientHttpRequestFactory(httpClient);
+        requestFactory.setReadTimeout(properties.getGitlab().getDiff().getReadTimeout());
+
+        return RestClient.builder()
+                .baseUrl(properties.getGitlab().getBaseUrl())
+                .requestFactory(requestFactory)
+                .defaultHeader("PRIVATE-TOKEN", properties.getGitlab().getDiffToken())
+                .defaultHeader(HttpHeaders.CONTENT_TYPE, "application/json")
+                .build();
+    }
+
+    /**
      * A <em>factory</em>, not a shared {@code RestClient}: {@link com.review.gateway.service.BackendProberImpl}
      * calls {@code get()} fresh for every single probe, so each probe gets its own {@link HttpClient} with
      * an empty connection pool.
