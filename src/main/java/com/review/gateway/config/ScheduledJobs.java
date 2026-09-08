@@ -3,6 +3,7 @@ package com.review.gateway.config;
 import com.review.gateway.service.BackendHealthChecker;
 import com.review.gateway.service.HeartbeatChecker;
 import com.review.gateway.service.PublishRetryService;
+import com.review.gateway.service.ReviewerSweepService;
 import com.review.gateway.service.TimeoutManager;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -29,15 +30,18 @@ public class ScheduledJobs {
     private final TimeoutManager timeoutManager;
     private final BackendHealthChecker backendHealthChecker;
     private final PublishRetryService publishRetryService;
+    private final ReviewerSweepService reviewerSweepService;
 
     public ScheduledJobs(HeartbeatChecker heartbeatChecker,
                           TimeoutManager timeoutManager,
                           BackendHealthChecker backendHealthChecker,
-                          PublishRetryService publishRetryService) {
+                          PublishRetryService publishRetryService,
+                          ReviewerSweepService reviewerSweepService) {
         this.heartbeatChecker = heartbeatChecker;
         this.timeoutManager = timeoutManager;
         this.backendHealthChecker = backendHealthChecker;
         this.publishRetryService = publishRetryService;
+        this.reviewerSweepService = reviewerSweepService;
     }
 
     /** {@code HeartbeatChecker.sweepStalled} (architecture §8), {@code gateway.scheduler.heartbeat-check-interval}. */
@@ -77,6 +81,21 @@ public class ScheduledJobs {
             publishRetryService.retryPublications();
         } catch (Exception e) {
             log.error("Publish retry tick failed; will retry on the next scheduled run", e);
+        }
+    }
+
+    /**
+     * GitLab Webhook Diff Trigger (WHR-23): {@code ReviewerSweepService.sweep}, hourly backstop against a
+     * silently-failing/disabled webhook delivery. {@code ReviewerSweepService} itself checks {@code
+     * gateway.webhook.enabled} and no-ops when the feature is off (WHT-24: the flag governs endpoint
+     * registration, filter, AND this scheduler, one decision point).
+     */
+    @Scheduled(fixedRateString = "#{@gatewayProperties.scheduler.reviewerSweepInterval.toMillis()}")
+    public void sweepReviewers() {
+        try {
+            reviewerSweepService.sweep();
+        } catch (Exception e) {
+            log.error("Reviewer sweep tick failed; will retry on the next scheduled run", e);
         }
     }
 }

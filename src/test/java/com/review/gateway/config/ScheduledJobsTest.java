@@ -3,6 +3,7 @@ package com.review.gateway.config;
 import com.review.gateway.service.BackendHealthChecker;
 import com.review.gateway.service.HeartbeatChecker;
 import com.review.gateway.service.PublishRetryService;
+import com.review.gateway.service.ReviewerSweepService;
 import com.review.gateway.service.TimeoutManager;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -24,6 +25,7 @@ class ScheduledJobsTest {
     private TimeoutManager timeoutManager;
     private BackendHealthChecker backendHealthChecker;
     private PublishRetryService publishRetryService;
+    private ReviewerSweepService reviewerSweepService;
     private ScheduledJobs scheduledJobs;
 
     @BeforeEach
@@ -32,7 +34,9 @@ class ScheduledJobsTest {
         timeoutManager = Mockito.mock(TimeoutManager.class);
         backendHealthChecker = Mockito.mock(BackendHealthChecker.class);
         publishRetryService = Mockito.mock(PublishRetryService.class);
-        scheduledJobs = new ScheduledJobs(heartbeatChecker, timeoutManager, backendHealthChecker, publishRetryService);
+        reviewerSweepService = Mockito.mock(ReviewerSweepService.class);
+        scheduledJobs = new ScheduledJobs(heartbeatChecker, timeoutManager, backendHealthChecker, publishRetryService,
+                reviewerSweepService);
     }
 
     @Test
@@ -92,6 +96,20 @@ class ScheduledJobsTest {
     }
 
     @Test
+    void sweepReviewersDelegatesToReviewerSweepService() {
+        scheduledJobs.sweepReviewers();
+
+        verify(reviewerSweepService).sweep();
+    }
+
+    @Test
+    void sweepReviewersSwallowsExceptions() {
+        when(reviewerSweepService.sweep()).thenThrow(new RuntimeException("boom"));
+
+        assertThatCode(() -> scheduledJobs.sweepReviewers()).doesNotThrowAnyException();
+    }
+
+    @Test
     void oneJobsFailureDoesNotPreventTheOthersFromRunning() {
         doThrow(new RuntimeException("boom")).when(heartbeatChecker).sweepStalled();
 
@@ -99,9 +117,11 @@ class ScheduledJobsTest {
         scheduledJobs.enforceMaxDuration();
         scheduledJobs.probeBackends();
         scheduledJobs.retryPublications();
+        scheduledJobs.sweepReviewers();
 
         verify(timeoutManager).enforceMaxDuration();
         verify(backendHealthChecker).probeAll();
         verify(publishRetryService).retryPublications();
+        verify(reviewerSweepService).sweep();
     }
 }
