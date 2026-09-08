@@ -16,7 +16,6 @@ import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatusCode;
 import org.springframework.stereotype.Component;
-import org.springframework.web.client.HttpClientErrorException;
 import org.springframework.web.client.RestClient;
 import org.springframework.web.client.RestClientException;
 import org.springframework.web.util.UriUtils;
@@ -263,32 +262,40 @@ public class GitLabClientImpl implements GitLabClient {
 
     // ================= GitLab Webhook Diff Trigger (read-only, gitLabDiffRestClient) =================
 
+    /**
+     * QA finding (WHT-15/WHR-19): previously read via {@code .retrieve().body(MergeRequestApiResponse.class)},
+     * which lets Jackson buffer the ENTIRE response before any size check ever runs -- the exact
+     * buffer-then-check mistake WHR-19 exists to forbid (F-DC-01 -&gt; PMT-13 -&gt; here), and this is the
+     * highest-frequency GitLab call in the whole feature (once per webhook delivery, once per sweep
+     * candidate). Now routed through the same {@code exchange(...)} + {@link #readBoundedBody} discipline
+     * as {@link #compareDiff}/{@link #fetchOverflowFlag}/{@link #listRecentNotes}.
+     */
     @Override
     public MergeRequestSnapshot fetchMergeRequest(Long projectId, Long mergeRequestIid) {
-        return withRetry429(() -> {
-            try {
-                MergeRequestApiResponse response = gitLabDiffRestClient.get()
-                        .uri(MERGE_REQUEST_PATH, projectId, mergeRequestIid)
-                        .retrieve()
-                        .body(MergeRequestApiResponse.class);
-                if (response == null || response.diffRefs() == null || response.diffRefs().baseSha() == null
-                        || response.diffRefs().headSha() == null) {
-                    throw new DiffFetchUnavailableException("GitLab merge request lookup returned no usable diff_refs");
-                }
-                List<Long> reviewerIds = response.reviewers() == null ? List.of() : response.reviewers().stream()
-                        .filter(Objects::nonNull)
-                        .map(ReviewerRefApi::id)
-                        .filter(Objects::nonNull)
-                        .toList();
-                return new MergeRequestSnapshot(response.state(), response.diffRefs().baseSha(),
-                        response.diffRefs().headSha(), reviewerIds);
-            } catch (HttpClientErrorException.TooManyRequests tooMany) {
-                throw new RateLimitedSignal(parseRetryAfter(tooMany.getResponseHeaders()));
-            } catch (RestClientException failure) {
-                log.warn("GitLab merge request lookup failed: {}", failure.getClass().getSimpleName());
-                throw new DiffFetchUnavailableException("Failed to fetch merge request from GitLab", failure);
-            }
-        });
+        return withRetry429(() -> gitLabDiffRestClient.get()
+                .uri(MERGE_REQUEST_PATH, projectId, mergeRequestIid)
+                .exchange((request, response) -> {
+                    HttpStatusCode status = response.getStatusCode();
+                    if (status.value() == 429) {
+                        throw new RateLimitedSignal(parseRetryAfter(response.getHeaders()));
+                    }
+                    if (!status.is2xxSuccessful()) {
+                        throw new DiffFetchUnavailableException("GitLab merge request lookup returned status " + status.value());
+                    }
+                    byte[] body = readBoundedBody(response);
+                    MergeRequestApiResponse parsed = parseJson(body, MergeRequestApiResponse.class);
+                    if (parsed.diffRefs() == null || parsed.diffRefs().baseSha() == null
+                            || parsed.diffRefs().headSha() == null) {
+                        throw new DiffFetchUnavailableException("GitLab merge request lookup returned no usable diff_refs");
+                    }
+                    List<Long> reviewerIds = parsed.reviewers() == null ? List.of() : parsed.reviewers().stream()
+                            .filter(Objects::nonNull)
+                            .map(ReviewerRefApi::id)
+                            .filter(Objects::nonNull)
+                            .toList();
+                    return new MergeRequestSnapshot(parsed.state(), parsed.diffRefs().baseSha(),
+                            parsed.diffRefs().headSha(), reviewerIds);
+                }));
     }
 
     @Override
@@ -539,6 +546,16 @@ public class GitLabClientImpl implements GitLabClient {
      * WHR-24: honours GitLab's {@code 429}/{@code Retry-After} with a bounded retry budget
      * ({@value #MAX_429_ATTEMPTS} attempts total, each wait capped at {@value #MAX_RETRY_AFTER_SECONDS}s)
      * — never an unbounded retry loop, never ignored.
+     *
+     * <p>QA finding: every caller of this method (WHTB-DIFF: {@code compareDiff}, {@code
+     * fetchOverflowFlag}, {@code headFileSize}, {@code fetchMergeRequest}, {@code
+     * listOpenMergeRequestsForReviewer}) relies on the documented "never throws (WHR-07)" contract of
+     * {@code WebhookReviewTriggerService}/{@code ReviewerSweepService}, which catch only {@link
+     * DiffFetchUnavailableException}/{@link DiffIntegrityException} — but a genuine transport-level
+     * failure (GitLab unreachable: DNS/connect/TLS failure, not merely an HTTP error status) throws a raw
+     * {@link RestClientException} (e.g. {@code ResourceAccessException}) out of {@code attempt.get()}
+     * that neither of those catch blocks matches. Translated here, once, for every caller at once, rather
+     * than duplicating a try/catch in each of the five methods above.
      */
     private <T> T withRetry429(Supplier<T> attempt) {
         for (int i = 0; i < MAX_429_ATTEMPTS; i++) {
@@ -549,6 +566,12 @@ public class GitLabClientImpl implements GitLabClient {
                     throw new DiffFetchUnavailableException("GitLab rate limit (429) exceeded the retry budget");
                 }
                 sleepBounded(signal.retryAfterSeconds);
+            } catch (RestClientException transportFailure) {
+                // DiffFetchUnavailableException/DiffIntegrityException are plain RuntimeExceptions (not
+                // RestClientException subtypes), so they pass through this catch untouched -- only a raw
+                // transport-level failure (no HTTP response at all) is translated here.
+                log.warn("GitLab request failed at the transport level: {}", transportFailure.getClass().getSimpleName());
+                throw new DiffFetchUnavailableException("Failed to reach GitLab", transportFailure);
             }
         }
         throw new IllegalStateException("unreachable");

@@ -376,6 +376,39 @@ class GitLabClientImplTest {
     }
 
     @Test
+    void fetchMergeRequestTransportFailureIsTranslatedNotRawlyPropagated() {
+        diffMockServer.expect(requestTo(BASE_URL + "/projects/10/merge_requests/5"))
+                .andRespond(request -> {
+                    throw new java.io.IOException("connection refused");
+                });
+
+        assertThatThrownBy(() -> client.fetchMergeRequest(10L, 5L))
+                .isInstanceOf(DiffFetchUnavailableException.class);
+    }
+
+    @Test
+    void fetchMergeRequestOversizedResponseIsRejectedThroughTheSameBoundedReadAsCompareDiff() {
+        // WHT-15/WHR-19 (QA finding): fetchMergeRequest previously bound Jackson directly against the
+        // raw response (.retrieve().body(...)), buffering the ENTIRE body before any size check ran --
+        // now routed through the same readBoundedBody discipline as compareDiff/fetchOverflowFlag.
+        GatewayProperties smallLimit = new GatewayProperties();
+        smallLimit.getGitlab().getDiff().setMaxResponseBytes(10);
+        org.springframework.web.client.RestClient.Builder tightDiffBuilder = org.springframework.web.client.RestClient.builder()
+                .baseUrl(BASE_URL).defaultHeader("PRIVATE-TOKEN", "t");
+        MockRestServiceServer tightServer = MockRestServiceServer.bindTo(tightDiffBuilder).build();
+        GitLabClientImpl underTest = new GitLabClientImpl(
+                org.springframework.web.client.RestClient.builder().baseUrl(BASE_URL).build(),
+                org.springframework.web.client.RestClient.builder().baseUrl(BASE_URL).build(),
+                tightDiffBuilder.build(), new TextSanitizer(), smallLimit);
+
+        tightServer.expect(requestTo(BASE_URL + "/projects/10/merge_requests/5"))
+                .andRespond(withSuccess("x".repeat(50), MediaType.APPLICATION_JSON).header("Content-Length", "50"));
+
+        assertThatThrownBy(() -> underTest.fetchMergeRequest(10L, 5L))
+                .isInstanceOf(DiffFetchUnavailableException.class);
+    }
+
+    @Test
     void fetchMergeRequestMissingDiffRefsIsTransient() {
         diffMockServer.expect(requestTo(BASE_URL + "/projects/10/merge_requests/5"))
                 .andRespond(withSuccess("""
@@ -453,6 +486,58 @@ class GitLabClientImplTest {
 
         assertThatThrownBy(() -> underTest.compareDiff(10L, "aaaaaaa", "bbbbbbb"))
                 .isInstanceOf(DiffFetchUnavailableException.class);
+    }
+
+    // ---- WHR-24: bounded (never unbounded) retry on GitLab 429, honouring Retry-After ----
+
+    @Test
+    void compareDiffTransportFailureIsTranslatedNotRawlyPropagated() {
+        // QA finding: a genuine transport-level failure (GitLab literally unreachable -- no HTTP response
+        // at all, unlike a 4xx/5xx) previously escaped withRetry429 as a raw RestClientException, breaking
+        // WebhookReviewTriggerService's "never throws (WHR-07)" contract, which catches only
+        // DiffFetchUnavailableException/DiffIntegrityException.
+        diffMockServer.expect(requestTo(BASE_URL
+                        + "/projects/10/repository/compare?from=aaaaaaa&to=bbbbbbb&unidiff=true"))
+                .andRespond(request -> {
+                    throw new java.io.IOException("connection refused");
+                });
+
+        assertThatThrownBy(() -> client.compareDiff(10L, "aaaaaaa", "bbbbbbb"))
+                .isInstanceOf(DiffFetchUnavailableException.class);
+    }
+
+    @Test
+    void compareDiffRetriesOn429AndSucceedsWithinTheRetryBudget() {
+        // Retry-After: 0 keeps this test fast (sleepBounded(0) does not actually sleep).
+        diffMockServer.expect(requestTo(BASE_URL
+                        + "/projects/10/repository/compare?from=aaaaaaa&to=bbbbbbb&unidiff=true"))
+                .andRespond(withStatus(org.springframework.http.HttpStatus.TOO_MANY_REQUESTS)
+                        .header("Retry-After", "0"));
+        diffMockServer.expect(requestTo(BASE_URL
+                        + "/projects/10/repository/compare?from=aaaaaaa&to=bbbbbbb&unidiff=true"))
+                .andRespond(withSuccess("""
+                        {"compare_timeout": false, "diffs": []}
+                        """, MediaType.APPLICATION_JSON));
+
+        GitLabClient.CompareResult result = client.compareDiff(10L, "aaaaaaa", "bbbbbbb");
+
+        assertThat(result.files()).isEmpty();
+        diffMockServer.verify(); // exactly the two expected requests -- not more, not fewer
+    }
+
+    @Test
+    void compareDiffGivesUpAfterTheBoundedRetryBudgetIsExhausted() {
+        // WHR-24: MAX_429_ATTEMPTS=3 total attempts -- a persistent 429 must NOT retry forever.
+        for (int i = 0; i < 3; i++) {
+            diffMockServer.expect(requestTo(BASE_URL
+                            + "/projects/10/repository/compare?from=aaaaaaa&to=bbbbbbb&unidiff=true"))
+                    .andRespond(withStatus(org.springframework.http.HttpStatus.TOO_MANY_REQUESTS)
+                            .header("Retry-After", "0"));
+        }
+
+        assertThatThrownBy(() -> client.compareDiff(10L, "aaaaaaa", "bbbbbbb"))
+                .isInstanceOf(DiffFetchUnavailableException.class);
+        diffMockServer.verify(); // exactly 3 attempts -- the bounded budget, not an unbounded loop
     }
 
     // ---- fetchOverflowFlag (WHR-16) ----
