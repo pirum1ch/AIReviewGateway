@@ -4,6 +4,14 @@ This is a single, end-to-end runbook for standing up the whole AI Code Review Pl
 PostgreSQL, the Review Gateway, one Worker/`llama-server` pair, and the GitLab CI integration that
 triggers reviews and receives the resulting MR comments.
 
+**This spans two git repositories.** The Gateway (`AIReviewGateway`, this repo) is the sole owner of
+Review state/business logic and PostgreSQL; the Worker (`AIReviewWorker`,
+[`github.com/pirum1ch/AIReviewWorker`](https://github.com/pirum1ch/AIReviewWorker)) is a separate,
+stateless-HTTP-client repository, present here as a submodule at `worker/` (clone this repo with
+`--recurse-submodules`, or run `git submodule update --init worker` on an existing checkout). See
+`docs/worker-gateway-split-architecture.md` for the full rationale and §11.3 below for the two
+independent `docker-compose.yml` stacks this produces.
+
 Every property name, endpoint, table/column, and CLI flag below is taken directly from this
 repository's code and existing docs — `src/main/java/com/review/gateway/**`, `worker/src/main/java/
 com/review/worker/**`, `src/main/resources/application.yml`, `worker/src/main/resources/
@@ -127,7 +135,16 @@ runbook uses `http://192.168.1.101:8000` throughout to match the Worker's own do
 > listen on plain HTTP internally (root [README §4.3](README.md#43-deployment-must-dos-from-docssecurityfeature-03-sast-reportmd)).
 > Every inbound hop that isn't loopback (CI → Gateway, Worker → Gateway, Admin → Gateway) must have TLS
 > terminated by a reverse proxy in front of the Gateway; this runbook assumes `https://gateway.internal`
-> reaches such a proxy.
+> reaches such a proxy. Since the worker/gateway repository split, Workers are deployed off-host by
+> default (one per `llama-server` host, from the separate `AIReviewWorker` repo) — a TLS endpoint in
+> front of the Gateway is therefore a **hard prerequisite before the first off-host Worker is deployed**,
+> not an optional hardening step; plain-HTTP loopback (`worker.allow-insecure-gateway=true`) is a
+> same-host dev/smoke-test affordance only ([§11.2](#112-local-single-host-smoke-test-this-is-the-exact-recipe-used-to-verify-both-images)),
+> never a substitute for the proxy in production. **If that proxy presents a private/self-signed
+> certificate**, prefer a publicly-trusted or dedicated-internal-CA certificate for it; do not reuse this
+> deployment's `gitlab.local` mkcert CA (its private key lives on a developer workstation and can mint a
+> certificate for any hostname) — see `worker/README.md` §6.3 for the truststore-mount pattern if a
+> custom CA is genuinely unavoidable.
 
 ### Token generation
 
@@ -515,9 +532,17 @@ SUSPECT` (auto-recovers back to `ACTIVE` on the next successful probe).
 
 ## 6. Step 4: Deploy the Worker
 
+The Worker is a **separate git repository** (`github.com/pirum1ch/AIReviewWorker`), present here as a
+submodule at `worker/`. Build it either from inside this checkout after `git submodule update --init
+worker`, or from a standalone clone of that repo — the commands are equivalent:
+
 ```bash
 mvn -q -f worker/pom.xml verify
 # artifact: worker/target/llm-worker.jar
+
+# equivalently, from a standalone clone of github.com/pirum1ch/AIReviewWorker:
+#   mvn -q verify
+#   # artifact: target/llm-worker.jar
 ```
 
 ### 6.1 Environment file
@@ -587,7 +612,9 @@ curl -s http://127.0.0.1:8081/actuator/prometheus | grep worker_
 ### 6.4 Docker alternative
 
 Instead of [§6](#6-step-4-deploy-the-worker)'s jar+systemd/launchd path, build and run `worker/Dockerfile`
-(same base-image pattern as the Gateway's, `HEALTHCHECK` against `GET /actuator/health`):
+(same base-image pattern as the Gateway's, `HEALTHCHECK` against `GET /actuator/health`), or use the
+Worker repo's own `docker-compose.yml` directly (`worker/README.md` §6.4) — both build from the same
+`worker/` tree:
 
 ```bash
 docker build -t llm-worker:latest worker/
@@ -926,9 +953,9 @@ allowlist gate is application-level, not a schema constraint).
 
 ### Бюджет LLM-токенов: сводная таблица
 
-Gateway и Worker — два независимых процесса (`chore/config-consolidation`: не обязательно даже на одной
-машине — см. [§1](#1-architecture-overview)), поэтому у них физически не может быть одного общего файла
-конфигурации. Все параметры ниже вместе формируют **один** бюджет контекстного окна модели, но живут в
+Gateway и Worker — два независимых процесса в **двух независимых git-репозиториях** (`chore/config-consolidation`
+/ `chore/worker-repo-split`: не обязательно даже на одной машине — см. [§1](#1-architecture-overview)),
+поэтому у них физически не может быть одного общего файла конфигурации. Все параметры ниже вместе формируют **один** бюджет контекстного окна модели, но живут в
 разных файлах: `src/main/resources/application.yml` (Gateway, блок `gateway.diff.*`/`gateway.structured.*`/
 `gateway.prompt.limits.*` — секция "§B Бюджет LLM-токенов" в файле), `worker/src/main/resources/
 application.yml` (блок `llama.*`/`worker.limits.*` — секция "§B" там же) и `worker/src/main/resources/
@@ -1004,6 +1031,16 @@ repeatedly, ask that project to resubmit with `promptVersion: v2` while investig
   in its own migration.
 
 ## 8d. Конфигурация: полный справочник параметров
+
+> **Post-split note:** the incidents below predate the worker/gateway repository split and describe a
+> single combined `docker-compose.yml` with `worker1`/`worker2` services. That file no longer exists —
+> `worker/Dockerfile`'s `ENV` and the Worker's own `docker-compose.yml` now live in the separate
+> `AIReviewWorker` repo (`worker/` submodule), while `docker-compose.yml`/`application.yml` here stay
+> Gateway-only. The **same three-layer trap** (`application.yml` default → `Dockerfile ENV` → compose
+> `environment:`) still applies identically — it just now spans two repositories instead of one file
+> tree, which makes it easier, not harder, for the layers to drift, since nobody reviews both trees side
+> by side. `LLAMA_MAX_TOKENS` in particular is Worker-only since the split (removed from the Gateway's
+> `.env`/`docker-compose.yml` — no Gateway property ever read it).
 
 Три независимых слоя решают, какое значение реально увидит процесс: **дефолт в `application.yml`**
 (`${VAR:default}`, зашивается в jar на этапе сборки) → **дефолт в `Dockerfile`** (`ENV VAR="..."`,
@@ -1337,9 +1374,12 @@ VALUES ('llama-01', 'http://192.168.1.101:8000', 'qwen2.5-coder', 1);
 
 ## 11. Docker deployment (verified, both images)
 
-Both components ship a `Dockerfile` — root (Gateway) and `worker/Dockerfile` (Worker) — each a
-multi-stage build (`maven:3.9-eclipse-temurin-21` → `eclipse-temurin:21-jre-jammy`, non-root user, a
-built-in `curl`-based `HEALTHCHECK`). Neither image is published anywhere; build locally from the repo:
+Both components ship a `Dockerfile` — root (Gateway, this repo) and `worker/Dockerfile` (Worker, now the
+separate [`AIReviewWorker`](https://github.com/pirum1ch/AIReviewWorker) repo, present here as the
+`worker/` submodule) — each a multi-stage build (`maven:3.9-eclipse-temurin-21` →
+`eclipse-temurin:21-jre-jammy`, non-root user, a built-in `curl`-based `HEALTHCHECK`). Neither image is
+published anywhere; build locally from the repo (`git submodule update --init worker` first if `worker/`
+is empty):
 
 ```bash
 docker build -t review-gateway:latest .
@@ -1366,6 +1406,10 @@ see [§6.4](#64-docker-alternative)).
 
 ### 11.2 Local single-host smoke test (this is the exact recipe used to verify both images)
 
+Needs both repos checked out (`worker/` initialized via `git submodule update --init worker`, or a
+sibling clone of `AIReviewWorker`) — this recipe predates the repo split and still builds/runs the
+Worker image straight from `worker/Dockerfile` on the same host as the Gateway, which is a legitimate
+same-host dev/smoke-test topology, distinct from the production one in [§11.1](#111-production-topology-reverse-proxy-no-special-flags-needed).
 This is the full topology actually exercised end-to-end against both images on this project: one Docker
 network for Postgres↔Gateway, and `--network host` for the Worker so its one hard requirement —
 `gateway.url` must resolve to a **real** loopback address to use the `WORKER_ALLOW_INSECURE_GATEWAY`
@@ -1433,25 +1477,65 @@ docker rm -f airg-gateway airg-worker airg-postgres
 docker network rm airg-test
 ```
 
-### 11.3 Docker Compose (the same topology, one command)
+### 11.3 Docker Compose (now two separate stacks, one per repo)
 
-`docker-compose.yml` at the repo root automates exactly the §11.2 recipe above — Postgres, the Gateway,
-a one-shot backend-registration job, and the Worker — instead of four separate `docker run` calls. It
-uses the same `network_mode: "service:gateway"` trick for the Worker (so `GATEWAY_URL=http://127.0.0.1:8080`
-is genuinely loopback from the Worker's point of view) and an `ON CONFLICT (name) DO NOTHING` insert for
-the backend row, so it's safe to re-run.
+As of the worker/gateway repository split (`docs/worker-gateway-split-architecture.md`), there is no
+longer a single combined compose file wiring up Postgres + Gateway + Worker in one command — that
+required the Worker and Gateway to share a container network namespace (`network_mode:
+"service:gateway"`), which only made sense while both lived in one repo. That trick is gone entirely and
+must not be reproduced in another form (see [§2's network matrix](#2-prerequisites) and
+`worker/README.md` §6.3 for why: a non-loopback `GATEWAY_URL` always requires `https://`, and forwarding
+a loopback setup to a remote Gateway through a non-encrypting relay is forbidden even with
+`WORKER_ALLOW_INSECURE_GATEWAY=true`).
+
+**Gateway stack** — `docker-compose.yml` at this repo's root: Postgres + the Gateway + a one-shot
+backend-registration job only.
 
 ```bash
 export DB_PASSWORD=change-me CI_TOKEN=$(openssl rand -hex 32) WORKER_TOKEN=$(openssl rand -hex 32) \
-       ADMIN_TOKEN=$(openssl rand -hex 32) GITLAB_TOKEN=$(openssl rand -hex 32) LLAMA_MODEL=qwen2.5-coder
+       ADMIN_TOKEN=$(openssl rand -hex 32) GITLAB_TOKEN=$(openssl rand -hex 32) LLAMA_MODEL=qwen2.5-coder \
+       LLAMA_URL_1=http://192.168.1.101:8000 LLAMA_URL_2=http://192.168.1.102:8000
 # (or put the same variables in a `.env` file next to docker-compose.yml instead of exporting them)
 docker compose up --build
 ```
 
-No defaults are set for the six required secrets (`DB_PASSWORD`, `CI_TOKEN`, `WORKER_TOKEN`,
-`ADMIN_TOKEN`, `GITLAB_TOKEN`, `LLAMA_MODEL`) — Compose refuses to start with a clear
-`required variable ... is missing a value` error if one is unset, rather than silently running with a
-blank/fake value. `LLAMA_URL` defaults to `http://127.0.0.1:8000` (a dev no-op, since no `llama-server`
-runs inside this stack) — override it to point at a real one. Verified end-to-end on this machine: the
-same claim→attempt→failure round-trip described in [§11.2](#112-local-single-host-smoke-test-this-is-the-exact-recipe-used-to-verify-both-images)
-was reproduced through `docker compose up` alone. Tear down with `docker compose down -v`.
+No defaults are set for the required secrets (`DB_PASSWORD`, `CI_TOKEN`, `WORKER_TOKEN`, `ADMIN_TOKEN`,
+`GITLAB_TOKEN`, `LLAMA_MODEL`, `LLAMA_URL_1`, `LLAMA_URL_2`) — Compose refuses to start with a clear
+`required variable ... is missing a value` error if one is unset. This stack alone reproduces the Gateway
+half of the [§11.2](#112-local-single-host-smoke-test-this-is-the-exact-recipe-used-to-verify-both-images)
+recipe (Postgres + Gateway + backend row); it does not start any Worker, so jobs sit in `QUEUED` until
+one is deployed separately. Tear down with `docker compose down -v`.
+
+**Worker stack** — a separate `docker-compose.yml` in the [`AIReviewWorker`](https://github.com/pirum1ch/AIReviewWorker)
+repo (`worker/docker-compose.yml` via the submodule), one Worker service per `llama-server` host, pointed
+at a **remote** Gateway over HTTPS by default — see `worker/README.md` §6.4 for the required `.env` keys
+and the (commented-out, dev-only, Linux-only) same-host loopback affordance.
+
+```bash
+cd worker   # or a standalone AIReviewWorker clone
+cp .env.example .env   # fill in GATEWAY_URL, GATEWAY_API_KEY, WORKER_ID, BACKEND_ID, LLAMA_URL, LLAMA_MODEL
+docker compose up --build
+```
+
+**Cross-repo coupling.** Nothing validates these across the two stacks/processes — see the coupling table
+below.
+
+#### Cross-repo coupling table
+
+| # | Gateway side | Worker side | Symptom when they disagree |
+|---|---|---|---|
+| 1 | `WORKER_TOKEN` | `GATEWAY_API_KEY` | Every claim `401`s; Worker logs `Gateway unavailable while claiming`; reviews sit in `QUEUED`. |
+| 2 | `backends.name` (seeded `llama-01`/`llama-02`) | `BACKEND_ID` | Claims return `204` forever — indistinguishable from an empty queue by design. Reviews sit in `QUEUED`. |
+| 3 | `LLAMA_URL_1`/`LLAMA_URL_2` (= `backends.url`, health probe) | `LLAMA_URL` (inference) | Backend flips `SUSPECT` while the Worker happily runs jobs, or vice versa. |
+| 4 | `BACKEND_ALLOWED_HOST_PATTERN` | — | Backend registration/probe rejected Gateway-side. |
+| 5 | `ALLOWED_PROMPT_VERSIONS` (e.g. adding `v3`) | prompt templates baked into the Worker jar | "Workers first, Gateway second" is a **cross-repo release-ordering** rule; the `worker/` submodule pin records the intended pairing (§3.2 of `docs/worker-gateway-split-architecture.md`). |
+| 6 | `gateway.structured.max-schema-bytes`, `gateway.diff.answer-reserve` | `worker.limits.max-constraint-bytes`, `v3.yml` `maxTokens`, `LLAMA_MAX_TOKENS` | The whole [§8c/§8d budget table](#8d-конфигурация-полный-справочник-параметров) below now spans two repositories. |
+| 7 | reverse proxy / TLS endpoint | `GATEWAY_URL` | Worker refuses to start (non-loopback + plain HTTP) or fails the TLS handshake ([§11.1](#111-production-topology-reverse-proxy-no-special-flags-needed)). |
+
+**Post-split operational step:** delete the pre-split combined `.env` (the one that used to hold
+`WORKER_ID_1/2`, `LLAMA_URL_1/2`, and `WORKER_TOKEN` together) from every Worker host, and set the new
+Worker `.env` to `0600`, owned by the Worker service user. If any Worker host ever held the full Gateway
+`.env` (`DB_PASSWORD`/`GITLAB_TOKEN`/`CI_TOKEN`/`ADMIN_TOKEN`), treat those secrets as exposed to that
+host and rotate them. `WORKER_TOKEN` rotation is a two-repo, N-host operation: rotate the Gateway's value
+and every Worker's `GATEWAY_API_KEY` together; the interim is a self-healing `401` window (Workers retry
+`POST /jobs/claim` forever and never exit — `worker/README.md` §9), never data loss.
