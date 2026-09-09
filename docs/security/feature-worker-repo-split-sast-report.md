@@ -209,6 +209,16 @@ F-WRS-06 and F-WRS-07 as immediate out-of-band actions (both are minutes of work
 F-WRS-02 / F-WRS-05 to `backend-developer` as one small docs pass. F-WRS-02 is the one I would not let
 sit long: a runbook that says `-p 8080:8080` will eventually be followed.
 
+**Post-merge update (2026-09-09):** `chore/worker-repo-split` merged to `master` (commit `3b27690`) with
+F-WRS-06 closed as a recorded owner decision (repo stays public; see the WRR-14a amendment in
+`docs/worker-repo-split-threat-model.md`) and F-WRS-01/02/05 closed by `backend-developer`'s docs-only fix
+round (commit `683bd4a`, pre-merge). **F-WRS-07 is PARTIALLY closed**: the owner enabled "Require pull
+request before merging" on `AIReviewWorker`'s `master`, confirmed via
+`GET /repos/pirum1ch/AIReviewWorker/branches/master` → `protected: true` (direct pushes now blocked, the
+core WRR-14d ask). Required status checks for the four `security-gate.yml` jobs are not yet configured —
+downgraded from blocking MUST to a tracked SHOULD (see the WRR-14d amendment) since PR-required review is
+the primary control and is now in place. No open item blocks anything already merged.
+
 ---
 
 `docs/` is gitignored in this repo — commit with

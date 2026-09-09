@@ -247,12 +247,15 @@ Tag = MUST / SHOULD / ACCEPTED-RISK. Each is testable/inspectable by the `F-WRS-
   c. **No Actions secrets and no environments** are configured in the Worker repo — its gate needs none.
   d. `master` requires a PR with the four checks green. If branch protection/rulesets are unavailable on
      this account plan, record it as an explicit **ACCEPTED-RISK** line in the Worker README rather than
-     leaving it implicit, and keep the PR-only discipline by convention. **Status (F-WRS-07, tracked, not
-     closed): branch protection is being enabled by the repo owner directly in GitHub settings
-     (2026-09-09), in parallel with this docs round — this document's job is to record that it happened
-     once confirmed, not to configure it. Leave this sub-item open until a follow-up API check (`GET
-     /branches` → `master.protected: true` or `GET /rulesets` → non-empty) confirms the setting, or until
-     the owner records an explicit ACCEPTED-RISK line instead.**
+     leaving it implicit, and keep the PR-only discipline by convention. **Status (F-WRS-07, PARTIALLY
+     CLOSED, 2026-09-09): confirmed via `GET /repos/pirum1ch/AIReviewWorker/branches/master` →
+     `protected: true`. The owner enabled "Require pull request before merging" — direct pushes to
+     `master` are now blocked. Required status checks (the four `security-gate.yml` jobs) are NOT yet
+     configured as required, so a PR can still be merged with a red gitleaks/sca/semgrep/build-test —
+     the gate remains advisory-only within a PR, same as it was on direct pushes before. Remaining gap
+     tracked as a SHOULD, not a blocking MUST (the PR-review step itself is the primary control WRR-14d
+     asked for): enable "Require status checks to pass" for the four job names in the same branch
+     protection rule when convenient.**
   e. Collaborator set is no wider than the Gateway repo's (WRT-11).
 
 ### Principle preservation & operations
@@ -285,9 +288,9 @@ WRR-12, WRR-13, WRR-14, WRR-15.
 **Accepted residuals:** submodule pin drift (§3.2); WSR-INH-1/WSR-INH-2 (shared `WORKER_TOKEN`, a
 compromised Worker host reads its own diffs) — unchanged by this split; WRR-14a's repo-visibility (public,
 accepted decision, see the amendment above — no longer a residual awaiting a fix, but recorded rather than
-silently accepted); branch protection availability (WRR-14d) if the account plan does not offer it — as of
-this round WRR-14d is **open, tracked**, not accepted-risk: the owner is enabling it directly in GitHub
-settings (2026-09-09) and it should be re-verified once done, per the amendment above.
+silently accepted); WRR-14d's required-status-checks sub-gap (PR-required is now on, confirmed via API
+2026-09-09; required status checks for the four `security-gate.yml` jobs are not yet enabled — tracked as
+a SHOULD follow-up, see the amendment above, not a blocker).
 
 The two ordering constraints that make the difference between a clean split and an incident:
 
