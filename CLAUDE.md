@@ -26,8 +26,11 @@ branch):
   `max-suggestion-chars`), never a schema constraint. Both backends currently ship with
   `structured_output_mode = OFF`; re-enabling either one requires the empirical probes in that
   architecture doc's §6 first (a schema that merely *looks* fine is not evidence it compiles).
-- `worker/` — a separate Maven module, the stateless LLM Worker (Executor) that claims jobs and calls
-  `llama-server`. See `worker/README.md`.
+- `worker/` — the stateless LLM Worker (Executor) that claims jobs and calls `llama-server`. As of the
+  worker/gateway repository split (`docs/worker-gateway-split-architecture.md`), this is **a separate
+  Git repository** (`github.com/pirum1ch/AIReviewWorker`), present here as a **git submodule** at the
+  same path — clone this repo with `--recurse-submodules`, or run `git submodule update --init worker`
+  on an existing checkout, or `worker/` will appear empty. See `worker/README.md`.
 - `README.md` (root) — the authoritative integration guide: every endpoint, feature flag, and error code
   actually implemented, in plain language. **Read this, not the original spec docs, for current
   behavior**; read `DEPLOYMENT.md` (below) for the exhaustive parameter-by-parameter reference.
@@ -40,7 +43,11 @@ branch):
   `threat-model.md`/`worker-threat-model.md` (baseline), `prompt-manager-architecture.md`/
   `prompt-manager-threat-model.md` (V3), `structured-review-output-architecture.md`/
   `structured-review-output-threat-model.md` (V5), `structured-output-grammar-budget-architecture.md`/
-  `-threat-model.md` (the grammar-budget fix above), and per-feature SAST reports under `docs/security/`.
+  `-threat-model.md` (the grammar-budget fix above), `worker-gateway-split-architecture.md`/
+  `worker-repo-split-threat-model.md` (the `worker/` repository split above), and per-feature SAST
+  reports under `docs/security/`. This stays the platform docs home for both sides of the Worker
+  protocol even after the split — `worker-architecture.md`/`worker-threat-model.md`/
+  `docs/security/worker-sast-report.md` are not moved into the new Worker repo.
 
 The original spec docs are still present at the repo root (`Требования_Review_Gateway_v2.md`, `#
 Итоговая архитектура AI Code Review Platform.md`, `Системный промт для генерации кода Review
@@ -60,6 +67,10 @@ export PATH="$JAVA_HOME/bin:$HOME/tools/apache-maven-3.9.9/bin:$PATH"
 ```
 
 Build/test: `mvn -q compile`, `mvn -q test`. **No Docker on this machine** — Testcontainers will not work; for integration tests use Zonky embedded-postgres (`io.zonky.test:embedded-postgres`) or plain unit tests with mocks.
+
+`worker/` is now a separate git submodule (see "Repository state" above) — `mvn -f worker/pom.xml …`
+(or `cd worker && mvn …`) only works once it's checked out (`git submodule update --init worker`); an
+uninitialized submodule leaves `worker/` empty and any command against it fails on a missing `pom.xml`.
 
 ## What is being built
 
@@ -160,3 +171,12 @@ doubt, but keep working on other features while waiting. Code quality bar from t
 applies to all new code: Java 21, Spring Boot 3.2/3.5, constructor injection, `@Transactional` with
 correct isolation, external calls wrapped with error handling (+ retry where appropriate), `record` for
 DTOs, INFO logging for main actions / DEBUG for details.
+
+**Worker-side changes** (code under `worker/`) run this same security-gated SDLC in the **Worker repo**
+(`github.com/pirum1ch/AIReviewWorker`) on its own branch/PR, gated by that repo's own
+`.github/workflows/security-gate.yml` — not this repo's. Architecture/threat-model/SAST artifacts for a
+Worker-side feature still land in *this* repo's `docs/` (platform-level docs stay here, per
+`docs/worker-gateway-split-architecture.md` §9.6). The last step of a Worker-side change is bumping the
+submodule pin here: `cd worker && git checkout master && git pull && cd .. && git add worker && git
+commit -m "chore: bump worker submodule to <sha>"` — the pin is documentation of which Worker build a
+Gateway build was designed against, not a deployment mechanism (each host deploys from its own clone).

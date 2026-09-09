@@ -1,12 +1,16 @@
-# Local stack for the two images in this repo: review-gateway (root Dockerfile) + llm-worker
-# (worker/Dockerfile), backed by a real Postgres. This is the containerized equivalent of
-# DEPLOYMENT.md §11.2's verified local smoke test, wired up as a single `docker compose up`.
+# Local stack for review-gateway (root Dockerfile), backed by a real Postgres, plus a one-shot
+# backend-registration job. This stack is Postgres + Gateway + backend registration ONLY.
 #
-# Set up for TWO Workers, each paired 1:1 with its own real llama-server host, per this project's
-# architecture (README §1: "Running N llama-server instances means running N Worker processes,
-# each with its own backend.id/llama.url" -- there is no shared-backend scaling knob, a Worker
-# always talks to exactly one llama-server). Adding a third means copying the `worker2`/backend row
-# pattern below once more (worker3, llama-03, LLAMA_URL_3, WORKER_ID default worker-llama-03, ...).
+# Workers are NOT part of this file. As of the AIReviewGateway/AIReviewWorker repository split
+# (docs/worker-gateway-split-architecture.md), each Worker lives in its own process/host, deployed
+# from github.com/pirum1ch/AIReviewWorker (present in this repo as a submodule at worker/) via that
+# repo's own docker-compose.yml -- one Worker per llama-server host. See worker/README.md §6.4.
+#
+# LLAMA_URL_1/LLAMA_URL_2 below register `backends` rows (the Gateway's health-probe target) -- they
+# are DISTINCT FROM, but must point at the same llama-server as, each Worker's own LLAMA_URL on its
+# own host. LLAMA_MODEL must likewise agree with each Worker's LLAMA_MODEL. See
+# AIReviewGateway/DEPLOYMENT.md's cross-repo coupling table for the full list of values that must
+# stay in sync across the two repos/processes.
 #
 # Required secrets (no defaults on purpose -- same fail-fast behavior as the bare-jar deployment,
 # see DEPLOYMENT.md §2 "Token generation"). Export these before running, or put them in a `.env`
@@ -14,7 +18,7 @@
 #
 #   export DB_PASSWORD=change-me-to-a-real-secret
 #   export CI_TOKEN=$(openssl rand -hex 32)
-#   export WORKER_TOKEN=$(openssl rand -hex 32)
+#   export WORKER_TOKEN=$(openssl rand -hex 32)      # each Worker's GATEWAY_API_KEY must equal this
 #   export ADMIN_TOKEN=$(openssl rand -hex 32)
 #   export GITLAB_TOKEN=$(openssl rand -hex 32)          # a real GitLab project/group token for actual use
 #   export LLAMA_MODEL=qwen2.5-coder                     # same model on both hosts per this setup
@@ -25,23 +29,17 @@
 #   docker compose up --build
 #
 # What you get: Postgres (Flyway migration runs automatically inside the Gateway on first connect),
-# the Gateway on http://localhost:8080, a one-shot job that registers two backend rows ("llama-01"
-# -> LLAMA_URL_1, "llama-02" -> LLAMA_URL_2), and two Workers, each claiming only its own backend's
-# jobs.
+# the Gateway on http://127.0.0.1:8080 (loopback-only, see below), and a one-shot job that registers
+# two backend rows ("llama-01" -> LLAMA_URL_1, "llama-02" -> LLAMA_URL_2). No Worker is started by
+# this file -- deploy one per llama-server host from the AIReviewWorker repo, pointed at this
+# Gateway's own reverse-proxy https:// endpoint (DEPLOYMENT.md §11.1); jobs sit in QUEUED until a
+# Worker claims them.
 #
-# The one real gotcha (documented in worker/README.md §6.3 and DEPLOYMENT.md §11.2): each Worker's
-# WorkerProperties refuses a plain-http GATEWAY_URL unless it resolves to an actual loopback address.
-# A compose service-name hostname (http://gateway:8080) does NOT count as loopback. Both `worker1`/
-# `worker2` services below work around this with `network_mode: "service:gateway"`, which makes each
-# one share the Gateway container's network namespace outright -- so http://127.0.0.1:8080 is
-# genuinely loopback from either Worker's point of view, exactly like the manually-verified
-# `--network host` recipe in DEPLOYMENT.md, but without needing host networking. Multiple containers
-# are allowed to share one container's network namespace simultaneously, so both Workers doing this
-# against the same `gateway` container is fine. This only matters for this local/plain-HTTP setup --
-# in a real deployment the Gateway sits behind a reverse proxy over HTTPS and none of this applies
-# (DEPLOYMENT.md §11.1); reaching each Worker's own remote llama-server (LLAMA_URL_1/2, a real LAN
-# host, not loopback) is unaffected either way -- that traffic just goes out through the shared
-# network namespace's normal outbound connectivity.
+# gateway's `ports:` binds to 127.0.0.1 only (mirrors the postgres service's own pattern below).
+# With Workers off-host, a TLS-terminating reverse proxy is the ONLY intended ingress to the Gateway
+# -- the origin port must not be reachable from the Worker network. Bind the proxy to this same host
+# and have it forward to 127.0.0.1:8080, or re-map this to a private interface plus a host firewall
+# rule admitting only the proxy, per DEPLOYMENT.md §2/§11.1.
 
 services:
   postgres:
@@ -98,7 +96,7 @@ services:
       STRUCTURED_OUTPUT_ENABLED: ${STRUCTURED_OUTPUT_ENABLED:-true}
       STRUCTURED_OUTPUT_DEFAULT_MODE: ${STRUCTURED_OUTPUT_DEFAULT_MODE:-OFF}
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     # GITLAB_BASE_URL uses the gitlab.local hostname (its self-signed cert's SAN is issued for
     # that name, not for a bare IP -- TLS hostname verification would fail otherwise). gitlab.local
     # is a .local/mDNS name that this container can't resolve on its own (no Avahi/nss-mdns in the
@@ -121,7 +119,7 @@ services:
     # this, only a direct SQL insert). Runs once the Gateway is healthy, i.e. after Flyway has
     # already created the `backends` table -- inserting any earlier would fail with "relation does
     # not exist". Idempotent (ON CONFLICT on the UNIQUE `name` column), safe to re-run on every
-    # `docker compose up`.
+    # `docker compose up`. Stays Gateway-side by design -- only the Gateway owns PostgreSQL.
     image: postgres:14-alpine
     depends_on:
       gateway:
@@ -142,57 +140,6 @@ services:
     networks:
       - airg
     restart: "no"
-
-  worker1:
-    build:
-      context: ./worker
-      dockerfile: Dockerfile
-    image: llm-worker:local
-    depends_on:
-      backend-seed:
-        condition: service_completed_successfully
-    network_mode: "service:gateway"
-    environment:
-      GATEWAY_URL: http://127.0.0.1:8080
-      GATEWAY_API_KEY: ${WORKER_TOKEN:?set WORKER_TOKEN, must equal the Gateway's value}
-      WORKER_ID: ${WORKER_ID_1:-worker-llama-01}
-      BACKEND_ID: llama-01
-      LLAMA_MODEL: ${LLAMA_MODEL:?set LLAMA_MODEL}
-      LLAMA_URL: ${LLAMA_URL_1:?set LLAMA_URL_1, e.g. http://192.168.1.101:8000}
-      LLAMA_MAX_TOKENS: ${LLAMA_MAX_TOKENS:-12000}
-      LLAMA_ENABLE_THINKING: ${LLAMA_ENABLE_THINKING:-true}
-      WORKER_ALLOW_INSECURE_GATEWAY: "true"
-      # Both workers share the Gateway's network namespace (network_mode: service:gateway below),
-      # so their Actuator ports would collide on the default 8081 -- pin distinct ports.
-      WORKER_HTTP_PORT: "8081"
-    # No `ports:` here -- forbidden alongside network_mode, and the Worker's Actuator
-    # (server.address: 127.0.0.1, hardcoded) is only ever meant to be reached via
-    # `docker compose exec worker1 curl http://127.0.0.1:8081/actuator/health` anyway.
-
-  worker2:
-    build:
-      context: ./worker
-      dockerfile: Dockerfile
-    image: llm-worker:local
-    depends_on:
-      backend-seed:
-        condition: service_completed_successfully
-    network_mode: "service:gateway"
-    environment:
-      GATEWAY_URL: http://127.0.0.1:8080
-      GATEWAY_API_KEY: ${WORKER_TOKEN:?set WORKER_TOKEN, must equal the Gateway's value}
-      WORKER_ID: ${WORKER_ID_2:-worker-llama-02}
-      BACKEND_ID: llama-02
-      LLAMA_MODEL: ${LLAMA_MODEL:?set LLAMA_MODEL}
-      LLAMA_URL: ${LLAMA_URL_2:?set LLAMA_URL_2, e.g. http://192.168.1.102:8000}
-      LLAMA_MAX_TOKENS: ${LLAMA_MAX_TOKENS:-12000}
-      LLAMA_ENABLE_THINKING: ${LLAMA_ENABLE_THINKING:-true}
-      WORKER_ALLOW_INSECURE_GATEWAY: "true"
-      # Must differ from worker1's -- see the comment there; both share one network namespace.
-      WORKER_HTTP_PORT: "8082"
-    # Actuator check: `docker compose exec worker2 curl http://127.0.0.1:8082/actuator/health`.
-    # You can't tell the two Workers apart by connecting from outside either way (no ports are
-    # published) -- use `docker compose logs worker1`/`worker2` or `docker compose exec workerN ...`.
 
 volumes:
   postgres-data:

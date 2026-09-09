@@ -89,10 +89,12 @@ to tens of minutes), and **1–10** backend servers, each typically paired with 
 | PostgreSQL | tested against 14.22 | The only persistence backend (schema in `src/main/resources/db/migration/V1__initial_schema.sql`, applied by Flyway at startup). No specific minimum version is mandated in the requirements document; the test suite runs against PostgreSQL 14.22 via an embedded (Zonky) instance and the schema uses no PostgreSQL-14-specific features (identity columns and `FOR UPDATE SKIP LOCKED` are supported from PostgreSQL 10+/9.5+ respectively), so 12+ is a reasonable practical floor. |
 | Docker | **not required to build or test** | Tests use `io.zonky.test` embedded PostgreSQL (a real Postgres binary run in-process), not Testcontainers. The CI security gate (`.github/workflows/security-gate.yml`) also runs `mvn verify` directly on a GitHub-hosted runner with no Docker step. |
 
-A root `Dockerfile`, `worker/Dockerfile`, and a `docker-compose.yml` wiring Postgres + both images together
-are provided as an *optional* containerized deployment path — see [§5](#5-deployment) and
-[DEPLOYMENT.md §11](DEPLOYMENT.md#11-docker-deployment-verified-both-images). The plain-jar path below
-remains the primary one this document describes in detail.
+A root `Dockerfile` and a `docker-compose.yml` (Postgres + Gateway + one-shot backend registration) are
+provided as an *optional* containerized deployment path for this repo — see [§5](#5-deployment) and
+[DEPLOYMENT.md §11](DEPLOYMENT.md#11-docker-deployment-verified-both-images). The Worker's own
+`Dockerfile`/`docker-compose.yml` now live in the separate `worker/` repo (a git submodule of this one —
+see [worker/README.md §6](worker/README.md#6-deployment)). The plain-jar path below remains the primary
+one this document describes in detail.
 
 ## 3. Build & test
 
@@ -276,9 +278,11 @@ is specifically built to tolerate that restart model.
 ### 5.1 Docker / Docker Compose (optional alternative)
 
 A multi-stage root `Dockerfile` (`maven:3.9-eclipse-temurin-21` → `eclipse-temurin:21-jre-jammy`,
-non-root user, `HEALTHCHECK` against `GET /health`) and a matching `worker/Dockerfile` are provided,
-plus a `docker-compose.yml` that wires up Postgres + both images + a one-shot backend-registration job
-in one command:
+non-root user, `HEALTHCHECK` against `GET /health`) is provided, plus a `docker-compose.yml` that wires
+up Postgres + the Gateway + a one-shot backend-registration job in one command. This stack is
+**Gateway-only** — Workers are not part of it; each Worker deploys separately, one per `llama-server`
+host, from the [`AIReviewWorker`](https://github.com/pirum1ch/AIReviewWorker) repo's own
+`docker-compose.yml` (present here as the `worker/` submodule):
 
 ```bash
 export DB_PASSWORD=... CI_TOKEN=$(openssl rand -hex 32) WORKER_TOKEN=$(openssl rand -hex 32) \
@@ -286,12 +290,13 @@ export DB_PASSWORD=... CI_TOKEN=$(openssl rand -hex 32) WORKER_TOKEN=$(openssl r
 docker compose up --build
 ```
 
-Every environment variable from [§4](#4-configuration) is read by the images the same way as by the bare
+Every environment variable from [§4](#4-configuration) is read by the image the same way as by the bare
 jar — no Docker-specific configuration exists. See
 [DEPLOYMENT.md §11](DEPLOYMENT.md#11-docker-deployment-verified-both-images) for the full reference
 (production topology behind a reverse proxy, the `docker-compose.yml` walkthrough, and a manual
-`docker run` recipe) and [worker/README.md §6.3](worker/README.md#63-containerization) for the Worker
-image specifically.
+`docker run` recipe) and [worker/README.md §6.4](worker/README.md#64-docker-compose) for the Worker's own
+compose stack (resolves once this repo is checked out with `--recurse-submodules`; standalone readers use
+the [AIReviewWorker repo](https://github.com/pirum1ch/AIReviewWorker) directly).
 
 ## 6. API reference
 
