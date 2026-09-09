@@ -1,0 +1,3 @@
+[submodule "worker"]
+	path = worker
+	url = git@github.com:pirum1ch/AIReviewWorker.git
