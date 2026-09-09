@@ -1399,10 +1399,62 @@ started without one fails fast in its own logs, same as [§4](#4-step-2-deploy-t
 In a real deployment the Gateway sits behind the same TLS-terminating reverse proxy this runbook already
 assumes ([§2, network matrix](#2-prerequisites)), so a containerized Worker reaching it via
 `GATEWAY_URL=https://gateway.internal` needs no Docker-specific handling at all — it behaves exactly like
-[§6.4](#64-docker-alternative) describes. `docker run -p 8080:8080` for the Gateway and normal container
-networking (a Docker network, a service mesh, or just routable hosts) is all that's required; the Worker
-container never publishes any port (its Actuator is loopback-only by design, checked via `docker exec`,
-see [§6.4](#64-docker-alternative)).
+[§6.4](#64-docker-alternative) describes, **except for the port binding**: `docker run -p
+127.0.0.1:8080:8080` for the Gateway, **not** a bare `-p 8080:8080`. Once Workers are off-host, the
+reverse proxy is the only intended ingress to the Gateway — the origin port must not be reachable from the
+Worker network (same rationale `docker-compose.yml`'s `ports:` header already carries for the Compose
+path, [WRR-06](docs/worker-repo-split-threat-model.md)); a bare `-p 8080:8080` publishes it on every
+interface, letting anything on the Worker network bypass the proxy — and every proxy-level control (TLS,
+IP allowlist, path restriction, body cap) along with it — entirely (WRT-04). If the proxy is not
+co-located on the Gateway host, bind to a private interface instead and admit only the proxy via a host
+firewall rule. Normal container networking (a Docker network, a service mesh, or just routable hosts)
+otherwise applies; the Worker container never publishes any port (its Actuator is loopback-only by design,
+checked via `docker exec`, see [§6.4](#64-docker-alternative)).
+
+#### Reverse-proxy requirements (WRR-07)
+
+The proxy is unconditionally in the data path for every Worker call once Workers are off-host, so a
+misconfigured proxy limit fails silently as a **fleet-wide stall** (WRT-14: every `POST
+/jobs/{id}/result` gets a `413`, every long generation gets a dropped connection, or every call gets a
+`401` — each one surfaces only as a heartbeat-timeout retry loop, not as an obvious error). The proxy in
+front of the Gateway must:
+
+1. **Forward the `Authorization` header unmodified.** Do not strip, rewrite, or re-terminate it — the
+   Gateway itself does the bearer-token check; the proxy must not decide auth on its behalf.
+2. **Allow a request body of at least `gateway.publish.max-request-body-bytes`
+   (`src/main/resources/application.yml`, default **500,000 bytes**) plus headroom.** This is the cap on
+   `POST /jobs/{id}/result` — the Worker's raw LLM response. nginx's own `client_max_body_size` default
+   (`1m`) already clears it; say so explicitly here so a later hardening pass does not silently lower it
+   below the Gateway's own cap.
+3. **Set a read/idle timeout comfortably above the Worker's own timeouts**: `WORKER_GATEWAY_TIMEOUT_SEC`
+   (`network.gateway-timeout-sec`, default **10s** — the Worker's own read timeout for claim/heartbeat/
+   result calls) and the heartbeat cadence, `WORKER_HEARTBEAT_INTERVAL_SEC` (`heartbeat.interval-sec`,
+   default **60s**) — see `worker/README.md` §5.2. A proxy timeout below either one drops a call the
+   Worker itself was still willing to wait for.
+4. **Defence in depth: expose only `/jobs/*` to the Worker network.** `/reviews*`, `/backends`,
+   `/metrics`, `/actuator/*` should be restricted to their own sources (CI runners, admin operators) —
+   the Gateway's own token check already enforces this at the application layer, but a compromised or
+   misrouted Worker host should not even be able to reach the CI/admin surface, matching the port-binding
+   half of the same story in [§2's network matrix](#2-prerequisites) and WRR-06 above.
+
+A minimal nginx snippet covering (1)-(4):
+
+```nginx
+location /jobs/ {
+    proxy_pass http://127.0.0.1:8080;
+    proxy_set_header Authorization $http_authorization;
+    client_max_body_size 1m;
+    proxy_read_timeout 30s;
+    proxy_connect_timeout 5s;
+    # restrict to the Worker network at the firewall/security-group level, not just here
+}
+location / {
+    proxy_pass http://127.0.0.1:8080;
+    proxy_set_header Authorization $http_authorization;
+    allow 10.0.0.0/8;   # CI runners / admin — replace with your actual ranges
+    deny all;
+}
+```
 
 ### 11.2 Local single-host smoke test (this is the exact recipe used to verify both images)
 
@@ -1486,7 +1538,8 @@ required the Worker and Gateway to share a container network namespace (`network
 must not be reproduced in another form (see [§2's network matrix](#2-prerequisites) and
 `worker/README.md` §6.3 for why: a non-loopback `GATEWAY_URL` always requires `https://`, and forwarding
 a loopback setup to a remote Gateway through a non-encrypting relay is forbidden even with
-`WORKER_ALLOW_INSECURE_GATEWAY=true`).
+`WORKER_ALLOW_INSECURE_GATEWAY=true`; an **encrypting** tunnel — `ssh -L`, WireGuard, an mTLS mesh
+sidecar — terminated locally is the supported alternative).
 
 **Gateway stack** — `docker-compose.yml` at this repo's root: Postgres + the Gateway + a one-shot
 backend-registration job only.

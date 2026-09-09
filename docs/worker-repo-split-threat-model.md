@@ -67,7 +67,7 @@ re-check):
 |---|-------|:-:|:-:|:-:|---|---|
 | WA1′ | `WORKER_TOKEN` / `GATEWAY_API_KEY` (same value) | **H** | **H** | — | Gateway `.env` **and** one `.env` per Worker host | Same secret, more copies, now crossing a real network on every request |
 | WA2′ | Diff content (crown jewels) | **H** | M | — | claim response body, **on the wire** | Was kernel loopback, now network |
-| WRA1 | **The Worker git repository** | M | **H** | M | `github.com/pirum1ch/AIReviewWorker` (private) | **New.** Push access ⇒ code execution on every Worker host, i.e. WA1′+WA2′ exfiltration |
+| WRA1 | **The Worker git repository** | M | **H** | M | `github.com/pirum1ch/AIReviewWorker` (**public** — a conscious owner decision, not the private repo originally planned here; see the WRR-14a amendment below and F-WRS-06) | **New.** Push access ⇒ code execution on every Worker host, i.e. WA1′+WA2′ exfiltration |
 | WRA2 | **The Worker CI security gate** | — | **H** | M | `AIReviewWorker/.github/workflows/security-gate.yml` | **New.** Absent or non-blocking ⇒ WSR-17 silently unenforced |
 | WRA3 | Gateway TLS endpoint / reverse proxy | — | **H** | **H** | not in this repo; a deployment prerequisite | Was optional, becomes **mandatory** |
 | WRA4 | Gateway `8080` listener | **H** | **H** | **H** | `ports:` in the Gateway compose | Was reachable only from the same host; must now be reachable from the Worker network |
@@ -99,7 +99,7 @@ Gateway trust boundary is modified by this change.
 | **WRT-03** | Spoofing / MITM | CWE-295, CWE-1104 / A02 | WRA5 | The Gateway proxy presents a private cert and each Worker mounts a `cacerts` trusting its CA — mirroring the Gateway's existing `certs/cacerts` pattern, which trusts an **mkcert** CA. An mkcert CA's private key lives on a developer workstation and can mint a valid cert for **any** hostname. Trusting it fleet-wide turns one workstation compromise into MITM of every Worker→Gateway hop (WA1′ + every diff). Secondary: a hand-built truststore that *replaces* rather than *extends* the JDK defaults, or a "just disable verification" fix when the handshake fails. | **High** |
 | **WRT-04** | Elevation / Info disc. | CWE-668, CWE-1327 / A01, A05 | WRA4 / WRTB-INGRESS | `ports: "8080:8080"` (all interfaces) is now the only path a Worker has to the Gateway. That one listener serves **`POST /reviews`, `DELETE /reviews/{id}`, `/backends`, `/metrics`, `/health`, `/actuator/health`** alongside `/jobs/*`. Anything that can reach the Worker network can reach the Gateway's origin port **directly**, bypassing the proxy entirely: no TLS, and any proxy-level control (IP allowlist, path restriction, rate limit, request-size cap) bypassed with it. Gateway-side token authz still holds — this is a defence-in-depth and TLS-bypass finding, not an authz break. | **High** |
 | **WRT-05** | Tampering (supply chain) | CWE-1104, CWE-937 / A06, A08 | WRTB-CI | The Gateway workflow's `sca-worker` + `build-test-worker` are deleted before the Worker repo's own gate exists / is green ⇒ Worker dependencies and its 98-test suite ship ungated (exactly the FW-02 regression WSR-17 was written for). Worse variant: `actions/checkout@v4` does not fetch submodules, so the surviving `gitleaks`/`semgrep` jobs scan an **empty `worker/`** and report **green** — a control that silently degrades to no control while reporting success. | **High** |
-| **WRT-06** | Elevation / Info disc. | CWE-1188, CWE-732 / A05 | WRA1, WRA2 | The new repo ships with defaults: created public by accident (`gh repo create` without `--private`), `GITHUB_TOKEN` default write permissions, no required status checks, no branch protection, Actions enabled with whatever the account default is. Any of these makes WRA2 advisory rather than gating, or makes WRA1 (which contains the Worker source and its README describing the token model) world-readable. | **High** |
+| **WRT-06** | Elevation / Info disc. | CWE-1188, CWE-732 / A05 | WRA1, WRA2 | The new repo ships with defaults: created public by accident (`gh repo create` without `--private`), `GITHUB_TOKEN` default write permissions, no required status checks, no branch protection, Actions enabled with whatever the account default is. Any of these makes WRA2 advisory rather than gating, or makes WRA1 (which contains the Worker source and its README describing the token model) world-readable. **Update (F-WRS-06, 2026-09-09):** the "public by accident" leg of this scenario did occur — but it turned out not to be an accident: the owner reviewed it and made keeping the repo public an explicit, recorded decision (no secrets in the tree, `AIReviewGateway` already public with the Worker docs tracked in it), so this leg is now an accepted residual rather than an open finding. The remaining defaults-hardening legs (`GITHUB_TOKEN` permissions, branch protection) are tracked separately at WRR-14b/d. | **High** |
 | **WRT-07** | Info disclosure | CWE-540, CWE-312 / A05 | WRA6 | The initial commit is produced by `cp -r worker/. .` from a live working tree and `git add .`. Anything sitting in `worker/` at that moment is swept in permanently: `target/` (build output incl. compiled test resources), an ad-hoc `.env`, `.idea/`, a `*.hprof` **heap dump** (which by WT-10's own analysis contains `WORKER_TOKEN` and a full diff), a stray `certs/`. The Gateway repo's full-history gitleaks scan never covers this commit, and rewriting it is only cheap **before** the first push. | **High** |
 | **WRT-08** | Info disclosure | CWE-798, CWE-1188 / A05 | `.env.example` ×2, `docker-compose.yml` ×2 | Two new committed files that describe secrets. Failure modes: a real value pasted into `.env.example` "to show the format"; a real value inlined in a committed compose file instead of `${VAR:?}`; `.env` not gitignored in the **new** repo before the first commit; `WORKER_ALLOW_INSECURE_GATEWAY=true` shipped as an *active* key in `.env.example`, making WRT-01 a copy-paste away. | **Medium** |
 | **WRT-09** | Info disclosure | CWE-538, CWE-1104 / A05 | Worker image | A secret ends up in an image layer: a `COPY . .`-style Dockerfile change picking up the repo-root `.env` (today's `worker/.dockerignore` does **not** exclude `.env`), an `ARG`/`ENV`-baked token, or a truststore/`certs/` copied into the image instead of bind-mounted. Layers survive `docker history` and any registry push. | **Medium** |
@@ -228,14 +228,31 @@ Tag = MUST / SHOULD / ACCEPTED-RISK. Each is testable/inspectable by the `F-WRS-
 
 - **WRR-14 (MUST, WRT-06).** New-repo hardening, verified by inspection **before** the first push where
   possible and immediately after otherwise:
-  a. Created **private** (`gh repo create … --private`), visibility re-verified via the API after
-     creation — not assumed from the create command.
+  a. **AMENDED (F-WRS-06, 2026-09-09).** Originally: created **private** (`gh repo create … --private`),
+     visibility re-verified via the API after creation. In fact the repo was created **public**; the
+     owner reviewed the deviation and made an explicit decision to **keep it public** rather than flip
+     it, on the grounds that (i) no secret-shaped content exists anywhere in the tree — verified by the
+     green full-history `gitleaks` CI run plus a manual secret review during the SAST round — so there is
+     nothing to disclose or rotate, and (ii) `AIReviewGateway` is itself public and already carries
+     `docs/worker-architecture.md`, `docs/worker-threat-model.md`, `docs/security/worker-sast-report.md`
+     and the Worker README in its own tracked tree, so the Worker's source, protocol and token model were
+     already world-readable regardless. This requirement is now satisfied as **"public, and recorded as a
+     conscious decision"** rather than "private" — re-verify visibility via the API the same way after any
+     future settings change. **This does not loosen WRR-08/09/10** (no secrets ever land in the initial
+     commit / `.gitignore` / `.dockerignore` / `.gitleaks.toml`) — those controls matter *more*, not less,
+     now that a push-access mistake is instantly world-visible instead of contained to invited
+     collaborators.
   b. Every workflow declares `permissions: contents: read` at the top level (as the Gateway's does), so
      the repo-level `GITHUB_TOKEN` default is irrelevant.
   c. **No Actions secrets and no environments** are configured in the Worker repo — its gate needs none.
   d. `master` requires a PR with the four checks green. If branch protection/rulesets are unavailable on
      this account plan, record it as an explicit **ACCEPTED-RISK** line in the Worker README rather than
-     leaving it implicit, and keep the PR-only discipline by convention.
+     leaving it implicit, and keep the PR-only discipline by convention. **Status (F-WRS-07, tracked, not
+     closed): branch protection is being enabled by the repo owner directly in GitHub settings
+     (2026-09-09), in parallel with this docs round — this document's job is to record that it happened
+     once confirmed, not to configure it. Leave this sub-item open until a follow-up API check (`GET
+     /branches` → `master.protected: true` or `GET /rulesets` → non-empty) confirms the setting, or until
+     the owner records an explicit ACCEPTED-RISK line instead.**
   e. Collaborator set is no wider than the Gateway repo's (WRT-11).
 
 ### Principle preservation & operations
@@ -266,8 +283,11 @@ Tag = MUST / SHOULD / ACCEPTED-RISK. Each is testable/inspectable by the `F-WRS-
 WRR-12, WRR-13, WRR-14, WRR-15.
 **Tracked SHOULDs (non-blocking):** WRR-07, WRR-16, WRR-17.
 **Accepted residuals:** submodule pin drift (§3.2); WSR-INH-1/WSR-INH-2 (shared `WORKER_TOKEN`, a
-compromised Worker host reads its own diffs) — unchanged by this split; branch protection availability
-(WRR-14d) if the account plan does not offer it.
+compromised Worker host reads its own diffs) — unchanged by this split; WRR-14a's repo-visibility (public,
+accepted decision, see the amendment above — no longer a residual awaiting a fix, but recorded rather than
+silently accepted); branch protection availability (WRR-14d) if the account plan does not offer it — as of
+this round WRR-14d is **open, tracked**, not accepted-risk: the owner is enabling it directly in GitHub
+settings (2026-09-09) and it should be re-verified once done, per the amendment above.
 
 The two ordering constraints that make the difference between a clean split and an incident:
 

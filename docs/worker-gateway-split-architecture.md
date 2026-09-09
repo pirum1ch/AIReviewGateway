@@ -7,7 +7,13 @@ Design input for the `appsec-engineer` threat-model round and the `backend-devel
 
 ## 1. Decision summary (confirmed with the user)
 
-1. `worker/` becomes its own private repo `github.com/pirum1ch/AIReviewWorker`, **fresh history**.
+1. `worker/` becomes its own repo `github.com/pirum1ch/AIReviewWorker`, **fresh history**. (Planned as
+   private here; the SAST round found it was created **public** instead — the owner's confirmed decision
+   is to keep it public rather than change it after the fact, since no secrets exist in the tree
+   (verified during that round) and `AIReviewGateway` is itself public and already carries the Worker's
+   architecture/threat-model/SAST docs in its tracked tree, so the marginal disclosure is judged
+   acceptable. See `docs/worker-repo-split-threat-model.md` WRR-14a and
+   `docs/security/feature-worker-repo-split-sast-report.md` F-WRS-06 for the record.)
 2. Wired back into the Gateway repo as a **submodule at the same path `worker/`**, so a `--recurse-submodules` clone looks exactly like today's checkout.
 3. Gateway `docker-compose.yml` deploys **only** `postgres` + `gateway` + `backend-seed`. No Worker service, no `network_mode` trick, no Worker image built from it.
 4. Worker repo gets its **own** `docker-compose.yml`: one `worker` service against a **remote** Gateway and a **remote** `llama-server`.
@@ -243,7 +249,7 @@ Nothing validates these across processes. Each is a silent misconfiguration:
 
 **Chosen fix — each repo gates its own code:**
 
-- Gateway workflow: delete `sca-worker` and `build-test-worker`; update the header block. Do **not** add `submodules: recursive` to the checkout — the Worker repo is private (needs a PAT secret in the Gateway repo) and it would make Gateway PRs block on code they did not change.
+- Gateway workflow: delete `sca-worker` and `build-test-worker`; update the header block. Do **not** add `submodules: recursive` to the checkout — that would make Gateway PRs block on code they did not change, and the Worker repo is already gated by its own workflow (WRR-13). (Originally reasoned here as also needing a PAT secret for a private repo; the repo was in fact created public — WRR-14a — so an anonymous checkout would not need one, but the "don't couple the two gates" rationale holds regardless of visibility and a future `submodules: recursive` add should still use a read-only deploy key or fine-grained token, never a classic `repo`-scoped PAT, per WRT-11.)
 - Worker repo: a trimmed copy of the same workflow — `gitleaks` (full history, `fetch-depth: 0`), `sca` (CycloneDX SBOM + osv-scanner, same pinned versions, `mvn` at repo root), `semgrep` (`p/java` + `p/secrets`; drop `p/sql-injection` and `.semgrep/rules.yml` — the Worker has no SQL and no GitLab client), `build-test` (`mvn -B -ntp verify`).
 - `.gitleaks.toml`: copy with the `target/` path allowlist and `useDefault = true`, keeping only value-scoped exemptions the Worker's own fixtures need.
 - `.semgrepignore`: copy verbatim.
