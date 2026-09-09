@@ -352,6 +352,14 @@ Testable assertions for the backend developer; AppSec re-verifies each in the SA
   `existsByProjectIdAndMergeRequestIdAndHeadSha`, return the coarse success with **zero** GitLab calls.
   Plus a bounded in-memory LRU of recent `X-Gitlab-Event-UUID` values. *Test:* the same delivery replayed
   twice issues the full fetch at most once.
+  **Status after the final-verification round (F-WH-11): HALF-IMPLEMENTED, REMAINDER ACCEPTED.** The
+  load-bearing half — the `last_commit.id` fast path — shipped and is tested. The `X-Gitlab-Event-UUID`
+  LRU was not built and `WebhookController` does not read that header at all. Accepted as a residual
+  rather than tracked as debt: the only window it would close (rapid exact redeliveries *before* the
+  first Review row exists) is already bounded three other ways — WHR-22's per-project/global hourly
+  limits, WHR-25's non-blocking concurrency permit, and WHR-26's single-flight guard on
+  `(projectId, mrIid)`, which collapses concurrent duplicate deliveries to one fetch set outright.
+  Re-open only if `/metrics`' `webhookRateLimited` shows redelivery storms actually consuming the budget.
 - **WHR-06 (MUST, WHT-05).** Every new GitLab URI uses templated path segments for ids and
   `UriBuilder.queryParam` for `from`/`to`/`unidiff`; no string concatenation anywhere in the path, host
   or query. `projectId`/`mrIid` are JSON-bound as `Long` and validated positive; both SHAs match
@@ -428,7 +436,20 @@ Testable assertions for the backend developer; AppSec re-verifies each in the SA
   modes rejects; a mode-only change is accepted and does not appear in the v3 coverage list; a file whose
   diff contains "differ"-adjacent ordinary text but also has real hunks (F-WH-01's reproduction fixture)
   remains coverage-bearing; a pure rename with matching old/new sizes is accepted and excluded from
-  coverage, one with mismatched sizes rejects. **Empirically confirmed (§8 probe):** this rule already
+  coverage, one with mismatched sizes rejects.
+  **Known residual on exemption (c) — F-WH-13, accepted for v1, re-check before enabling in production.**
+  Byte size is a *proxy* for "content unchanged", not a proof: a rename whose content changed by a
+  length-preserving edit (byte count identical) on a file large enough for GitLab to drop its patch
+  (the WHT-08 mechanism) passes the size comparison and leaves the coverage-bearing set silently — the
+  same end state as F-WH-01, but requiring a deliberate author, a >`diff_max_patch_bytes` file, a
+  rename, and an equal-length edit, with no accidental variant. The exact fix is one extra header off
+  the **same** `HEAD` request: compare `X-Gitlab-Blob-Id` (or `X-Gitlab-Content-Sha256`) instead of
+  `X-Gitlab-Size` — a rename with unchanged content has, by git's own object model, an identical blob
+  id. Blocked only on the §8-style read-only probe that confirms the header on this GitLab version
+  (`X-Gitlab-Size` was probed; the blob-id header was not), and on probing that GitLab reports
+  `renamed_file: true` with an empty `diff` for a truncated rename at all — the §8 probe covered
+  modified and new files only.
+  **Empirically confirmed (§8 probe):** this rule already
   fires correctly as designed for a heavily modified 408 KB file (`a_mode == b_mode`, `diff: ""`) — no
   change needed for the modified-file case.
 - **WHR-15b (MUST, WHT-08/WHT-12 — added after the §8 probe, closes a real gap the original plan missed).**
@@ -579,6 +600,24 @@ Testable assertions for the backend developer; AppSec re-verifies each in the SA
 with WHR-28's log + metric in place and documented as the alerting hook); WHT-27 (prompt-injection
 exposure widens with the project population — mechanism unchanged, output channel still governed by
 SR-08/SR-09); no per-delivery signature from GitLab (WHT-01, compensated by WHR-03/WHR-05).
+
+Added by the final-verification round (all three are decisions, not omissions — do not re-discover them):
+
+- **F-WH-11 — WHR-05's `X-Gitlab-Event-UUID` LRU: half-implemented, remainder accepted.** Reasoning at
+  WHR-05 above.
+- **F-WH-12 — the webhook/sweep dedup fast path matches a Review in *any* status, deliberately diverging
+  from `createReview`'s active-only dedup.** Consequence: once a webhook-triggered Review for a given
+  `head_sha` reaches `FAILED`, no redelivery and no sweep tick creates another one for that revision.
+  Accepted rather than narrowed: narrowing it would make every hourly sweep tick create a fresh Review
+  row + queue job for a permanently-failing revision, forever, bounded only by WHR-22's rate limit — a
+  worse failure mode than "not re-attempted", and one that consumes the same budget legitimate MRs need.
+  Operator remedy exists and is documented in `DEPLOYMENT.md` §7.4: push a new commit, or create the
+  Review over the CI path (`POST /reviews`), whose own dedup *does* allow superseding a `FAILED`
+  predecessor. Recorded in `ReviewRepository#existsByProjectIdAndMergeRequestIdAndHeadSha`'s javadoc too,
+  since that method is where the mistake would be made.
+- **F-WH-13 — WHR-15 exemption (c) verifies "content unchanged" by byte size, not by blob id.** Reasoning
+  and the exact fix at WHR-15 above. Accepted for v1 (the feature ships default-off); listed in
+  `DEPLOYMENT.md` §7.4's pre-enable checklist rather than left to memory.
 **WHT-08's residual is no longer conditional** — the §8 probe ran, and found GitLab does not drop trailing
 hunks silently; it returns a fully empty diff with no signal, closed by WHR-15 (modified files, confirmed
 correct as designed) plus the newly-added WHR-15b (new/deleted files, `HEAD`/`X-Gitlab-Size`). The
@@ -600,6 +639,14 @@ by the assembler — WHR-21).
 feature is in flight: (a) flag any string concatenation building a URI or query string in the new GitLab
 client methods, (b) flag `.body(String.class)`/`.body(<POJO>.class)` on the diff-fetch calls (must go
 through the `exchange(...)` + `BoundedInputStream` form).
+**Status (F-WH-10):** both rules landed in `.semgrep/rules.yml` and are wired into both Semgrep steps of
+`.github/workflows/security-gate.yml`. They have **never been executed** — Semgrep does not run on the
+development host (no Windows support, no Docker daemon, no general-purpose WSL distro), so the branch's
+own PR run of `security-gate` is their first execution. Treat that run as part of this gate: the Semgrep
+job must be green, and the rules must be confirmed to actually *fire* at least once (paste the
+positive-control fixture in the final-verification section of
+`docs/security/feature-gitlab-webhook-diff-trigger-sast-report.md` into a scratch `.java` file and
+confirm two hits) — a rule that matches nothing is indistinguishable from a passing gate.
 
 ---
 

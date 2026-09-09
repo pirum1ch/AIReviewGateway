@@ -36,6 +36,15 @@ public interface ReviewRepository extends JpaRepository<Review, Long> {
      * "active" subset above), a webhook/sweep redelivery can return its coarse outcome with zero further
      * GitLab calls. Covered by the existing {@code ix_reviews_mr} index plus a {@code head_sha} filter —
      * zero new Flyway migrations needed.
+     *
+     * <p><b>"ANY status" is a deliberate divergence from {@link
+     * #findByProjectIdAndMergeRequestIdAndHeadShaAndStatusIn} (F-WH-12, accepted in the webhook threat
+     * model's §7 residual list — do not "fix" it without reading that entry).</b> Its consequence: once a
+     * webhook-triggered Review for a given {@code head_sha} reaches {@code FAILED}, neither a webhook
+     * redelivery nor any sweep tick creates another one for that revision. The remedy is a new commit or
+     * the CI path ({@code POST /reviews}), whose dedup deliberately *does* allow superseding a
+     * {@code FAILED}/{@code CANCELLED}/{@code OBSOLETE} predecessor. Narrowing this to the active set
+     * would make every hourly sweep tick re-create a Review for a permanently-failing revision.
      */
     boolean existsByProjectIdAndMergeRequestIdAndHeadSha(Long projectId, Long mergeRequestId, String headSha);
 

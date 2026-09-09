@@ -782,6 +782,26 @@ CI), `gateway.webhook.max-concurrent-fetches` (so a slow GitLab cannot consume t
 starve `/jobs/claim`), `gateway.webhook.sweep.*` (the hourly backstop's per-tick ceilings),
 `GITLAB_DIFF_MAX_RESPONSE_BYTES` and `gateway.gitlab.diff.max-pages` (bounded reads).
 
+**Three accepted behaviours to plan around** (decisions from the security review, recorded in
+`docs/gitlab-webhook-trigger-threat-model.md` §7 — not bugs, but each will surprise you once):
+
+- **A webhook-triggered review that ends `FAILED` is not re-attempted for that revision.** The dedup
+  fast path matches an existing Review in *any* status, so neither a redelivery nor an hourly sweep tick
+  creates a second one for the same `head_sha`. Remedy: push a new commit, or create the Review over the
+  CI path (`POST /reviews`, §7.1–§7.2), whose dedup does allow superseding a `FAILED` predecessor. The
+  alternative — re-creating it every tick forever — was judged worse.
+- **The hourly rate limits count deliveries that reach the fetch stage, not Reviews created.** A delivery
+  for an MR where the bot is *not* a reviewer still consumes a slot, because "is the bot a reviewer" can
+  only be answered by the GitLab read the limit exists to bound. On a busy allowlisted project, raise
+  `gateway.webhook.max-reviews-per-project-per-hour` above the project's MR-event rate rather than above
+  its review rate. Suppression is self-healing within one hour via the sweep, and shows up as the
+  `webhookRateLimited` counter on `GET /metrics`.
+- **Before enabling in production, close F-WH-13** (threat model WHR-15, exemption (c)): a *renamed*
+  file whose content changed by a length-preserving edit, and which is large enough that GitLab drops its
+  patch, is currently accepted as a "pure rename" and silently excluded from what the model reviews. The
+  fix is one extra header off the `HEAD` request already being made (`X-Gitlab-Blob-Id` instead of
+  `X-Gitlab-Size`), pending one read-only probe of this GitLab version.
+
 ## 8. Step 6: End-to-end smoke test
 
 Ordered checklist, using the tokens/hosts from the sections above:

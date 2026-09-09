@@ -1,5 +1,13 @@
 # AppSec SAST Report — feature/gitlab-webhook-diff-trigger (inbound GitLab webhook → Gateway-side diff fetch)
 
+> **STATUS (final): PASS — RELEASE GATE OPEN, approved for merge into `master`** (verified at `5711446`
+> plus this round's own docs-only commit). Everything from here down to
+> "[Round 2 — final verification / release gate](#round-2--final-verification--release-gate)" is the
+> **round-1** report (verdict *NEEDS A DEV PASS*), kept verbatim as the historical record. Read Round 2
+> for the current status of every finding, the two residual-risk calls this round made (F-WH-11,
+> F-WH-12), the one new residual it found (F-WH-13), and the two things that must be checked on the PR's
+> own CI run rather than here.
+
 Scope: `master..feature/gitlab-webhook-diff-trigger`, HEAD `46da421`, tree clean apart from the two doc
 files this round updated itself (see §Doc fixes). 9 commits (`f8615c9` config/credentials → `5533db5`
 client → `e02ad94` assembler → `1bf59fb` verifier → `a703b52` security wiring → `5002942` metrics →
@@ -229,3 +237,269 @@ half-implemented status (F-WH-11).
 For the final verification round, the two things to re-run rather than re-read: the F-WH-01 probe
 fixture (must return both files), and `mvn -o -q test` (955 green today; F-WH-02's fix should add at
 least the two regression tests named in its remediation).
+
+---
+---
+
+# Round 2 — final verification / release gate
+
+**Verdict: PASS — ready to merge.** All four must-fix findings (1 High + 3 Medium) and all four
+should-fix findings are **CONFIRMED FIXED**, verified against the code and re-probed rather than read
+off the commit messages. One new **Low** (F-WH-13) and two new **Info** (F-WH-14, F-WH-15) were found;
+none blocks the merge, and F-WH-13 is recorded as a documented residual with a named pre-enable owner
+action. The two items the fix round deferred to AppSec (F-WH-11, F-WH-12) are **decided and accepted**
+below, with the acceptance written into the threat model's §7 residual list so the next round cannot
+re-discover them as omissions.
+
+**Scope:** `46da421..5711446` — 6 commits (`818b322` F-WH-01 → `9de72f3` F-WH-02/05 → `393f02f`
+F-WH-03/07 → `0638705` F-WH-06/08 → `699e7ee` F-WH-10 → `5711446` docs), read as diffs *and* as resulting
+file state. `git diff master...HEAD -- pom.xml` is still empty — no dependency delta, SCA posture
+unchanged. Zero new Flyway migrations. `.github/workflows/security-gate.yml` gained only the two
+`--config .semgrep/rules.yml` flags.
+
+**Suite (run by me, this host, `mvn -o clean test`):**
+`Tests run: 973, Failures: 0, Errors: 0, Skipped: 0` — **BUILD SUCCESS**. 973 = 955 + 18 regression tests
+added by the fix round. No test was weakened: every fix's own tests assert behaviour, not absence of an
+exception (checked each one).
+
+**Method:** hunted specifically for fix-induced defects — a widened `catch` swallowing what a narrower
+one handled correctly, an exemption "fixed" into a new fail-open, an `Optional` refactor with a stale
+call site, a startup validator that breaks an unrelated deployment, and a CI rule that blocks the gate
+while matching nothing. Plus one executable probe (11 fixtures) run against the real
+`DiffIntegrityVerifier`/`DiffAssembler`, deleted after the run.
+
+## Fix-by-fix verdicts
+
+| Finding | Sev | Fix commit | Verdict |
+|---|---|---|---|
+| **F-WH-01** | **High** (release blocker) | `818b322` | **CONFIRMED FIXED** — re-probed, see below |
+| **F-WH-02** | Medium | `9de72f3` | **CONFIRMED FIXED** — catch order is correct, nothing shadowed |
+| **F-WH-03** | Medium | `393f02f` | **CONFIRMED FIXED** — single call site, both directions tested |
+| **F-WH-04** | Medium | `818b322` | **FIXED, with a new residual** → F-WH-13 (Low) |
+| F-WH-05 | Low | `9de72f3` | **CONFIRMED FIXED** |
+| F-WH-06 | Low | `0638705` | **CONFIRMED FIXED** |
+| F-WH-07 | Low | `393f02f` | **CONFIRMED FIXED** |
+| F-WH-08 | Low | `0638705` | **CONFIRMED FIXED** |
+| F-WH-09 | Info | `5711446` | **CONFIRMED** — WHR-19 is now endpoint-agnostic and enforceable |
+| F-WH-10 | Info | `699e7ee` | **PARTIAL** — rules exist and are wired; **never executed anywhere** |
+| F-WH-11 | Info | — | **ACCEPTED** as documented residual (decision below) |
+| F-WH-12 | Info | — | **ACCEPTED** as documented residual (decision below) |
+
+### F-WH-01 — re-probed against the real classes, not re-read
+
+The predicate is now
+`diff.startsWith("Binary files ") && diff.stripTrailing().endsWith(" differ") && !diff.contains("\n@@")`.
+The round-1 reproduction fixture, replayed verbatim through the real `DiffIntegrityVerifier` +
+`DiffAssembler`:
+
+```
+PROBE F-WH-01 original repro -> coverage-bearing=[src/Auth.java, src/Other.java]
+                                assembledMentionsAuth=true assembledLen=298
+```
+
+The file that removes `if (user.isAdmin()) check();` while carrying the context line
+`// Binary files are handled differently here` is back in the coverage-bearing set and back in the
+assembled diff. The High is closed. The same probe run covered the adjacent cases, which is where a
+fix like this usually breaks something else:
+
+| Probe fixture | Result |
+|---|---|
+| Genuine binary marker, modified file (`Binary files a/img.png and b/img.png differ\n`) | exempt ✓ (no availability regression) |
+| Genuine binary marker, new file (GitLab's `old_path == new_path` shape) | exempt ✓ |
+| Genuine binary marker, deleted file | exempt ✓ |
+| Genuine binary marker, no trailing newline | exempt ✓ (`stripTrailing` is doing real work) |
+| Marker line + `\n@@` hunk header + an auth-check removal | **rejected** `DIFF_TOO_LARGE_OR_TRUNCATED` ✓ |
+| Same, CRLF (`\r\n@@`) | **rejected** ✓ (`contains("\n@@")` still matches inside `\r\n@@`) |
+| `GIT binary patch` form (git's `--binary` shape, not GitLab's) | rejected, i.e. fail-**closed** ✓ |
+
+One theoretical hole remains and is **not reachable through GitLab**: a body of
+`"Binary files … differ\n<arbitrary non-hunk lines>…differ"` still tests as binary (probed: exempt).
+Reaching it requires controlling the *first* bytes of the diff body, which git/GitLab generate — a text
+file's body always begins with `@@`. The one route that could smuggle a newline into the marker line is
+an attacker-chosen path (the marker interpolates `old_path`/`new_path`), and `validatePath` runs
+**before** the exemption test (`DiffIntegrityVerifier:102-108`) and rejects any Cc/Cf character. Cheap
+hardening if it is ever wanted: additionally require `diff.strip()` to contain no `\n` at all — one line,
+strictly stronger, no behaviour change for any real GitLab shape. Not required for this gate.
+
+Worth recording for whoever debugs the first rejected binary MR after enabling: the exact marker text is
+inferred from git's own output format, not from a §8-style empirical capture (the §8 probes covered
+oversized/truncated files, not binaries). The direction of failure if GitLab's wording ever differs is
+closed — a rejected MR with a diagnostic comment, not a silent drop — so this is a debugging hint, not a
+risk.
+
+### F-WH-02 — the catch order is right, and nothing is shadowed
+
+The concern this round had to settle: does `catch (RuntimeException)` now swallow
+`DiffFetchUnavailableException`/`DiffIntegrityException` before their specific handlers run? **No.** The
+two specific catches live *inside* `doHandle` (`WebhookReviewTriggerService:197-203`); the backstop is one
+frame up, wrapping the `doHandle` call in `handle` (`:124-140`). Java's semantics make the inner handlers
+strictly first: the integrity path still produces its unconditional ERROR log + per-reason metric + the
+capped diagnostic comment, and the transient path still returns quietly for redelivery. The three WHR-28
+tests that assert exactly that are still green. If the *comment* path itself throws something unexpected,
+the backstop catches it — which is the desired ordering, not a leak.
+
+Also checked and correct: only `RuntimeException` is caught (an `Error` still propagates, as it must);
+`fetchPermits.release()` cannot double-release (the inner `try` is entered only after a successful
+`tryAcquire`, and the saturated path `return`s before it); `inFlight.remove` still runs on every path.
+`ReviewerSweepService:100-108` has the per-candidate guard, and `attempted++` still counts the failed
+candidate, so the tick's own log line stays honest.
+
+Residual, not worth code: the loop's *pre-check* `existsByProjectIdAndMergeRequestIdAndHeadSha`
+(`ReviewerSweepService:94-96`) is outside that `try`, so a `DataAccessException` there still aborts the
+tick. That is a DB-down condition in which every other scheduled job is failing too, and
+`ScheduledJobs.sweepReviewers` catches and logs it. Noted, deliberately not fixed.
+
+### F-WH-03 — every call site moved with the signature
+
+`listRecentNotes` now returns `Optional<List<Note>>`. There is exactly **one** production call site
+(`WebhookReviewTriggerService:235`, grep-verified across `src/main`), and it returns before
+`postDiscussion` when the Optional is empty, with a WARN naming the fail-safe direction. `Optional.empty()`
+is produced on any exception *and* on page-cap exhaustion (`GitLabClientImpl:425-433`), so F-WH-07's
+truncated-notes case folds into the same "do not post" outcome as WHR-28 requires. `Optional.of(List.of())`
+— a genuinely empty read — still posts. Both directions have tests, plus the `GitLabClientImpl` pair
+(`listRecentNotesReturnsAPresentEmptyListWhenThereAreGenuinelyNoNotes` /
+`…ReturnsEmptyOptionalOnFailureRatherThanThrowing` / `…TreatsHittingThePageCapAsAmbiguous…`).
+
+### F-WH-04 — fixed as specified, and the size check has a real (narrow) gap → F-WH-13
+
+The pure-rename exemption is present, correctly conjunctive (`renamedFile && oldPath != newPath &&
+aMode.equals(bMode) && diff.isEmpty() && !newFile && !deletedFile`), disjoint from the other two
+exemptions, and it *verifies* rather than assumes, reusing `headFileSize` — which fails closed on every
+ambiguous branch. A rename with a real content change never reaches it (non-empty diff ⇒ ordinary hunk
+validation; asserted with `verify(…, never()).headFileSize(…)`), and `renamed_file: true` with an
+unchanged path still rejects (probed). The over-strict whole-MR rejection of an ordinary refactor is gone.
+
+What the size check cannot see is a **length-preserving** content change — see F-WH-13 below.
+
+## New findings (Round 2)
+
+| # | Severity | CWE / OWASP | Where | Description | Remediation |
+|---|----------|-------------|-------|-------------|-------------|
+| **F-WH-13** | **Low** (CVSS:3.1 `AV:N/AC:H/PR:L/UI:N/S:U/C:N/I:L/A:N` ≈ 2.6 — deliberate-insider only, no accidental variant, advisory output) | CWE-354 / CWE-1288, A04:2021 | `DiffIntegrityVerifier.verifyPureRenameSizesMatch:161-169` | **The F-WH-04 exemption proves "content unchanged" with byte size, which a length-preserving edit defeats.** Probed against the real classes: `renamed_file: true`, `diff: ""`, `headFileSize(old@base) == headFileSize(new@head) == 408000` ⇒ `coverage-bearing=[]`, the file leaves the review silently — the same end state as F-WH-01. Prerequisites are much narrower, which is why this is Low, not High: the author must (a) rename a file, (b) make it large enough that GitLab drops its patch entirely (the WHT-08 mechanism the §8 probe confirmed at >200 KB), and (c) keep the byte count identical across the edit. There is no accidental variant — a genuine pure rename really is unchanged, and any rename of a normal-sized file returns a real diff and takes the ordinary hunk path. Direction-of-failure for the *inverse* case is still closed (mismatched sizes reject; either HEAD read failing rejects). Note also that the rename+truncation shape itself is **unprobed** — §8 covered modified and new files only. | Compare identity, not size: the **same** `HEAD /repository/files/{path}?ref={sha}` request already being issued also returns `X-Gitlab-Blob-Id` and `X-Gitlab-Content-Sha256`; a rename with unchanged content has an identical blob id by git's object model, so the check becomes exact for zero extra requests. Gate it on one read-only probe of this GitLab version first (the same discipline that produced `X-Gitlab-Size`) — a header that "should be there" is not evidence. **Accepted for v1** (feature ships default-off), recorded in the threat model's WHR-15 + §7 residual list and in `DEPLOYMENT.md` §7.4's pre-enable checklist. |
+| F-WH-14 | Info | — (requirement/naming drift) | `WebhookReviewTriggerService.handle:109-113` vs. `gateway.webhook.max-reviews-per-*` | **The rate-limit bucket counts deliveries that reach the fetch stage, not Reviews created.** The limit is consumed before the state/reviewer/dedup checks — necessarily, since those need the GitLab read the limit exists to bound. So on an allowlisted project every MR event consumes a slot, including MRs where the bot is not a reviewer, while the property name and WHR-22's wording both say "reviews". At this project's stated scale (20–30 MRs/day, defaults 20/project/hour, 100 global/hour) this is comfortably inside the budget, one project cannot starve the global bucket (per-project is consumed first), and suppression self-heals within one hour via the sweep, which enrolls exactly the MRs that were skipped. | Documented in `DEPLOYMENT.md` §7.4 ("raise the per-project limit above the project's *MR-event* rate, not its review rate") with the `webhookRateLimited` counter named as the signal. No code change. |
+| F-WH-15 | Info | — (test hygiene) | `DiffIntegrityVerifierTest:208-253` | `aGenuineBinaryMarkerWithTrailingWhitespaceIsStillExempted` is byte-identical to `acceptsABinaryMarkerFileAndExcludesItFromCoverage`; the trailing-whitespace case its name promises (e.g. `"… differ  \n\n"`) is not actually covered. My own probe covers the no-trailing-newline end; the whitespace end is still untested. | Change the fixture to `"Binary files a/img.png and b/img.png differ \n\n"` next time this file is touched, or delete the duplicate. Cosmetic. |
+
+## The two deferred items — decided
+
+**F-WH-11 (WHR-05's `X-Gitlab-Event-UUID` LRU) — ACCEPTED, not required.** The load-bearing half (the
+`last_commit.id` fast path) shipped and is tested; the LRU would only collapse rapid exact redeliveries in
+the window *before* the first Review row exists, and that window is already bounded three other ways —
+WHR-22's hourly limits, WHR-25's non-blocking permit, and WHR-26's single-flight guard, which collapses
+concurrent duplicate deliveries for one MR to a single fetch set outright. Building an in-memory LRU to
+close what a `ConcurrentHashMap` single-flight guard already closes is cost without a matching risk. The
+acceptance is now written into WHR-05 itself and into §7's residual list, with the re-open trigger named
+(`webhookRateLimited` showing redelivery storms actually consuming budget).
+
+**F-WH-12 (dedup matches any Review status) — ACCEPTED as a stated divergence, not narrowed.** I weighed
+the alternative concretely: narrowing the fast path to `createReview`'s active-status set means every
+hourly sweep tick creates a *fresh* Review row + queue job for a revision whose review permanently fails
+(a dead backend, a poisoned prompt version) — forever, consuming the same rate-limit budget legitimate
+MRs need, and generating a `FAILED` row per hour per MR. "Not re-attempted" is the better failure mode at
+this scale, and unlike the round-1 write-up implied, the operator is **not** without remedy: the CI path
+(`POST /reviews`) deliberately *does* allow superseding a `FAILED` predecessor, and a new commit changes
+the dedup key anyway. Recorded in three durable places so it reads as a decision: the threat model's §7
+residual list, `ReviewRepository#existsByProjectIdAndMergeRequestIdAndHeadSha`'s javadoc (where the
+mistake would be made), and `DEPLOYMENT.md` §7.4's operator notes.
+
+## Threat-model amendments — verified coherent
+
+`docs/gitlab-webhook-trigger-threat-model.md` is now genuinely in git history (`5711446`, force-added;
+`git log -- <path>` confirms, and the working tree matches). Read end to end as an amended document:
+
+- **WHR-15** now states all three exemptions with the anchored predicate inline, explains *why* the
+  unanchored version was wrong, and specifies exemption (c)'s verification rather than just permitting it.
+  Coherent with the code. This round appended F-WH-13's residual to it.
+- **WHR-18** now distinguishes diff-bearing reads (hard reject) from best-effort reads (bounded +
+  observable), and explicitly says the diff-bearing case does not currently arise. It matches what shipped
+  and it stays falsifiable — if a diff-bearing read is ever paginated, the rule already covers it.
+- **WHR-19** is the one I checked hardest, because "endpoint-agnostic" can easily become unenforceable
+  hand-waving. It does not: it names the *client bean* (`gitLabDiffRestClient`), quantifies over "every
+  response read … present and future", names the mechanism (`BoundedInputStream` at
+  `max-response-bytes + 1` with a `Content-Length` early reject), and states the negative condition in
+  checkable form ("a new method on that client that uses `.retrieve().body(...)` is a defect by
+  construction"). A hypothetical fourth GitLab-reading method is unambiguously covered, and the rule is
+  now mechanically enforceable by the Semgrep rule F-WH-10 added. Re-verified by hand that all five
+  existing reads still route through `readBoundedBody`.
+
+## F-WH-10 — the Semgrep rules are wired but **unproven**
+
+`.semgrep/rules.yml` parses as valid YAML with the right schema keys, and both the informational and the
+blocking `semgrep scan` steps now pass `--config .semgrep/rules.yml` alongside the three registry packs.
+**Neither rule has ever been executed.** Semgrep does not run on this host (no Windows support, no Docker
+daemon — the CLI is installed but `npipe:////./pipe/dockerDesktopLinuxEngine` is not up, and the only WSL
+distro is `docker-desktop`), so this round could verify the rules only by reading them, exactly as the
+round-1 report had to.
+
+Two specific doubts a real run would settle, neither blocking the merge (the equivalent `rg` sweeps are
+clean again this round: zero `.retrieve().body(...)` on any GitLab client, zero concatenated URI/query
+construction in `src/main`):
+
+1. Rule (a) binds `$CLIENT` to the whole receiver chain (`gitLabDiffRestClient.get().uri(…)`), not to the
+   bare identifier; it relies on `metavariable-regex` matching that chain's text from the start. Plausible,
+   unproven.
+2. A malformed rule file makes the **blocking** step exit non-zero, i.e. it would redden the gate for
+   everyone. That is fail-loud and self-limiting — the branch's own PR run is the first execution, so it
+   would be caught on this PR, not on `master`.
+
+**Carry into the PR run (this is part of the gate, per the threat model's §7 CI-gate note):** confirm the
+`semgrep` job is green, and confirm the rules actually *fire* by dropping this positive control into a
+scratch `.java` file and expecting two hits:
+
+```java
+// rule (a) must fire:
+gitLabDiffRestClient.get().uri("/x/{id}", id).retrieve().body(MergeRequestApiResponse.class);
+// rule (b) must fire:
+gitLabDiffRestClient.get().uri("/projects/" + userValue, 1L);
+```
+
+A rule that matches nothing is indistinguishable from a passing gate.
+
+## Fresh independent pass over the branch — nothing else found
+
+Beyond the fix-by-fix work, a top-to-bottom re-read looking for anything *both* rounds missed, focused on
+what the fix round could have disturbed:
+
+- `GatewayProperties.validateWebhookOnStartup` — the new `BOT_USERNAME_PATTERN` check runs only when the
+  feature is enabled, sits alongside the four existing pinned patterns, and cannot break a
+  webhook-disabled deployment. The default `ai-review-bot` satisfies it, so no existing config breaks
+  either. GitLab's own username alphabet is a superset-safe choice for a query parameter.
+- The three new `MetricsCounters`/`MetricsSnapshot`/`MetricsResponse` fields are threaded in the right
+  order at both call sites (two adjacent `long`s is exactly where a silent transposition hides —
+  `AdminController:49` and `StatisticsService:107` both pass `rateLimited, unexpectedFailure`, checked
+  individually). The new counter's label set stays closed; no unbounded cardinality.
+- `GlobalExceptionHandler`'s two new mappings are now unreachable by construction (the backstop swallows
+  everything first) and their bodies are coarse anyway — no verdict leakage if a future refactor exposes
+  them.
+- `WebhookController` still returns `202` unconditionally and inspects nothing. A malformed JSON body
+  yields a framework `400` before any logic runs; that reveals nothing about the project/MR and is not a
+  WHR-07 oracle.
+- No new logging of any GitLab body, note, diff or token on the changed lines: the new WARNs log
+  `getClass().getSimpleName()`, ids, and config *names* only (WHR-29 re-verified by grep over the fix-round
+  diff).
+- `pom.xml` untouched; no new migration; no new infrastructure.
+
+## Gate decision
+
+**PASS — merge approved.** Round-1's 1 High + 3 Medium are closed and re-verified by probe and by suite;
+the four Lows are closed; the two deferred Infos are decided and documented; the one new finding is a Low
+with a named owner action before the feature is *enabled*, which is a separate event from merging (the
+branch ships `WEBHOOK_ENABLED=false`).
+
+**Recommended to merge now.** Three things for the user's own judgment, none of which is a reason to hold
+the merge:
+
+1. **F-WH-13 is my call to accept, not a mechanical one.** If you would rather not carry a
+   silent-coverage-loss residual at all — even an insider-only one behind a default-off flag — send it back
+   for the `X-Gitlab-Blob-Id` change plus its probe. It is a small change (one header, one comparison) but
+   it needs a real GitLab probe to be done to this repo's standard, which is why I did not treat it as a
+   merge blocker.
+2. **F-WH-12's acceptance is a product decision as much as a security one.** "A failed webhook review is
+   never retried for that revision" is now documented in three places, but if operators would rather have
+   the hourly retry loop, that is a legitimate different answer — it is a behaviour choice, not a
+   correctness one.
+3. **The Semgrep gate is unproven until this PR's own CI run.** Watch that job on the PR; if it is red for
+   a config reason, that is this branch's own change and should be fixed before merging rather than after.
+
+Docs-only changes made by AppSec in this round (no production behaviour touched): the threat model's
+WHR-05/WHR-15/§7 amendments and CI-gate status note, `DEPLOYMENT.md` §7.4's three accepted behaviours,
+`ReviewRepository`'s javadoc note (comment only), and this section.
