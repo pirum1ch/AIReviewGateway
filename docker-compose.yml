@@ -78,6 +78,13 @@ services:
       GITLAB_BASE_URL: ${GITLAB_BASE_URL:-https://gitlab.example.com/api/v4}
       GITLAB_TOKEN: ${GITLAB_TOKEN:?set GITLAB_TOKEN, a GitLab project/group access token}
       BACKEND_ALLOWED_HOST_PATTERN: ${BACKEND_ALLOWED_HOST_PATTERN:-.*}
+      # Backend Self-Registration (docs/backend-self-registration-architecture.md) -- off by default.
+      # Turning this on lets a Worker register/repoint its own backends row via POST /backends/announce
+      # instead of the backend-seed job below / the admin API. If you enable it, BACKEND_ALLOWED_HOST_PATTERN
+      # above MUST be narrowed to your real backend network first -- the Gateway refuses to start with
+      # self-registration on and an effectively-universal pattern (still .* by default here).
+      BACKEND_SELF_REGISTRATION_ENABLED: ${BACKEND_SELF_REGISTRATION_ENABLED:-false}
+      BACKEND_MAX_BACKENDS: ${BACKEND_MAX_BACKENDS:-16}
       # Prompt Manager (V3, optional) -- Compose only forwards variables listed here; exporting them
       # in the host shell alone has no effect on the container. Left at their off-by-default values
       # unless the corresponding host env var is actually exported (see README.md §4.4).
