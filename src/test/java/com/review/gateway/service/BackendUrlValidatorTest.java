@@ -146,6 +146,40 @@ class BackendUrlValidatorTest {
                 .isInstanceOf(BackendUnavailableException.class);
     }
 
+    // ---------------------------------------------------------- F-BSR-06: allowlist runs before DNS ---
+
+    @Test
+    void nonAllowlistedHostnameIsRejectedByTheAllowlistWithoutEverAttemptingDnsResolution() {
+        // Ordering proof without mocking InetAddress (a static JDK call): a host that is BOTH
+        // unresolvable AND non-allowlisted must fail with the allowlist's own message, never with
+        // isBlockedHost's "in a blocked range"/unresolvable-host message. If DNS resolution ran first (the
+        // pre-fix ordering), an unresolvable host is fail-closed as blocked and the allowlist message
+        // would never be reached -- so this message assertion is a direct, deterministic proof that the
+        // allowlist regex runs BEFORE any resolver call, not merely a proxy for it.
+        String neverResolves = "this-host-does-not-exist-either.invalid";
+        Pattern narrow = Pattern.compile("^10\\..*");
+
+        assertThatThrownBy(() -> BackendUrlValidator.validate("http://" + neverResolves + ":8080", narrow))
+                .isInstanceOf(BackendUnavailableException.class)
+                .hasMessage("Backend URL host does not match the configured allowlist");
+    }
+
+    @Test
+    void nonAllowlistedHostnameRejectionIsFastEvenWhenTheHostWouldOtherwiseRequireDnsResolution() {
+        // Wall-clock corroboration of the same ordering (SAST report measured 46-57ms for the pre-fix DNS
+        // round-trip vs ~0ms for an in-memory regex miss). Generous bound to avoid CI flakiness -- the
+        // point is "no resolver round-trip happened", not a tight timing assertion.
+        String neverResolves = "another-host-that-does-not-exist.invalid";
+        Pattern narrow = Pattern.compile("^10\\..*");
+
+        long start = System.nanoTime();
+        assertThatThrownBy(() -> BackendUrlValidator.validate("http://" + neverResolves + ":8080", narrow))
+                .isInstanceOf(BackendUnavailableException.class);
+        long elapsedMillis = (System.nanoTime() - start) / 1_000_000;
+
+        assertThat(elapsedMillis).isLessThan(20);
+    }
+
     // -------------------------------------------------------------------- BSQ-24: full match only ---
 
     @Test
