@@ -79,13 +79,17 @@ public class GlobalExceptionHandler {
     }
 
     /**
-     * Backend Self-Registration (BSQ-03): deliberately a distinct status/code from {@link
+     * Backend Self-Registration (BSQ-03 / F-BSR-04): deliberately a distinct status/code from {@link
      * BackendNameTakenException}'s {@code 409} so the two different "announce did not land" causes stay
-     * distinguishable to a Worker.
+     * distinguishable to a Worker. Mapped to {@code 503}, not {@code 422} — unlike a rejected URL (a
+     * permanent Worker-side misconfiguration), a full registry is a transient Gateway-side capacity
+     * condition that resolves itself once an operator decommissions a stale backend or raises the cap;
+     * the Worker (which never reads this response body, BSR-19) must bucket it with "retry with backoff",
+     * the same bucket as a genuinely unreachable Gateway, not with "fail startup permanently".
      */
     @ExceptionHandler(BackendRegistryFullException.class)
     public ResponseEntity<ErrorResponse> handleBackendRegistryFull(BackendRegistryFullException ex) {
-        return ResponseEntity.status(HttpStatus.UNPROCESSABLE_ENTITY)
+        return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
                 .body(new ErrorResponse("BACKEND_REGISTRY_FULL", ex.getMessage()));
     }
 

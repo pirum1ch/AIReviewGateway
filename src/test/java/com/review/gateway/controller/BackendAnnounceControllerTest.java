@@ -4,6 +4,7 @@ import com.review.gateway.config.GatewayProperties;
 import com.review.gateway.config.SecurityConfig;
 import com.review.gateway.dto.AnnounceBackendResponse;
 import com.review.gateway.exception.BackendNameTakenException;
+import com.review.gateway.exception.BackendRegistryFullException;
 import com.review.gateway.exception.BackendUrlRejectedException;
 import com.review.gateway.service.BackendRegistryService;
 import com.review.gateway.service.MetricsCounters;
@@ -96,6 +97,21 @@ class BackendAnnounceControllerTest {
                 .andExpect(status().isUnprocessableEntity())
                 .andExpect(jsonPath("$.error").value("BACKEND_URL_REJECTED"))
                 .andExpect(jsonPath("$.message").value("Backend URL was rejected"));
+    }
+
+    @Test
+    void registryFullMapsTo503NotFatalToAWorker() throws Exception {
+        // F-BSR-04: a full registry is a transient Gateway-side capacity condition, not a permanent
+        // Worker-side misconfiguration -- it must not share BACKEND_URL_REJECTED's 422 (which the Worker
+        // treats as fail-fast-forever), so the Worker's retry-with-backoff bucket picks it up instead.
+        when(backendRegistryService.announce(any(), any(), any(), any()))
+                .thenThrow(new BackendRegistryFullException("Backend registry is at its configured capacity"));
+
+        mockMvc.perform(post("/backends/announce")
+                        .header("Authorization", "Bearer " + SecurityTestTokens.WORKER_TOKEN)
+                        .contentType(MediaType.APPLICATION_JSON).content(VALID_BODY))
+                .andExpect(status().isServiceUnavailable())
+                .andExpect(jsonPath("$.error").value("BACKEND_REGISTRY_FULL"));
     }
 
     @Test
