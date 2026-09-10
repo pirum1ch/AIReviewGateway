@@ -72,6 +72,14 @@ gateway:
                                      # outside any DB transaction (see GatewayProperties.Backend#readTimeout)
                                      # — таймаут чтения ответа backend'а при health-пробе; увеличен с 5s, т.к. WOC-14 вынес ввод-вывод пробы за пределы транзакции БД, и это стало безопасно
     allowed-host-pattern: ${BACKEND_ALLOWED_HOST_PATTERN:.*}   # SR-10: tighten per deployment — regex-паттерн допустимых хостов для URL backend'ов (защита от SSRF); в конкретном окружении следует сузить
+    # Backend Self-Registration (BSR-11/BSQ-05): kill-switch, default false -- a Gateway upgrade must
+    # never silently open the new WORKER-writable POST /backends/announce endpoint. When enabling it,
+    # allowed-host-pattern above MUST also be narrowed first (GatewayProperties refuses to start
+    # otherwise) -- регистрация backend'ов воркерами по умолчанию выключена; при включении ОБЯЗАТЕЛЬНО
+    # сузьте allowed-host-pattern выше, иначе приложение откажется стартовать (см. DEPLOYMENT.md).
+    self-registration:
+      enabled: ${BACKEND_SELF_REGISTRATION_ENABLED:false}
+      max-backends: ${BACKEND_MAX_BACKENDS:16}   # BSQ-03: hard cap on registry rows an announce INSERT may create
 
   # ---- §B Бюджет LLM-токенов ------------------------------------------------------------------
   # Все параметры этого блока (плюс gateway.prompt.limits.* из §C, плюс аналогичные параметры

@@ -116,6 +116,62 @@ class ApplicationYamlBootTest {
                 });
     }
 
+    /**
+     * QA round (Backend Self-Registration, BST-03/BSQ-05): the developer's own tests
+     * ({@code GatewayPropertiesBackendSelfRegistrationValidationTest}) only call {@code
+     * validateOnStartup()} directly -- they never prove the real Spring Boot application context, wired
+     * against the actual {@code application.yml} and enabled the way an operator would actually enable it
+     * (the documented {@code BACKEND_SELF_REGISTRATION_ENABLED} env var), genuinely refuses to start. This
+     * is BST-03's own example of a pattern that "an operator will read as narrow" while actually granting
+     * the entire IPv4 space -- the single most important negative-path scenario in the whole feature per
+     * the threat model. Also a regression test for the {@code application.yml} wiring itself: before the
+     * QA fix that added the {@code BACKEND_SELF_REGISTRATION_ENABLED}/{@code BACKEND_MAX_BACKENDS} env-var
+     * placeholders under {@code gateway.backend.self-registration.*} (mirroring every other kill-switch in
+     * this file, e.g. {@code PROMPT_MANAGER_ENABLED}), setting this documented env var did nothing at all
+     * -- the property stayed at its Java default (disabled) with no error, silently no-op'ing the exact
+     * activation step {@code DEPLOYMENT.md}/the architecture doc (BSR-11) promise operators.
+     */
+    @Test
+    void selfRegistrationEnabledWithAnIpShapedUniversalAllowlistRefusesToStartTheRealApplicationContext() {
+        runner.withPropertyValues(
+                        "BACKEND_ALLOWED_HOST_PATTERN=^[0-9.]+$",
+                        "BACKEND_SELF_REGISTRATION_ENABLED=true")
+                .run(context -> {
+                    assertThat(context).hasFailed();
+                    assertThat(context.getStartupFailure()).hasRootCauseInstanceOf(IllegalStateException.class);
+                    assertThat(rootCause(context.getStartupFailure()).getMessage())
+                            .contains("gateway.backend.allowed-host-pattern")
+                            .contains("refusing to start");
+                });
+    }
+
+    /** Same scenario, the other side: a genuinely narrow LAN pattern boots the real context cleanly. */
+    @Test
+    void selfRegistrationEnabledWithANarrowLanAllowlistBootsTheRealApplicationContextCleanly() {
+        runner.withPropertyValues(
+                        "BACKEND_ALLOWED_HOST_PATTERN=^192\\.168\\.1\\.\\d+$",
+                        "BACKEND_SELF_REGISTRATION_ENABLED=true")
+                .run(context -> {
+                    assertThat(context).hasNotFailed();
+                    GatewayProperties properties = context.getBean(GatewayProperties.class);
+                    assertThat(properties.getBackend().getSelfRegistration().isEnabled())
+                            .as("BACKEND_SELF_REGISTRATION_ENABLED must actually reach "
+                                    + "gateway.backend.self-registration.enabled")
+                            .isTrue();
+                });
+    }
+
+    /** The documented env var stays a true no-op (default false, unchanged) when it is never set. */
+    @Test
+    void stockDeploymentLeavesSelfRegistrationDisabled() {
+        runner.run(context -> {
+            assertThat(context).hasNotFailed();
+            GatewayProperties properties = context.getBean(GatewayProperties.class);
+            assertThat(properties.getBackend().getSelfRegistration().isEnabled()).isFalse();
+            assertThat(properties.getBackend().getSelfRegistration().getMaxBackends()).isEqualTo(16);
+        });
+    }
+
     private Throwable rootCause(Throwable t) {
         Throwable current = t;
         while (current.getCause() != null && current.getCause() != current) {
