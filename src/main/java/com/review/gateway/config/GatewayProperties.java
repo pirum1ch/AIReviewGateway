@@ -7,12 +7,22 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.stereotype.Component;
 
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.regex.Pattern;
+import java.util.regex.PatternSyntaxException;
 
 /**
  * Typed {@code gateway.*} configuration surface. Extended in feature/03-api-security with the
@@ -178,6 +188,162 @@ public class GatewayProperties {
         validateRetryAndBackendHealthOnStartup();
         validatePromptOnStartup();
         validateStructuredOnStartup();
+        // Backend Self-Registration (BSQ-06): unconditional -- runs regardless of whether
+        // gateway.backend.self-registration.enabled is true, so an uncompilable/pathological
+        // allowed-host-pattern is caught at startup even for a deployment that never opts into this
+        // feature (today's permissive default keeps working unchanged for everyone else).
+        validateAllowedHostPatternOnStartup();
+        // BSQ-05/BSR-12: only when the feature is actually opted into (default false).
+        validateBackendSelfRegistrationOnStartup();
+    }
+
+    /**
+     * Backend Self-Registration (BSQ-06, blocking): compiles {@code gateway.backend.allowed-host-pattern}
+     * exactly once, here, and caches the result on {@link Backend#compiledAllowedHostPattern} for reuse by
+     * {@code BackendUrlValidator}/{@code BackendProberImpl}/{@code BackendRegistryService} — never
+     * recompiled per call. Runs unconditionally: until self-registration exists, this pattern is only ever
+     * evaluated against DBA-chosen data (SR-10), so a slow/uncompilable pattern was tolerable; once a
+     * caller-chosen host can reach it (BSTB-ANN), it is not.
+     *
+     * <p>A {@link PatternSyntaxException} always refuses startup. Immediately after compiling, the pattern
+     * is run against two pathological ~255-character inputs on a background thread with a hard 100ms
+     * wall-clock budget (never waited out past that — a genuinely catastrophic pattern can take
+     * astronomically longer than 100ms to actually finish, so this measures "did it finish in time", not
+     * "how long did it take", and abandons the probe thread rather than blocking on it).
+     */
+    void validateAllowedHostPatternOnStartup() {
+        String rawPattern = backend.getAllowedHostPattern();
+        String effectivePattern = (rawPattern == null || rawPattern.isBlank()) ? ".*" : rawPattern;
+        Pattern compiled;
+        try {
+            compiled = Pattern.compile(effectivePattern);
+        } catch (PatternSyntaxException invalid) {
+            throw new IllegalStateException(
+                    "gateway.backend.allowed-host-pattern does not compile as a regular expression — refusing to start",
+                    invalid);
+        }
+        runBacktrackingBudgetProbe(compiled);
+        backend.compiledAllowedHostPattern = compiled;
+    }
+
+    /** BSQ-06: 100ms wall-clock budget for the pathological-input probe below. */
+    private static final Duration REDOS_PROBE_BUDGET = Duration.ofMillis(100);
+
+    private void runBacktrackingBudgetProbe(Pattern compiled) {
+        String pathologicalMatch = "a".repeat(255);
+        String pathologicalNearMiss = "a".repeat(255) + "!";
+        var executor = Executors.newSingleThreadExecutor(runnable -> {
+            Thread probeThread = new Thread(runnable, "allowed-host-pattern-redos-probe");
+            probeThread.setDaemon(true);
+            return probeThread;
+        });
+        Future<?> probe = executor.submit(() -> {
+            compiled.matcher(pathologicalMatch).matches();
+            compiled.matcher(pathologicalNearMiss).matches();
+        });
+        try {
+            probe.get(REDOS_PROBE_BUDGET.toMillis(), TimeUnit.MILLISECONDS);
+        } catch (TimeoutException tooSlow) {
+            throw new IllegalStateException(
+                    "gateway.backend.allowed-host-pattern took longer than " + REDOS_PROBE_BUDGET
+                            + " to evaluate a pathological input — likely catastrophic backtracking — refusing to start");
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException(
+                    "Interrupted while probing gateway.backend.allowed-host-pattern for catastrophic backtracking — refusing to start",
+                    interrupted);
+        } catch (ExecutionException probeFailed) {
+            throw new IllegalStateException(
+                    "gateway.backend.allowed-host-pattern failed while probing for catastrophic backtracking — refusing to start",
+                    probeFailed.getCause());
+        } finally {
+            // The regex-evaluation thread itself cannot be interrupted mid-match (java.util.regex has no
+            // cooperative cancellation) -- shutdownNow() only stops the executor from accepting further
+            // work. A genuinely pathological match keeps burning CPU on that orphaned daemon thread until
+            // the JVM exits, which it does immediately after this throws (startup failure).
+            executor.shutdownNow();
+        }
+    }
+
+    /** BSQ-05: name-shaped sentinels (BSR-12's original three), plus one randomly-generated per boot. */
+    private static final List<String> NAME_SHAPED_SENTINELS =
+            List.of("evil.example.com", "metadata.google.internal", "a3f9c1e2-probe.invalid");
+    /**
+     * BSQ-05: IP-literal sentinels covering every "an operator thinks this is narrow but it isn't" shape
+     * — private (10/8, 172.16/12, 192.168/16), CGNAT (100.64/10), link-local-metadata, and public.
+     * {@code ^[0-9.]+\$} passes every {@link #NAME_SHAPED_SENTINELS} entry while granting the entire IPv4
+     * space (BST-03) — this list exists specifically to still catch that shape.
+     */
+    private static final List<String> IP_LITERAL_SENTINELS =
+            List.of("10.0.0.1", "172.16.0.1", "192.168.0.1", "100.100.100.200", "169.254.169.254",
+                    "8.8.8.8", "203.0.113.7");
+    /** BSQ-05: a single-label (no-dot) sentinel — catches {@code ^[^.]*\$}, "every single-label internal hostname". */
+    private static final String SINGLE_LABEL_SENTINEL = "internal-probe-host";
+    private static final String[] RANDOM_SENTINEL_TLDS = {"test", "example", "invalid", "probe-net"};
+
+    /**
+     * Backend Self-Registration (BSQ-05/BST-03, blocking): when the flag is on, refuse to start unless
+     * {@code gateway.backend.allowed-host-pattern} is <em>behaviourally</em> non-universal. "Behaviourally
+     * non-universal" is tested by sentinel, not string-compared (a literal {@code ".*".equals(pattern)}
+     * check is false assurance — {@code .+}, {@code .*.*}, {@code [\s\S]*}, {@code (?s).*} all defeat it).
+     *
+     * <p>The check is grouped, not one flat AND over every sentinel: refuse if the pattern matches
+     * <b>every</b> sentinel within <em>any single group</em> (dotted name-shaped / IP-literal /
+     * single-label). A flat AND over the whole combined list would never flag {@code ^[0-9.]+\$} (which
+     * fails to match the name-shaped sentinels) even though it grants the entire IPv4 space, nor
+     * {@code ^[^.]*\$} (which fails to match every dotted sentinel) even though it grants every
+     * unqualified internal hostname — each is universal <em>within its own shape</em>, which is exactly
+     * what makes it dangerous, and the grouped check is what catches that. One randomly-generated
+     * dotted-and single-label sentinel per boot additionally defeats a pattern hard-tuned to this exact
+     * fixed list.
+     *
+     * <p><b>Passing this check is not evidence the pattern is narrow</b> — only that it is not universal
+     * for at least one of the tested shapes. See {@code docs/backend-self-registration-threat-model.md}
+     * §3.1 for why no automated check can do better than that.
+     */
+    void validateBackendSelfRegistrationOnStartup() {
+        if (!backend.getSelfRegistration().isEnabled()) {
+            return;
+        }
+        if (backend.getSelfRegistration().getMaxBackends() < 1) {
+            throw new IllegalStateException(
+                    "gateway.backend.self-registration.max-backends must be >= 1; got: "
+                            + backend.getSelfRegistration().getMaxBackends());
+        }
+
+        Pattern compiled = backend.getCompiledAllowedHostPattern();
+        List<String> dottedNameGroup = new ArrayList<>(NAME_SHAPED_SENTINELS);
+        dottedNameGroup.add(randomLabel() + "." + randomTld());
+        List<String> singleLabelGroup = List.of(SINGLE_LABEL_SENTINEL, randomLabel());
+
+        boolean universal = matchesEvery(compiled, dottedNameGroup)
+                || matchesEvery(compiled, IP_LITERAL_SENTINELS)
+                || matchesEvery(compiled, singleLabelGroup);
+        if (universal) {
+            throw new IllegalStateException(
+                    "gateway.backend.allowed-host-pattern must be narrowed to your actual backend network "
+                            + "before gateway.backend.self-registration.enabled=true — the configured pattern "
+                            + "matches every sentinel host in at least one tested shape (dotted names / IP "
+                            + "literals / single-label names) — passing this check only proves the pattern is "
+                            + "not universal for that shape, never that it is narrow enough — refusing to start");
+        }
+    }
+
+    private boolean matchesEvery(Pattern compiled, List<String> hosts) {
+        for (String host : hosts) {
+            if (!compiled.matcher(host.toLowerCase(Locale.ROOT)).matches()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private String randomLabel() {
+        return "sentinel-" + UUID.randomUUID().toString().replace("-", "").substring(0, 12);
+    }
+
+    private String randomTld() {
+        return RANDOM_SENTINEL_TLDS[ThreadLocalRandom.current().nextInt(RANDOM_SENTINEL_TLDS.length)];
     }
 
     /**
@@ -961,6 +1127,76 @@ public class GatewayProperties {
          * {@code gateway.job.max-duration} so a wedged-but-busy backend cannot defer forever.
          */
         private Duration deferDemotionMax = Duration.ofMinutes(45);
+
+        private final SelfRegistration selfRegistration = new SelfRegistration();
+
+        /**
+         * BSQ-06: the {@link #allowedHostPattern} above, compiled exactly once by {@link
+         * GatewayProperties#validateAllowedHostPatternOnStartup()} and reused by every caller — never
+         * recompiled per call. {@code null} until that validation has run; a real Spring context always
+         * populates it before any bean depending on {@code GatewayProperties} can observe a null value
+         * ({@code @PostConstruct} runs before this bean is handed to any of its consumers). Deliberately
+         * has no public setter — only the enclosing {@code GatewayProperties} (a same-outer-class access,
+         * not a config-binding target) ever assigns it, so the Spring Boot relaxed binder has no writable
+         * property here to (mis)bind.
+         */
+        private Pattern compiledAllowedHostPattern;
+
+        public SelfRegistration getSelfRegistration() {
+            return selfRegistration;
+        }
+
+        public Pattern getCompiledAllowedHostPattern() {
+            return compiledAllowedHostPattern;
+        }
+
+        /**
+         * Returns the startup-compiled {@link Pattern} when available, else compiles {@link
+         * #allowedHostPattern} fresh (uncached) — the fallback exists only for plain unit tests that
+         * construct {@code new GatewayProperties()} directly and never invoke {@code validateOnStartup()}
+         * (e.g. {@code BackendProberImplTest}); every real Spring context always takes the cached path.
+         */
+        public Pattern resolveAllowedHostPattern() {
+            if (compiledAllowedHostPattern != null) {
+                return compiledAllowedHostPattern;
+            }
+            String raw = (allowedHostPattern == null || allowedHostPattern.isBlank()) ? ".*" : allowedHostPattern;
+            return Pattern.compile(raw);
+        }
+
+        /** Backend Self-Registration (architecture §3.1/BSR-11, {@code gateway.backend.self-registration.*}). */
+        public static class SelfRegistration {
+            /**
+             * Kill switch (BSR-11): default {@code false} — a Gateway upgrade must never silently open a
+             * new WORKER-writable endpoint. {@code POST /backends/announce} does not even exist in the
+             * Spring context while this is off ({@code @ConditionalOnProperty} on
+             * {@code BackendAnnounceController}).
+             */
+            private boolean enabled = false;
+            /**
+             * BSQ-03: hard cap on registry size, enforced on the announce INSERT branch only (ADMIN
+             * {@code POST /backends} is exempt — a trusted operator must always be able to fix things).
+             * {@code BackendHealthChecker} probes serially with a 10s read timeout, so an unbounded row
+             * count is a DoS on outage detection for every other backend (BST-08).
+             */
+            private int maxBackends = 16;
+
+            public boolean isEnabled() {
+                return enabled;
+            }
+
+            public void setEnabled(boolean enabled) {
+                this.enabled = enabled;
+            }
+
+            public int getMaxBackends() {
+                return maxBackends;
+            }
+
+            public void setMaxBackends(int maxBackends) {
+                this.maxBackends = maxBackends;
+            }
+        }
 
         public Duration getConnectTimeout() {
             return connectTimeout;

@@ -18,7 +18,12 @@ public class WebConfig {
         FilterRegistrationBean<RequestBodySizeLimitFilter> registration =
                 new FilterRegistrationBean<>(new RequestBodySizeLimitFilter(properties));
         registration.setOrder(Ordered.HIGHEST_PRECEDENCE);
-        registration.addUrlPatterns("/reviews", "/jobs/*");
+        // BSQ-11 (Backend Self-Registration): registered unconditionally, regardless of
+        // gateway.backend.self-registration.enabled -- a cap on a path that 403s/404s when the feature is
+        // off costs nothing, and the filter would otherwise never be invoked for these paths at all (the
+        // servlet container only calls a filter for the URL patterns it is registered against here --
+        // adding a PathPattern inside the filter class alone does NOT do this).
+        registration.addUrlPatterns("/reviews", "/jobs/*", "/backends", "/backends/announce");
         return registration;
     }
 }

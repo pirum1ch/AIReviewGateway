@@ -146,7 +146,9 @@ class RequestBodySizeLimitFilterTest {
 
     @Test
     void unrelatedPathIsNeverSizeLimitedEvenIfHuge() throws Exception {
-        MockHttpServletRequest request = new MockHttpServletRequest("POST", "/backends");
+        // Backend Self-Registration (BSQ-11) added a cap for POST /backends -- use a genuinely unrelated
+        // path here instead.
+        MockHttpServletRequest request = new MockHttpServletRequest("POST", "/metrics");
         request.setContent(new byte[999999]);
         MockHttpServletResponse response = new MockHttpServletResponse();
         FilterChain chain = Mockito.mock(FilterChain.class);

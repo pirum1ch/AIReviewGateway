@@ -3,6 +3,7 @@ package com.review.gateway.config;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.context.properties.bind.Bindable;
 import org.springframework.boot.context.properties.bind.Binder;
+import org.springframework.boot.context.properties.bind.PropertySourcesPlaceholdersResolver;
 import org.springframework.boot.context.properties.source.ConfigurationPropertySources;
 import org.springframework.boot.env.YamlPropertySourceLoader;
 import org.springframework.core.env.MutablePropertySources;
@@ -63,7 +64,16 @@ class GatewayPropertiesApplicationYamlBindingTest {
         loaded.forEach(mutableSources::addLast);
 
         GatewayProperties properties = new GatewayProperties();
-        Binder binder = new Binder(ConfigurationPropertySources.from(mutableSources));
+        // QA fix (Backend Self-Registration): gateway.backend.self-registration.enabled/max-backends
+        // added their own ${VAR:default} placeholders alongside allowed-host-pattern's pre-existing one --
+        // a bare Binder (no PlaceholdersResolver) leaves an unset placeholder as its literal, unresolved
+        // "${VAR:default}" text, which happened to silently "work" for the String-typed
+        // allowed-host-pattern field but hard-fails Binder's boolean/int conversion for the new fields.
+        // Resolving placeholders against these same property sources first (exactly what the real
+        // ConfigData/Environment machinery does at production boot) is what this test's own docstring
+        // already claims to reproduce.
+        Binder binder = new Binder(ConfigurationPropertySources.from(mutableSources),
+                new PropertySourcesPlaceholdersResolver(mutableSources));
         binder.bind("gateway.backend", Bindable.ofInstance(properties.getBackend()));
         return properties.getBackend();
     }

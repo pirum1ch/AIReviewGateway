@@ -22,5 +22,6 @@ public record BackendSnapshot(
         BackendStatus status,
         long running,
         Instant lastSeen,
-        Instant probeFailedSince) {
+        Instant probeFailedSince,
+        String announcedBy) {
 }

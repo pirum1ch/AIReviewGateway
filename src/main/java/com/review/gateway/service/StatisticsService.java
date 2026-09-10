@@ -54,11 +54,20 @@ public class StatisticsService {
                 .toList();
     }
 
+    /**
+     * Backend Self-Registration (BSQ-17): also used by {@code AdminController} to build the {@code POST
+     * /backends}/{@code DELETE /backends/{name}} response from the just-persisted entity — never from the
+     * request DTO, so {@code url} can never leak into a response body.
+     */
+    public BackendSnapshot snapshotOf(Backend backend) {
+        return toSnapshot(backend);
+    }
+
     private BackendSnapshot toSnapshot(Backend backend) {
         long running = reviewJobRepository.countRunningJobsForBackend(backend.getId());
         return new BackendSnapshot(backend.getId(), backend.getName(), backend.getModel(),
                 backend.getCapacity(), backend.getStatus(), running, backend.getLastSeen(),
-                backend.getProbeFailedSince());
+                backend.getProbeFailedSince(), backend.getAnnouncedBy());
     }
 
     @Transactional(readOnly = true)
@@ -103,7 +112,8 @@ public class StatisticsService {
                 metricsCounters.ownershipMismatchSnapshot(), metricsCounters.workerFailureReportsIgnoredCount(),
                 metricsCounters.legacyParseFallbackCount(), metricsCounters.structuredValidationFailuresSnapshot(),
                 metricsCounters.structuredConstraintSentSnapshot(), metricsCounters.structuredFallbackUsedCount(),
-                metricsCounters.structuredFieldTruncatedSnapshot());
+                metricsCounters.structuredFieldTruncatedSnapshot(), metricsCounters.backendAnnounceRejectedSnapshot(),
+                metricsCounters.backendUrlRepointedCount());
     }
 
     private double nullToZero(Double value) {
