@@ -48,6 +48,16 @@ public class RequestBodySizeLimitFilter extends OncePerRequestFilter {
     private static final PathPattern REVIEWS_PATTERN = new PathPatternParser().parse("/reviews");
     private static final PathPattern RESULT_PATTERN = new PathPatternParser().parse("/jobs/{id}/result");
     private static final PathPattern FAIL_PATTERN = new PathPatternParser().parse("/jobs/{id}/fail");
+    private static final PathPattern BACKENDS_PATTERN = new PathPatternParser().parse("/backends");
+    private static final PathPattern BACKENDS_ANNOUNCE_PATTERN = new PathPatternParser().parse("/backends/announce");
+    /**
+     * Backend Self-Registration (BSQ-11): a hardcoded 8 KiB cap for {@code POST /backends} and {@code
+     * POST /backends/announce} -- the worst-case body (64+256+128+64 chars of payload plus JSON overhead,
+     * or the somewhat larger admin upsert body) is two orders of magnitude below this, so there is nothing
+     * to tune and deliberately no {@code gateway.*} property for it. Registered unconditionally in {@code
+     * WebConfig} regardless of {@code gateway.backend.self-registration.enabled}.
+     */
+    private static final long BACKEND_WRITE_MAX_BODY_BYTES = 8 * 1024;
 
     private final GatewayProperties properties;
 
@@ -86,6 +96,9 @@ public class RequestBodySizeLimitFilter extends OncePerRequestFilter {
         }
         if (FAIL_PATTERN.matches(decodedPath)) {
             return properties.getJob().getMaxFailBodyBytes();
+        }
+        if (BACKENDS_PATTERN.matches(decodedPath) || BACKENDS_ANNOUNCE_PATTERN.matches(decodedPath)) {
+            return BACKEND_WRITE_MAX_BODY_BYTES;
         }
         return null;
     }

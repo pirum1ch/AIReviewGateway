@@ -259,6 +259,90 @@ class SecurityMatrixTest {
         assertThat(garbage.getStatusCode().value()).isEqualTo(401);
     }
 
+    // ---------------------------------------------------- Backend Self-Registration (BSQ-12) ----------
+
+    @Test
+    void postBackendsRequiresAdminExactly() {
+        Map<String, Object> body = Map.of("name", "matrix-admin-upsert", "url", "http://192.168.1.80:8080", "model", "model-x");
+
+        ResponseEntity<Map> admin = restTemplate.exchange("/backends", HttpMethod.POST, entity(ADMIN_TOKEN, body), Map.class);
+        assertThat(admin.getStatusCode().value()).isEqualTo(201);
+
+        ResponseEntity<Map> ci = restTemplate.exchange("/backends", HttpMethod.POST, entity(CI_TOKEN, body), Map.class);
+        assertThat(ci.getStatusCode().value()).isEqualTo(403);
+        assertBodyLeaksNothing(ci);
+
+        ResponseEntity<Map> worker = restTemplate.exchange("/backends", HttpMethod.POST, entity(WORKER_TOKEN, body), Map.class);
+        assertThat(worker.getStatusCode().value()).isEqualTo(403);
+
+        ResponseEntity<Map> none = restTemplate.exchange("/backends", HttpMethod.POST, entity(null, body), Map.class);
+        assertThat(none.getStatusCode().value()).isEqualTo(401);
+    }
+
+    @Test
+    void deleteBackendsByNameRequiresAdminExactly() {
+        ResponseEntity<Map> admin = restTemplate.exchange("/backends/does-not-exist", HttpMethod.DELETE, entity(ADMIN_TOKEN, null), Map.class);
+        assertThat(admin.getStatusCode().value()).as("ADMIN is authenticated for the right role; 404 proves it reached the handler").isEqualTo(404);
+
+        ResponseEntity<Map> ci = restTemplate.exchange("/backends/does-not-exist", HttpMethod.DELETE, entity(CI_TOKEN, null), Map.class);
+        assertThat(ci.getStatusCode().value()).isEqualTo(403);
+
+        ResponseEntity<Map> worker = restTemplate.exchange("/backends/does-not-exist", HttpMethod.DELETE, entity(WORKER_TOKEN, null), Map.class);
+        assertThat(worker.getStatusCode().value()).isEqualTo(403);
+
+        ResponseEntity<Map> none = restTemplate.exchange("/backends/does-not-exist", HttpMethod.DELETE, entity(null, null), Map.class);
+        assertThat(none.getStatusCode().value()).isEqualTo(401);
+    }
+
+    @Test
+    void announceIs401Or403ForEveryRoleWhenSelfRegistrationIsDisabled() {
+        // Default flag state (off): BackendAnnounceController does not exist in the context at all
+        // (@ConditionalOnProperty) AND SecurityConfig omits the matcher for this path -- both
+        // independently fail closed to the surviving anyRequest().denyAll() fallthrough, so no role
+        // (including WORKER, which would be allowed if the flag were on) ever reaches a handler here.
+        Map<String, Object> body = Map.of("backendId", "matrix-disabled", "workerId", "worker-matrix",
+                "url", "http://192.168.1.80:8080", "model", "model-x");
+
+        ResponseEntity<Map> worker = restTemplate.exchange("/backends/announce", HttpMethod.POST, entity(WORKER_TOKEN, body), Map.class);
+        assertThat(worker.getStatusCode().value()).as("403 = feature disabled (see cross-repo Worker contract)").isEqualTo(403);
+        assertBodyLeaksNothing(worker);
+
+        ResponseEntity<Map> ci = restTemplate.exchange("/backends/announce", HttpMethod.POST, entity(CI_TOKEN, body), Map.class);
+        assertThat(ci.getStatusCode().value()).isEqualTo(403);
+
+        ResponseEntity<Map> admin = restTemplate.exchange("/backends/announce", HttpMethod.POST, entity(ADMIN_TOKEN, body), Map.class);
+        assertThat(admin.getStatusCode().value()).isEqualTo(403);
+
+        ResponseEntity<Map> none = restTemplate.exchange("/backends/announce", HttpMethod.POST, entity(null, body), Map.class);
+        assertThat(none.getStatusCode().value()).isEqualTo(401);
+    }
+
+    /**
+     * BSQ-11: through the REAL running application (WebConfig's filter registration + the filter's own
+     * pattern), not a direct unit test of {@code RequestBodySizeLimitFilter} -- the threat model's own
+     * BST-09 finding is that a filter-class-only test can pass while the container never invokes the
+     * filter at all for an unregistered URL pattern; this is the test that would have caught it.
+     */
+    @Test
+    void postBackendsRejectsAnOversizedBodyThroughTheRunningApplication() {
+        String oversizedJson = "{\"name\":\"matrix-oversized\",\"url\":\"http://192.168.1.80:8080\",\"model\":\""
+                + "a".repeat(9 * 1024) + "\"}";
+        byte[] bodyBytes = oversizedJson.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        HttpHeaders headers = new HttpHeaders();
+        headers.set("Authorization", "Bearer " + ADMIN_TOKEN);
+        headers.setContentType(org.springframework.http.MediaType.APPLICATION_JSON);
+        // Set explicitly rather than relying on the HTTP client to compute it -- TestRestTemplate's
+        // default request factory can switch to chunked transfer (no declared Content-Length) for large
+        // bodies, which would silently bypass this Content-Length-only filter regardless of server-side
+        // behavior; setting it here pins the test to the filter's actual, documented contract.
+        headers.setContentLength(bodyBytes.length);
+
+        ResponseEntity<Map> response = restTemplate.exchange("/backends", HttpMethod.POST,
+                new HttpEntity<>(oversizedJson, headers), Map.class);
+
+        assertThat(response.getStatusCode().value()).isEqualTo(413);
+    }
+
     @Test
     void metricsRequiresAdminExactly() {
         ResponseEntity<Map> admin = restTemplate.exchange("/metrics", HttpMethod.GET, entity(ADMIN_TOKEN, null), Map.class);

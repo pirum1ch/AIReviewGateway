@@ -42,18 +42,34 @@ public class SecurityConfig {
 
     @Bean
     public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+        // Backend Self-Registration (BSQ-12): read from the ONE place (GatewayProperties) that also
+        // drives BackendAnnounceController's @ConditionalOnProperty -- both independently fail closed if
+        // they ever disagree (matcher-without-controller -> 404; controller-without-matcher -> denyAll
+        // 403), so this is belt-and-braces, not the only thing keeping this endpoint safe.
+        boolean selfRegistrationEnabled = properties.getBackend().getSelfRegistration().isEnabled();
+
         http
                 .csrf(AbstractHttpConfigurer::disable)
                 .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
-                .authorizeHttpRequests(auth -> auth
-                        .requestMatchers("/health").permitAll()
-                        .requestMatchers(EndpointRequest.to("health")).permitAll()
-                        .requestMatchers(HttpMethod.DELETE, "/reviews/**").hasRole("ADMIN")
-                        .requestMatchers(HttpMethod.GET, "/backends", "/backends/**").hasRole("ADMIN")
-                        .requestMatchers(HttpMethod.GET, "/metrics", "/metrics/**").hasRole("ADMIN")
-                        .requestMatchers("/reviews/**").hasRole("CI")
-                        .requestMatchers("/jobs/**").hasRole("WORKER")
-                        .anyRequest().denyAll())
+                .authorizeHttpRequests(auth -> {
+                    auth.requestMatchers("/health").permitAll()
+                            .requestMatchers(EndpointRequest.to("health")).permitAll();
+                    // BSR-09: announce's exact-path matcher, added ONLY when the flag is on, and ordered
+                    // before the POST /backends (exact) rule below -- inert as reasoned (an exact-path
+                    // "/backends" matcher can never match "/backends/announce" regardless of order), kept
+                    // for defense-in-depth against a future widening of that rule to "/backends/**".
+                    if (selfRegistrationEnabled) {
+                        auth.requestMatchers(HttpMethod.POST, "/backends/announce").hasRole("WORKER");
+                    }
+                    auth.requestMatchers(HttpMethod.POST, "/backends").hasRole("ADMIN")
+                            .requestMatchers(HttpMethod.DELETE, "/backends/*").hasRole("ADMIN")
+                            .requestMatchers(HttpMethod.DELETE, "/reviews/**").hasRole("ADMIN")
+                            .requestMatchers(HttpMethod.GET, "/backends", "/backends/**").hasRole("ADMIN")
+                            .requestMatchers(HttpMethod.GET, "/metrics", "/metrics/**").hasRole("ADMIN")
+                            .requestMatchers("/reviews/**").hasRole("CI")
+                            .requestMatchers("/jobs/**").hasRole("WORKER")
+                            .anyRequest().denyAll();
+                })
                 .exceptionHandling(handling -> handling
                         .authenticationEntryPoint(this::handleUnauthenticated)
                         .accessDeniedHandler(this::handleForbidden))

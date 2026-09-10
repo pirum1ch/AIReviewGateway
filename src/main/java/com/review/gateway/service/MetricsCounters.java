@@ -36,6 +36,15 @@ public class MetricsCounters {
     // ("comment"/"suggestion") -- never a file path, project id, or any model-supplied string.
     private final Map<String, AtomicLong> structuredFieldTruncated = new ConcurrentHashMap<>();
 
+    // Backend Self-Registration (BSQ-15): keyed only on a closed Gateway-side reason vocabulary
+    // (NAME_TAKEN/URL_REJECTED/VALIDATION/REGISTRY_FULL) -- never a backend name, workerId, or URL --
+    // same discipline as structuredValidationFailures above. This is the detection signal for a
+    // name-takeover or SSRF-probing campaign; the DB itself carries no durable trace (backends.updated_at
+    // is overwritten by the very next successful health probe).
+    private final Map<String, AtomicLong> backendAnnounceRejected = new ConcurrentHashMap<>();
+    /** BSQ-15: every accepted ownership claim or URL change via self-announce (BSQ-02's WARN condition). */
+    private final AtomicLong backendUrlRepointed = new AtomicLong();
+
     /** @param endpoint a short, fixed label — e.g. {@code "heartbeat"}, {@code "result"}, {@code "fail"}. */
     public void incrementOwnershipMismatch(String endpoint) {
         ownershipMismatches.computeIfAbsent(endpoint, key -> new AtomicLong()).incrementAndGet();
@@ -81,6 +90,15 @@ public class MetricsCounters {
         structuredFieldTruncated.computeIfAbsent(field, key -> new AtomicLong()).incrementAndGet();
     }
 
+    /** @param reason one of {@code NAME_TAKEN}/{@code URL_REJECTED}/{@code VALIDATION}/{@code REGISTRY_FULL}. */
+    public void incrementBackendAnnounceRejected(String reason) {
+        backendAnnounceRejected.computeIfAbsent(reason, key -> new AtomicLong()).incrementAndGet();
+    }
+
+    public void incrementBackendUrlRepointed() {
+        backendUrlRepointed.incrementAndGet();
+    }
+
     public Map<String, Long> ownershipMismatchSnapshot() {
         Map<String, Long> snapshot = new LinkedHashMap<>();
         ownershipMismatches.forEach((endpoint, count) -> snapshot.put(endpoint, count.get()));
@@ -109,6 +127,14 @@ public class MetricsCounters {
 
     public Map<String, Long> structuredFieldTruncatedSnapshot() {
         return snapshotOf(structuredFieldTruncated);
+    }
+
+    public Map<String, Long> backendAnnounceRejectedSnapshot() {
+        return snapshotOf(backendAnnounceRejected);
+    }
+
+    public long backendUrlRepointedCount() {
+        return backendUrlRepointed.get();
     }
 
     private Map<String, Long> snapshotOf(Map<String, AtomicLong> counters) {

@@ -27,5 +27,7 @@ public record MetricsSnapshot(
         Map<String, Long> structuredValidationFailures,
         Map<String, Long> structuredConstraintSent,
         long structuredFallbackUsed,
-        Map<String, Long> structuredFieldTruncated) {
+        Map<String, Long> structuredFieldTruncated,
+        Map<String, Long> backendAnnounceRejected,
+        long backendUrlRepointed) {
 }
