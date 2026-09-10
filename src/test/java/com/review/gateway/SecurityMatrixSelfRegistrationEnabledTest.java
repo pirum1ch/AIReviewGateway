@@ -1,5 +1,6 @@
 package com.review.gateway;
 
+import com.review.gateway.model.Backend;
 import com.review.gateway.repository.BackendRepository;
 import io.zonky.test.db.AutoConfigureEmbeddedDatabase;
 import org.junit.jupiter.api.AfterEach;
@@ -126,6 +127,68 @@ class SecurityMatrixSelfRegistrationEnabledTest {
                 new HttpEntity<>(oversizedJson, headers), Map.class);
 
         assertThat(response.getStatusCode().value()).isEqualTo(413);
+    }
+
+    // -------------------------------------------------------- QA: full register/steal/override lifecycle ---
+
+    /**
+     * QA round (task item 3): the register -&gt; steal attempt -&gt; owner re-announce -&gt; admin override
+     * sequence, exercised through the real HTTP surface end to end (the developer's own tests exercise the
+     * same decision table at the service layer, {@code BackendRegistryServiceTest} -- this is the same
+     * invariants proven through {@code SecurityConfig}/the controllers/JSON (de)serialization as well).
+     */
+    @Test
+    void registerStealAttemptReannounceThenAdminOverrideLifecycle() {
+        String name = "mac-mini-lifecycle";
+
+        // 1. A fresh announce registers the backend, owned by worker-original.
+        ResponseEntity<Map> registered = restTemplate.exchange("/backends/announce", HttpMethod.POST,
+                entity(WORKER_TOKEN, Map.of("backendId", name, "workerId", "worker-original",
+                        "url", "http://192.168.1.90:8080", "model", "model-x")), Map.class);
+        assertThat(registered.getStatusCode().value()).isEqualTo(200);
+        assertThat(registered.getBody()).containsEntry("created", true);
+        assertThat(registered.getBody()).doesNotContainKey("url"); // BSQ-17
+
+        // 2. A different workerId tries to steal the name -- 409, zero mutation.
+        ResponseEntity<Map> stealAttempt = restTemplate.exchange("/backends/announce", HttpMethod.POST,
+                entity(WORKER_TOKEN, Map.of("backendId", name, "workerId", "worker-attacker",
+                        "url", "http://192.168.1.91:9090", "model", "model-evil")), Map.class);
+        assertThat(stealAttempt.getStatusCode().value()).isEqualTo(409);
+        Backend afterSteal = backendRepository.findByName(name).orElseThrow();
+        assertThat(afterSteal.getUrl()).isEqualTo("http://192.168.1.90:8080");
+        assertThat(afterSteal.getModel()).isEqualTo("model-x");
+        assertThat(afterSteal.getAnnouncedBy()).isEqualTo("worker-original");
+
+        // 3. The original owner re-announces with a new address -- accepted, url updates.
+        ResponseEntity<Map> reannounce = restTemplate.exchange("/backends/announce", HttpMethod.POST,
+                entity(WORKER_TOKEN, Map.of("backendId", name, "workerId", "worker-original",
+                        "url", "http://192.168.1.92:8080", "model", "model-x")), Map.class);
+        assertThat(reannounce.getStatusCode().value()).isEqualTo(200);
+        assertThat(reannounce.getBody()).containsEntry("created", false);
+        Backend afterReannounce = backendRepository.findByName(name).orElseThrow();
+        assertThat(afterReannounce.getUrl()).isEqualTo("http://192.168.1.92:8080");
+        assertThat(afterReannounce.getAnnouncedBy()).isEqualTo("worker-original");
+
+        // 4. An admin call overrides the row (host replacement) and releases self-registration ownership.
+        ResponseEntity<Map> adminOverride = restTemplate.exchange("/backends", HttpMethod.POST,
+                entity(ADMIN_TOKEN, Map.of("name", name, "url", "http://192.168.1.93:8080", "model", "model-x")),
+                Map.class);
+        assertThat(adminOverride.getStatusCode().value()).isEqualTo(200); // update, not insert
+        assertThat(adminOverride.getBody()).doesNotContainKey("url"); // BSQ-17
+        assertThat(adminOverride.getBody()).containsKey("announcedBy");
+        assertThat(adminOverride.getBody().get("announcedBy")).isNull();
+        Backend afterAdmin = backendRepository.findByName(name).orElseThrow();
+        assertThat(afterAdmin.getUrl()).isEqualTo("http://192.168.1.93:8080");
+        assertThat(afterAdmin.getAnnouncedBy()).isNull();
+
+        // 5. The name is unowned again -- even the former "attacker" workerId may now claim it (first
+        // claim, same url as the admin just set -- BSQ-01 permits this).
+        ResponseEntity<Map> claimAfterRelease = restTemplate.exchange("/backends/announce", HttpMethod.POST,
+                entity(WORKER_TOKEN, Map.of("backendId", name, "workerId", "worker-attacker",
+                        "url", "http://192.168.1.93:8080", "model", "model-x")), Map.class);
+        assertThat(claimAfterRelease.getStatusCode().value()).isEqualTo(200);
+        Backend afterClaim = backendRepository.findByName(name).orElseThrow();
+        assertThat(afterClaim.getAnnouncedBy()).isEqualTo("worker-attacker");
     }
 
     // ---------------------------------------------------------- BSQ-12: trailing-slash / percent-encoded ---
