@@ -775,3 +775,223 @@ shows up when you read the two repositories as one system.
 
 **PASS-WITH-FINDINGS — send to `backend-developer` for a fix round; re-verify F-BSR-01..F-BSR-05 before
 merging to `master`.**
+
+---
+
+# Final verification (CLAUDE.md SDLC step 7 — merge gate)
+
+Round: **step 7**, following the `backend-developer` fix round that closed F-BSR-01..F-BSR-06.
+Scope re-read end to end, in both repositories:
+
+- **Gateway** — `C:\Develop\AIReviewGateway`, `feature/backend-self-registration`, HEAD **`ebc1f6a`**,
+  working tree clean. Fix round = `1eedc85..ebc1f6a` (5 commits, 11 files, **+395 / −71**).
+- **Worker** — `C:\Develop\AIReviewWorker`, `feature/backend-self-registration`, HEAD **`ec47534`**,
+  working tree clean. Fix round = `c232de8..ec47534` (1 commit, 5 files, **+112 / −20**).
+
+Method: every finding re-derived against the shipped code, not against its commit message. Where the
+original finding asked for a specific proof (an ordering, a status-code bucket, a byte-empty diff), that
+exact proof was reconstructed. Plus a deliberate hunt for the failure mode six independent fixes landing
+together invites: one fix's edge case interacting badly with another's.
+
+## Verdict: **MERGE.**
+
+0 Critical, 0 High, 0 Medium open. All five blocking findings and the one strongly-recommended finding
+are genuinely closed. Both suites green with independently reproduced counts. **BSQ-01..BSQ-20 — all 20
+blocking MUSTs now hold**, including BSQ-16, the one that failed the SAST round outright.
+
+One new Low finding was raised and fixed inside this round (**F-BSR-17**, Worker `README.md` staleness,
+committed as `5cee02f` on `AIReviewWorker`). Four Low/Info findings from the SAST round remain open by
+design and are listed in §F.4 as post-merge follow-ups; none is merge-blocking.
+
+## §F.1 — The six findings, re-derived
+
+| ID | Fix commit | Verdict | Proof reconstructed this round |
+|---|---|---|---|
+| **F-BSR-01** | `b84bcaa` | ✅ **CLOSED** | `git show master:…/GlobalExceptionHandler.java` grepped for `IllegalArgument` → **empty**: `master` never had such a handler, so the branch's net delta is now four handlers, each scoped to a feature-local exception type, and the application-wide exception surface is **byte-unchanged from `master`**. `grep -rn "IllegalArgumentException.class" src/main/java` → **zero hits repo-wide**. The `Exception` backstop (`:295-300`, `log.error` + fixed `INTERNAL_ERROR` body) is intact. Checked the two throw sites are the *only* consumers: `BackendValidationException` is a plain `RuntimeException`, thrown inside `defaultTransactionTemplate.execute` (which rethrows the original, does not wrap), and no `catch` in `BackendRegistryService`/`AdminController`/`BackendAnnounceController` intercepts it. **Also verified the blast radius the finding worried about, in the other direction:** the two remaining `IllegalArgumentException` throws in the codebase (`ReviewSchemaBuilder.java:70`, `:76`) are internal builder invariants reachable from the Worker-facing claim path — under the deleted handler they would have returned `400` echoing an internal message; they now correctly reach the logged `500`. That is a restoration of `master` behaviour, not a regression. **BSQ-15 not disturbed:** the `VALIDATION` counter is wired to `BackendAnnounceController`'s own `MethodArgumentNotValidException` handler (`:53-60`), which this fix never touched. |
+| **F-BSR-02** | `3475dc5` | ✅ **CLOSED** | `git diff master -- docker-compose.yml` → **empty**. Not "only feature-related deltas" — genuinely, byte-for-byte empty. QA's `5148eed` env forwarding did not touch this file. |
+| **F-BSR-03** | `ebc1f6a` | ✅ **CLOSED**, and it is the item that flips BSQ-16 | Each required sentence located, not counted: BSQ-16's three (`DEPLOYMENT.md` §8d — log-only audit, the `review_events.review_id` `NOT NULL` FK reason, `backends.updated_at` overwritten within `backend-health-interval`, "log retention *is* audit retention"; mirrored at `README.md:286-292`). BSQ-05's "passing proves only non-universality, never narrowness" (`DEPLOYMENT.md:1175-1182`). BSQ-INH-4's `http://` deviation, explicitly labelled a documented deviation rather than an oversight (`DEPLOYMENT.md:1188-1194`, `README.md:273-279`). BSQ-INH-5's "parking does not lock a `url`" (both files, plus `README.md:1269`'s status table). BSQ-22's verify-against-the-deployed-role note on the `GRANT` block (`DEPLOYMENT.md:367-376`). New config surface (`BACKEND_SELF_REGISTRATION_ENABLED`, `BACKEND_MAX_BACKENDS`, `BACKEND_URL`, the changed status of `BACKEND_ALLOWED_HOST_PATTERN`) in the bilingual reference (`:1150-1152`, `:1232`). All three new error codes in `README.md`'s §6.8 table with correct statuses (`409`/`422`/**`503`**). Every stale line the finding named is gone: grepping `README.md`/`DEPLOYMENT.md` for "no REST endpoint", "STUB — not implemented" and "direct SQL only" returns only `DEPLOYMENT.md:685`, which is about the *GitLab webhook* receiver and unrelated. |
+| **F-BSR-04** | `841a453` | ✅ **CLOSED** | `GlobalExceptionHandler.java:90-94` → `HttpStatus.SERVICE_UNAVAILABLE`. Cross-repo trace: `503` misses `announce`'s `403/404` arm, misses the `429` arm, misses `statusCode >= 400 && < 500`, falls to `mapServerError` → `GatewayUnavailableException` → `WorkerRunner.announceWithRetry:104-110` capped-backoff loop. The fix round's claim that **no Worker code change was needed for this half specifically is correct** — and is now pinned by a Worker test (`announceThrowsGatewayUnavailableOn503RegistryFull`) rather than left as an assertion. Checked for a status-code collision: the Gateway has exactly two `503` producers, this one and `PromptResolutionSaturatedException` (`:165-168`), which is on the CI-facing review-creation path and unreachable from `/backends/announce`. Admin path is cap-exempt, so no operator ever sees this `503`. |
+| **F-BSR-05** | `ec47534` (Worker) | ✅ **CLOSED** | Full enumeration in §F.2 below. |
+| **F-BSR-06** | `65d411d` | ✅ **CLOSED**, minimally | Ordering verified in the current file: allowlist `pattern.matcher(...).matches()` at `BackendUrlValidator.java:116`, `isBlockedHost(host)` at `:120`. **Filtering the diff to non-comment lines leaves exactly one hunk — the `isBlockedHost` block moved, nothing else** — so this is provably a pure reorder with no smuggled behaviour change. DNS genuinely does not run for a non-allowlisted host: the `:117` throw precedes the *only* call site of `isBlockedHost`, and the developer's `nonAllowlistedHostnameIsRejectedByTheAllowlistWithoutEverAttemptingDnsResolution` proves it *deterministically* rather than by timing — a host that is both unresolvable **and** non-allowlisted must produce the allowlist's message; under the pre-fix ordering `isBlockedHost` fails closed on `UnknownHostException` and the allowlist message would be unreachable. That is a genuine ordering proof, not a proxy for one. Useful side effect: an ADMIN registering a typo'd hostname outside the allowlist now gets the correct message instead of F-BSR-08's misleading "blocked range" one. |
+
+## §F.2 — F-BSR-05: every status code the Worker can plausibly see
+
+The task asked for this enumeration explicitly, because inverting a default is exactly where a fix
+breaks something it was not aiming at. Traced through `GatewayClient.announce:172-205` →
+`WorkerRunner.handleOutcome:117-161`.
+
+| Status | Lands in | Behaviour | Intended? |
+|---|---|---|---|
+| `2xx` | `AnnounceOutcome.accepted` | INFO, loop starts; extra WARN if effective status is not `ACTIVE` | ✅ |
+| `400` | `>= 400 && < 500` | **FATAL**, cause names `BACKEND_ID`/`WORKER_ID`/model | ✅ subsumes QA's `c232de8` |
+| **`401`** | `>= 400 && < 500` | **FATAL**, cause names `GATEWAY_API_KEY` | ✅ **the finding's whole point** — was retry-forever |
+| `403` | explicit arm | NON-FATAL, WARN, loop starts (legacy mode) | ✅ BSQ-18/BST-14a preserved |
+| `404` | explicit arm | NON-FATAL, WARN, loop starts | ✅ BSQ-18 preserved |
+| `409` | `>= 400 && < 500` | **FATAL**, cause names a copy-pasted `BACKEND_ID` | ✅ BSQ-18 unchanged |
+| `413` | `>= 400 && < 500` | **FATAL**, generic cause | ✅ *behaviour changed* — BSQ-11's 8 KiB cap was previously retry-forever; an oversized announce is non-self-healing, so fatal is an improvement |
+| `422` | `>= 400 && < 500` | **FATAL**, cause names the host allowlist / bare origin | ✅ BSQ-18 unchanged; note `422` moved from the `switch`'s `default ->` to an explicit `case`, and the new `default ->` is a generic-but-honest string |
+| `429` | explicit arm | `mapServerError` → **RETRIED** with capped backoff | ✅ the one genuinely transient `4xx`; defensive only — the Gateway never emits `429` (SR-20 unimplemented), so this can only come from a reverse proxy |
+| other `4xx` (e.g. `405`, `415`, `431`) | `>= 400 && < 500` | **FATAL**, generic cause carrying the status | ✅ the new default; pinned by `announceReturnsRejectedFatalOnAnUnenumeratedFourHundredStatus` |
+| `500` | falls through | **RETRIED** | ✅ — and now genuinely reachable, since F-BSR-01 returned internal faults to `500` |
+| `502`/`504` | falls through | **RETRIED** | ✅ the ordinary reverse-proxy / Gateway-restarting case |
+| `503` | falls through | **RETRIED** | ✅ F-BSR-04's landing zone |
+| connection failure | `ResourceAccessException` | **RETRIED** | ✅ unchanged |
+
+**No status regressed from a correct bucket into a wrong one.** Two changed bucket and both changed for
+the better (`401`, `413`). The retried set gained `429` and lost nothing.
+
+One residual, Info only: **`408 Request Timeout`** (and, pedantically, `425 Too Early`) are the only
+`4xx` codes with a colourable claim to being transient, and they are now fatal. Judged not worth an
+exemption — the announce body is ~200 bytes in a single segment, nginx answers a slow client with `499`
+rather than `408`, and a fail-fast startup error naming the status is a far better operator experience
+than an indefinite silent hang. Recorded so a future reader sees it was considered, not missed.
+
+## §F.3 — Test suites, and the reported non-determinism
+
+**Authoritative numbers, both from a clean build:**
+
+| Module | Command | Result |
+|---|---|---|
+| Gateway | `mvn -q clean test -Djunit.jupiter.execution.parallel.enabled=false -DforkCount=1` | **86 classes, 937 tests, 0 failures, 0 errors, 0 skipped** — exit 0 |
+| Worker | `mvn -q clean verify` | **18 classes, 208 tests, 0 failures, 0 errors, 0 skipped** — exit 0 |
+
+Tallied from the raw surefire XML (`tests`/`failures`/`errors`/`skipped` attributes), never from console
+output. Worker `203 → 208` is exactly the fix round's 5 new methods; Gateway `933 → 937` is exactly its 4.
+
+**The reported non-determinism did not reproduce, and the mechanism is now identified.**
+
+- Four runs at `ebc1f6a` (three plain `mvn -q test` from a wiped `target/surefire-reports/`, then the
+  clean run above): **86/937/0/0/0 every time**, and the per-class `name tests failures errors skipped`
+  lists are **byte-identical across all four** (`diff` clean, not merely equal totals).
+- **86 is provably the complete set, not an under-discovery.** `src/test/java` holds 89 `.java` files;
+  87 match Surefire's default includes (the other two are the helpers `ReviewTestSupport` /
+  `SecurityTestTokens`); exactly one of those 87 is `abstract` (`AbstractPostgresIntegrationTest`).
+  87 − 1 = **86**. There is no eleventh-hour pool of classes to lose. The `pom.xml` configures **no**
+  `maven-surefire-plugin` section at all and there is no `junit-platform.properties`, so the run is
+  already single-fork, `reuseForks=true`, non-parallel — the "forced deterministic run" the task asked
+  for *is* the default, which is why the explicit flags above changed nothing.
+- **Most likely explanation for the earlier 1019/97 figures: stale `target/test-classes` from a sibling
+  branch.** `maven-compiler-plugin`'s incremental compilation never deletes orphaned `.class` files, and
+  Surefire scans `target/test-classes`, not `src`. This working tree's default branch is
+  `feature/gitlab-webhook-diff-trigger`, which carries **95** test source files — 10 of them
+  (`WebhookControllerTest`, `WebhookReviewTriggerServiceTest`, `WebhookReviewTriggerServiceIntegrationTest`,
+  `WebhookSecurityWiringIntegrationTest`, `DiffAssemblerTest`, `DiffIntegrityVerifierTest`,
+  `DiagnosticCommentRendererTest`, `GitLabWebhookSecretFilterTest`, `GatewayPropertiesWebhookValidationTest`,
+  `ReviewerSweepServiceTest`) exist on no other branch. The union of that branch and this one is **96
+  Surefire-eligible names → 95 concrete classes**, within rounding of the 97 reported, and ~10 extra
+  classes is precisely the "~11-class, ~85-test gap" observed. A `mvn test` without `clean` after a
+  branch switch runs the other branch's leftover compiled classes — which also explains why every such
+  run still showed 0 failures (the sibling branch is green too) and why no `--diff-filter=D` search finds
+  a deleted file. `target/test-classes` currently holds 89 non-nested classes against 89 sources, zero
+  orphans, which is why the effect is not reproducing now.
+- **Could this have masked a real failure from this feature? No — and that was checked directly, not
+  argued.** Each of the 9 test methods the fix round added was grepped by name out of the authoritative
+  runs' surefire XML: all 9 present, all in a report with `failures=0 errors=0`. Additionally, the
+  mechanism cannot silently skip: a class that fails to initialise (Spring context failure,
+  embedded-Postgres port clash) produces an `<error>` in its XML and a non-zero build, not an absent
+  report — so "0 failures" is never spurious in the way the concern imagined. The direction of the
+  anomaly is *extra* classes, not missing ones.
+- **Not this feature's problem, and not blocking.** Nothing here is introduced by, or specific to,
+  backend self-registration. Post-merge follow-up in §F.4.
+
+## §F.4 — Open items after this round (none blocking)
+
+Carried forward from the SAST round, unchanged and still correctly non-blocking:
+
+| ID | Severity | Status |
+|---|---|---|
+| **F-BSR-07** | Low | **OPEN** — the BSQ-02 repoint WARN still logs a DB-sourced legacy `previousUrl` through `TextSanitizer.sanitizeSingleLine` only, which strips control characters but not userinfo. Only reachable for a pre-`V6` raw-SQL row carrying credentials. Fix is the `bestEffortOrigin(String)` helper in the original finding. |
+| **F-BSR-08** | Low | **OPEN**, and slightly narrower after F-BSR-06 — an unresolvable host is still reported as "in a blocked range", but is now only reachable once the host has already matched the allowlist, and an ADMIN's most likely mistake (a typo'd host outside the allowlist) now gets the correct message. |
+| **F-BSR-09** | Low | **OPEN** — no upgrade note for legacy non-bare-origin `backends.url` rows. Docs-only; the probe-time rejection is intended behaviour. |
+| **F-BSR-10** | Low | **OPEN** — `WorkerProperties.validateBackendUrl` still lacks the null-host guard. Blast radius shrank: the Gateway's `422` still fails the Worker's startup, and after F-BSR-05 the `422` cause string is now an explicit `case` rather than the `default ->` arm, so the message is at least the right one. |
+| **F-BSR-11 … F-BSR-14, F-BSR-16** | Info | **OPEN** as recorded. |
+| **F-BSR-15** | Info (process) | ✅ **CLOSED in this round** — `docs/backend-self-registration-architecture.md` was still `!!` (ignored, untracked) after the fix round; force-added with this report. |
+| **F-BSR-17** | Low | ✅ **CLOSED in this round** — see §F.5. |
+
+**Recommended post-merge follow-ups, in priority order:**
+
+1. **BSQ-INH-1 / T-03 — one token per backend with a token-bound `backendId`.** Still the single
+   highest-value security change available to this feature, and still explicitly out of scope. It is the
+   only thing that would turn `announced_by` into a real authorisation boundary.
+2. **SR-20 — per-token rate limiting.** Now justified by three endpoints rather than two; it is the
+   compensating control both BSQ-INH-2 and F-BSR-04's DoS analysis lean on.
+3. **A small docs/logging pass** picking up F-BSR-07 through F-BSR-10 together — roughly an hour, no
+   design work.
+4. **`mvn clean` hygiene, or a Surefire guard, for this repo's test suite** (see §F.3). Two options, both
+   cheap: document "always `mvn clean test` when reporting counts across branches", or pin an explicit
+   `maven-surefire-plugin` block so the run configuration is stated rather than inherited. **Explicitly
+   NOT blocking this feature** — it is pre-existing, reproduces on branches this feature never touched,
+   and its direction is extra classes rather than missing ones.
+
+## §F.5 — The one new finding this round raised
+
+### F-BSR-17 — **Low**. The Worker's `README.md` announce contract went stale the moment F-BSR-05 landed
+
+*CWE-1059 (insufficient documentation of a security-relevant control) — A09:2021. Introduced by the fix
+round itself (`ec47534`); found by this round; fixed in `5cee02f`.*
+
+`AIReviewWorker/README.md` §2.0 still enumerated the pre-fix rule — *"`409`/`422` — fatal, startup
+fails"* — with no `400`, no `401`, no statement of the new fail-fast-by-default rule, and no `429`/`503`
+split. Two operator-facing consequences, both wrong in the direction that costs debugging time: a reader
+concluded that a wrong `GATEWAY_API_KEY` produces an indefinite retry (it now fails startup immediately,
+by design — the entire point of F-BSR-05), and that a full Gateway registry is fatal (it is now `503`,
+retried until the cap is raised — the entire point of F-BSR-04). The Gateway's own `README.md` /
+`DEPLOYMENT.md` are correct, because `ebc1f6a` was written after `841a453`; only the Worker half lagged.
+
+Fixed by rewriting the two bullets: `429` and `503 BACKEND_REGISTRY_FULL` folded into the retried bucket
+with their rationale, and the `409`/`422` bullet replaced with the general rule plus the per-status
+likely-cause table `WorkerRunner` actually emits. Documentation only — no code, no behaviour change, and
+the Worker suite was re-run green afterwards.
+
+## §F.6 — Release-gate checklist, re-verified after the fix round
+
+The fix round touched `BackendUrlValidator`, `GlobalExceptionHandler`, `BackendRegistryService`,
+`GatewayClient` and `WorkerRunner` — files central to several BSQ requirements — so compliance was
+re-derived rather than inherited. The scoping that makes this tractable is itself evidence:
+`git diff --stat 1eedc85..ebc1f6a` and `c232de8..ec47534` show that **`SecurityConfig`, `WebConfig`,
+`RequestBodySizeLimitFilter`, `GatewayProperties`, `BackendProberImpl`, `MetricsCounters`,
+`AdminController`, `BackendAnnounceController`, `BackendHealthChecker`,
+`V6__backend_self_registration.sql` and `WorkerProperties` were not touched at all** — so BSQ-05, 06, 07,
+09, 11, 12, 15, 17, 19, 20 and 22 verify unchanged from the SAST round, by file identity rather than by
+re-reading.
+
+| BSQ | Post-fix-round verdict |
+|---|---|
+| **BSQ-01** | ✅ **PASS**, untouched. `BackendRegistryService.java` changed by 7 lines this round, all in `upsertByAdminTx`'s two throws and one javadoc `@throws` line — the announce path's `firstClaim && urlChanging ⇒ nameTaken()` logic is byte-identical. |
+| **BSQ-02** | ✅ **PASS**, untouched (same argument). F-BSR-07's `oldOrigin` caveat still applies, still Low. |
+| **BSQ-03** | ✅ **PASS with a recorded, deliberate deviation.** The cap, its placement in the INSERT branch, the same transaction, the fixed message, the WARN and the counter are all unchanged and verified. The status code is now `503`, not the `409`/`422` this requirement enumerated — knowingly, because both enumerated options are defective in combination with BSQ-18 (F-BSR-04). **Threat model §4 amended in this round** so the deviation is a decision on the record, not a silent mismatch. |
+| **BSQ-04** | ✅ **PASS.** Both write paths still persist `validate()`'s return value; the reorder moved no rejection rule and removed none. All bare-origin rejections (userinfo/path/query/fragment) still run *before* both the allowlist and DNS, so their behaviour is unchanged in every respect. |
+| **BSQ-05, BSQ-06, BSQ-07** | ✅ **PASS**, `GatewayProperties`/`BackendProberImpl` untouched. BSQ-06's "host cap applied before the regex" survives the reorder — the 255-char check is at `:90-92`, still above the match at `:116`. |
+| **BSQ-08, BSQ-09, BSQ-10** | ✅ **PASS**, untouched. The `REQUIRES_NEW` `TransactionTemplate` structure and the `DataIntegrityViolationException` catch are unmodified; `BackendValidationException` is thrown *inside* the callback and propagates out unwrapped, so BSQ-08's single-retry shape is unaffected. |
+| **BSQ-11, BSQ-12** | ✅ **PASS**, `WebConfig`/`RequestBodySizeLimitFilter`/`SecurityConfig` untouched. Note BSQ-11's `413` is now fatal to a Worker rather than retried (§F.2) — an improvement, and the cap itself is unchanged. |
+| **BSQ-13** | ✅ **PASS**, and **stronger than at SAST time**. All six `BackendUrlValidator` messages remain compile-time constants with no interpolation (re-read line by line after the reorder). The WORKER `422` collapse is unchanged. The application-wide breach the SAST round recorded against this requirement — F-BSR-01 — is closed, so SR-17 is intact everywhere again, not only on this feature's paths. F-BSR-06 additionally removes the wall-clock side channel that was separating the collapsed bodies. |
+| **BSQ-14** | ⚠ **PASS-WITH-FINDING** (F-BSR-07, Low, open). Unchanged by the fix round. |
+| **BSQ-15** | ✅ **PASS**, untouched — and specifically checked that F-BSR-01 did not break the `VALIDATION` bucket, which lives on `BackendAnnounceController`'s own handler, not on the deleted one. The counter vocabulary is still the closed four-key set with every call site passing a literal. |
+| **BSQ-16** | ✅ **PASS** — **the failed MUST is now met.** See §F.1's F-BSR-03 row for the located text. |
+| **BSQ-17** | ✅ **PASS**, `AdminController`/the response DTOs untouched; no `url` field added anywhere. |
+| **BSQ-18** | ✅ **PASS**, and generalised. `403`/`404` WARN-and-continue exactly as required; `409`/`422` still terminal with their cause-specific messages. The requirement's *enumeration* became a *rule* (fail-fast default) — a strict superset of what it demanded, closing the `401` hole it did not anticipate. **Threat model §4 amended** to record the rule. |
+| **BSQ-19** | ✅ **PASS**, `WorkerRunner`'s shutdown/backoff machinery untouched by the fix round (the diff is confined to `handleOutcome`'s `REJECTED_FATAL` arm). The `ContextClosedEvent` flag, `sleepInSlices`, and the interrupt-flag restore are unmodified. |
+| **BSQ-20** | ⚠ **PASS-WITH-FINDING** (F-BSR-10, Low, open). `WorkerProperties` untouched. |
+
+**Blocking-MUST result: 20 of 20 pass.** (BSQ-03 with a deliberate, now-documented status-code deviation;
+BSQ-14 and BSQ-20 with open Low findings that the SAST round already classed non-blocking.)
+
+**Non-regression set:** all re-checked. The two that had regressed now hold — **SR-17** is restored
+application-wide (F-BSR-01), and **SR-15**'s knowing deviation is recorded in the operator docs where
+BSQ-INH-4 required (F-BSR-03). **SR-10 / SR-11 / SR-16 / T-17 / WOC-14/15/17/21 / WOR-10 / WSR-09 /
+WSR-12** are unchanged by the fix round by file identity. **SR-12 / T-09** keeps its one Low gap
+(F-BSR-07).
+
+**Supply chain:** `git diff master -- pom.xml` is **empty in both repositories** — re-confirmed after the
+fix round. No dependency added, removed or bumped anywhere on this branch. No SCA delta to assess.
+
+## §F.7 — Bottom line
+
+The fix round did what it claimed, and did it with unusually small diffs: F-BSR-06 is a pure statement
+reorder with a one-hunk non-comment diff, F-BSR-02 is a literal revert to `master`, and F-BSR-01 leaves
+the application's exception surface byte-identical to `master` rather than merely "narrower than before".
+The one place six-fixes-at-once did bite is exactly where that risk was expected — a cross-repo
+consistency gap, F-BSR-17 — and it was documentation, not behaviour.
+
+The feature's security core was already sound at SAST time; what this round confirms is that the edge has
+caught up with it. **MERGE.**
