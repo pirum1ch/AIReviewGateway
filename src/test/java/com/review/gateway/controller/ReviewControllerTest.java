@@ -224,6 +224,25 @@ class ReviewControllerTest {
     }
 
     @Test
+    void arbitraryIllegalArgumentExceptionFromANonBackendsEndpointStillReturnsGenericFiveHundred() throws Exception {
+        // F-BSR-01 regression: GlobalExceptionHandler used to have an application-wide
+        // @ExceptionHandler(IllegalArgumentException.class) meant only for two constant-message throws in
+        // BackendRegistryService -- it accidentally intercepted every IllegalArgumentException from every
+        // endpoint (NumberFormatException, PatternSyntaxException, Base64 decode failures are all IAE
+        // subclasses) and echoed ex.getMessage() verbatim as a 400, unlogged. That handler is gone; an
+        // arbitrary IAE from a review endpoint must still hit the generic 500 backstop, logged, with a
+        // fixed body that never echoes the exception's own message.
+        when(reviewService.getStatus(99L)).thenThrow(new IllegalArgumentException("some internal detail that must never leak"));
+
+        mockMvc.perform(get("/reviews/{id}", 99)
+                        .header("Authorization", "Bearer " + SecurityTestTokens.CI_TOKEN))
+                .andExpect(status().isInternalServerError())
+                .andExpect(jsonPath("$.error").value("INTERNAL_ERROR"))
+                .andExpect(jsonPath("$.message").value("An unexpected error occurred"))
+                .andExpect(jsonPath("$.message", org.hamcrest.Matchers.not(org.hamcrest.Matchers.containsString("internal detail"))));
+    }
+
+    @Test
     void getStatusWithNonNumericIdShouldReturn400NotInternalError() throws Exception {
         // FIXED (previously QA finding, Minor): a non-numeric path variable ("/reviews/abc") makes
         // Spring MVC throw MethodArgumentTypeMismatchException while resolving the @PathVariable Long

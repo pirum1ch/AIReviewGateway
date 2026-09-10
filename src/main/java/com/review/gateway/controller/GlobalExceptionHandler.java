@@ -4,6 +4,7 @@ import com.review.gateway.dto.ErrorResponse;
 import com.review.gateway.exception.BackendNameTakenException;
 import com.review.gateway.exception.BackendRegistryFullException;
 import com.review.gateway.exception.BackendUrlRejectedException;
+import com.review.gateway.exception.BackendValidationException;
 import com.review.gateway.exception.DiffTooLargeException;
 import com.review.gateway.exception.IncompatiblePromptVersionException;
 import com.review.gateway.exception.InvalidStateTransitionException;
@@ -86,6 +87,20 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ErrorResponse> handleBackendRegistryFull(BackendRegistryFullException ex) {
         return ResponseEntity.status(HttpStatus.UNPROCESSABLE_ENTITY)
                 .body(new ErrorResponse("BACKEND_REGISTRY_FULL", ex.getMessage()));
+    }
+
+    /**
+     * Backend Self-Registration (F-BSR-01): {@code BackendRegistryService#upsertByAdminTx} throws this for
+     * a create missing a required {@code url}/{@code model} — a condition bean validation on the DTO
+     * cannot see (it cannot know whether the target row already exists). Deliberately scoped to this
+     * specific exception type rather than the application-wide {@code IllegalArgumentException} (which a
+     * prior version of this handler caught, catching every unrelated IAE from every other endpoint —
+     * SR-17 regression, see F-BSR-01). Message is a fixed, non-reflecting string.
+     */
+    @ExceptionHandler(BackendValidationException.class)
+    public ResponseEntity<ErrorResponse> handleBackendValidation(BackendValidationException ex) {
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST)
+                .body(new ErrorResponse("VALIDATION_ERROR", ex.getMessage()));
     }
 
     @ExceptionHandler(ReviewNotFoundException.class)
@@ -246,17 +261,6 @@ public class GlobalExceptionHandler {
                 .orElse("Request validation failed");
         return ResponseEntity.status(HttpStatus.BAD_REQUEST)
                 .body(new ErrorResponse("VALIDATION_ERROR", message));
-    }
-
-    /**
-     * Backend Self-Registration: {@code BackendRegistryService#upsertByAdmin} throws this for a create
-     * missing a required {@code url}/{@code model} -- a condition bean validation on the DTO cannot see
-     * (it cannot know whether the target row already exists). Message is a fixed, non-reflecting string.
-     */
-    @ExceptionHandler(IllegalArgumentException.class)
-    public ResponseEntity<ErrorResponse> handleIllegalArgument(IllegalArgumentException ex) {
-        return ResponseEntity.status(HttpStatus.BAD_REQUEST)
-                .body(new ErrorResponse("VALIDATION_ERROR", ex.getMessage()));
     }
 
     @ExceptionHandler(HttpMessageNotReadableException.class)

@@ -11,6 +11,7 @@ import com.review.gateway.dto.UpsertBackendRequest;
 import com.review.gateway.exception.BackendNameTakenException;
 import com.review.gateway.exception.BackendRegistryFullException;
 import com.review.gateway.exception.BackendUrlRejectedException;
+import com.review.gateway.exception.BackendValidationException;
 import com.review.gateway.model.Backend;
 import com.review.gateway.model.enums.BackendStatus;
 import com.review.gateway.repository.BackendRepository;
@@ -372,12 +373,12 @@ class BackendRegistryServiceTest extends AbstractPostgresIntegrationTest {
 
         assertThatThrownBy(() -> service.upsertByAdmin(new UpsertBackendRequest(
                 "mac-mini-01", null, "model-x", null, null, null, null)))
-                .isInstanceOf(IllegalArgumentException.class)
+                .isInstanceOf(BackendValidationException.class)
                 .hasMessageContaining("url");
 
         assertThatThrownBy(() -> service.upsertByAdmin(new UpsertBackendRequest(
                 "mac-mini-01", "http://192.168.1.50:8080", null, null, null, null, null)))
-                .isInstanceOf(IllegalArgumentException.class)
+                .isInstanceOf(BackendValidationException.class)
                 .hasMessageContaining("model");
     }
 

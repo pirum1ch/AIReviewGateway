@@ -7,6 +7,7 @@ import com.review.gateway.exception.BackendNameTakenException;
 import com.review.gateway.exception.BackendRegistryFullException;
 import com.review.gateway.exception.BackendUnavailableException;
 import com.review.gateway.exception.BackendUrlRejectedException;
+import com.review.gateway.exception.BackendValidationException;
 import com.review.gateway.model.Backend;
 import com.review.gateway.model.enums.BackendStatus;
 import com.review.gateway.repository.BackendRepository;
@@ -240,7 +241,7 @@ public class BackendRegistryService {
      * @throws BackendUrlRejectedException the submitted {@code url} failed validation — the validator's
      *                                      own specific (constant, non-reflecting) message is preserved
      *                                      for this trusted principal (BSQ-13)
-     * @throws IllegalArgumentException    {@code url}/{@code model} is required (and missing) on a create
+     * @throws BackendValidationException  {@code url}/{@code model} is required (and missing) on a create
      */
     public BackendUpsertOutcome upsertByAdmin(UpsertBackendRequest request) {
         return defaultTransactionTemplate.execute(status -> upsertByAdminTx(request));
@@ -252,10 +253,10 @@ public class BackendRegistryService {
         boolean creating = existingOpt.isEmpty();
 
         if (creating && isBlank(request.url())) {
-            throw new IllegalArgumentException("url is required when registering a new backend");
+            throw new BackendValidationException("url is required when registering a new backend");
         }
         if (creating && isBlank(request.model())) {
-            throw new IllegalArgumentException("model is required when registering a new backend");
+            throw new BackendValidationException("model is required when registering a new backend");
         }
 
         String normalizedUrl = null;
