@@ -1631,23 +1631,34 @@ a loopback setup to a remote Gateway through a non-encrypting relay is forbidden
 `WORKER_ALLOW_INSECURE_GATEWAY=true`; an **encrypting** tunnel — `ssh -L`, WireGuard, an mTLS mesh
 sidecar — terminated locally is the supported alternative).
 
-**Gateway stack** — `docker-compose.yml` at this repo's root: Postgres + the Gateway + a one-shot
-backend-registration job only.
+**Gateway stack** — `docker-compose.yml` at this repo's root: Postgres + the Gateway ONLY by default.
 
 ```bash
 export DB_PASSWORD=change-me CI_TOKEN=$(openssl rand -hex 32) WORKER_TOKEN=$(openssl rand -hex 32) \
-       ADMIN_TOKEN=$(openssl rand -hex 32) GITLAB_TOKEN=$(openssl rand -hex 32) LLAMA_MODEL=qwen2.5-coder \
-       LLAMA_URL_1=http://192.168.1.101:8000 LLAMA_URL_2=http://192.168.1.102:8000
+       ADMIN_TOKEN=$(openssl rand -hex 32) GITLAB_TOKEN=$(openssl rand -hex 32)
 # (or put the same variables in a `.env` file next to docker-compose.yml instead of exporting them)
-docker compose up --build
+docker compose up -d --build
 ```
 
-No defaults are set for the required secrets (`DB_PASSWORD`, `CI_TOKEN`, `WORKER_TOKEN`, `ADMIN_TOKEN`,
-`GITLAB_TOKEN`, `LLAMA_MODEL`, `LLAMA_URL_1`, `LLAMA_URL_2`) — Compose refuses to start with a clear
-`required variable ... is missing a value` error if one is unset. This stack alone reproduces the Gateway
-half of the [§11.2](#112-local-single-host-smoke-test-this-is-the-exact-recipe-used-to-verify-both-images)
-recipe (Postgres + Gateway + backend row); it does not start any Worker, so jobs sit in `QUEUED` until
-one is deployed separately. Tear down with `docker compose down -v`.
+No defaults are set for these required secrets — Compose refuses to start with a clear
+`required variable ... is missing a value` error if one is unset. This starts with **zero registered
+backends**; pick one of three ways to register one (see the header comment in `docker-compose.yml`
+for the full explanation):
+
+- **Backend Self-Registration** (recommended): `BACKEND_SELF_REGISTRATION_ENABLED=true` +
+  a narrowed `BACKEND_ALLOWED_HOST_PATTERN` here, `BACKEND_URL` on the Worker's own compose/`.env`.
+  Nothing backend-address-related needs to be typed on the Gateway side at all.
+- **Admin API**: one `POST /backends` call per backend (`ADMIN_TOKEN` above) — see `README.md`.
+- **`backend-seed` legacy helper** (opt-in via a Compose profile, useful for a quick local smoke
+  test with two hardcoded backends): does *not* run on a plain `docker compose up` —
+
+  ```bash
+  LLAMA_MODEL=qwen2.5-coder LLAMA_URL_1=http://192.168.1.101:8000 LLAMA_URL_2=http://192.168.1.102:8000 \
+    docker compose --profile seed up -d --build
+  ```
+
+This stack does not start any Worker, so jobs sit in `QUEUED` until a backend is registered and a
+Worker is deployed separately. Tear down with `docker compose down -v`.
 
 **Worker stack** — a separate `docker-compose.yml` in the [`AIReviewWorker`](https://github.com/pirum1ch/AIReviewWorker)
 repo (`worker/docker-compose.yml` via the submodule), one Worker service per `llama-server` host, pointed

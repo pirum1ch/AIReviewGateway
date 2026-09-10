@@ -1,16 +1,11 @@
-# Local stack for review-gateway (root Dockerfile), backed by a real Postgres, plus a one-shot
-# backend-registration job. This stack is Postgres + Gateway + backend registration ONLY.
+# Local stack for review-gateway (root Dockerfile), backed by a real Postgres, plus an OPTIONAL
+# one-shot backend-registration job. This stack is Postgres + Gateway (+ optionally backend
+# registration) ONLY.
 #
 # Workers are NOT part of this file. As of the AIReviewGateway/AIReviewWorker repository split
 # (docs/worker-gateway-split-architecture.md), each Worker lives in its own process/host, deployed
 # from github.com/pirum1ch/AIReviewWorker (present in this repo as a submodule at worker/) via that
 # repo's own docker-compose.yml -- one Worker per llama-server host. See worker/README.md §6.4.
-#
-# LLAMA_URL_1/LLAMA_URL_2 below register `backends` rows (the Gateway's health-probe target) -- they
-# are DISTINCT FROM, but must point at the same llama-server as, each Worker's own LLAMA_URL on its
-# own host. LLAMA_MODEL must likewise agree with each Worker's LLAMA_MODEL. See
-# AIReviewGateway/DEPLOYMENT.md's cross-repo coupling table for the full list of values that must
-# stay in sync across the two repos/processes.
 #
 # Required secrets (no defaults on purpose -- same fail-fast behavior as the bare-jar deployment,
 # see DEPLOYMENT.md §2 "Token generation"). Export these before running, or put them in a `.env`
@@ -21,19 +16,31 @@
 #   export WORKER_TOKEN=$(openssl rand -hex 32)      # each Worker's GATEWAY_API_KEY must equal this
 #   export ADMIN_TOKEN=$(openssl rand -hex 32)
 #   export GITLAB_TOKEN=$(openssl rand -hex 32)          # a real GitLab project/group token for actual use
-#   export LLAMA_MODEL=qwen2.5-coder                     # same model on both hosts per this setup
-#   export LLAMA_URL_1=http://192.168.1.101:8000         # first llama-server host
-#   export LLAMA_URL_2=http://192.168.1.102:8000         # second llama-server host
 #
 # Then:
-#   docker compose up --build
+#   docker compose up -d --build
 #
-# What you get: Postgres (Flyway migration runs automatically inside the Gateway on first connect),
-# the Gateway on http://127.0.0.1:8080 (loopback-only, see below), and a one-shot job that registers
-# two backend rows ("llama-01" -> LLAMA_URL_1, "llama-02" -> LLAMA_URL_2). No Worker is started by
-# this file -- deploy one per llama-server host from the AIReviewWorker repo, pointed at this
-# Gateway's own reverse-proxy https:// endpoint (DEPLOYMENT.md §11.1); jobs sit in QUEUED until a
-# Worker claims them.
+# That's it -- the Gateway starts with ZERO registered backends. Pick ONE of these to actually get a
+# backend registered (see AIReviewGateway/DEPLOYMENT.md's cross-repo coupling table for the values
+# that must stay in sync between whichever of these you pick and the Worker side):
+#
+#   (a) Backend Self-Registration (recommended, no values to type here at all): set
+#       BACKEND_SELF_REGISTRATION_ENABLED=true + a real BACKEND_ALLOWED_HOST_PATTERN below, then set
+#       BACKEND_URL on the Worker's own docker-compose.yml/.env -- the Worker announces itself to the
+#       Gateway on startup. Nothing about the backend's address is configured on this side at all.
+#   (b) Admin API, one call per backend, once: `POST /backends` with the ADMIN_TOKEN above -- see
+#       README.md's endpoint table. No LLAMA_URL_*/LLAMA_MODEL vars needed here either.
+#   (c) The `backend-seed` service below (legacy, opt-in via a Compose profile): registers exactly
+#       two hardcoded backend rows from LLAMA_URL_1/LLAMA_URL_2/LLAMA_MODEL, useful for a quick local
+#       smoke test. It does NOT run on a plain `docker compose up` -- it needs the `seed` profile:
+#
+#         LLAMA_MODEL=qwen2.5-coder \
+#         LLAMA_URL_1=http://192.168.1.101:8000 \
+#         LLAMA_URL_2=http://192.168.1.102:8000 \
+#         docker compose --profile seed up -d --build
+#
+# Jobs sit in QUEUED until some backend is registered (any of the three paths above) and a Worker
+# claims them.
 #
 # gateway's `ports:` binds to 127.0.0.1 only (mirrors the postgres service's own pattern below).
 # With Workers off-host, a TLS-terminating reverse proxy is the ONLY intended ingress to the Gateway
@@ -122,11 +129,17 @@ services:
     # elsewhere in this file relies on it.
 
   backend-seed:
-    # One-shot job: registers both backend rows (DEPLOYMENT.md §5 -- there is no REST endpoint for
-    # this, only a direct SQL insert). Runs once the Gateway is healthy, i.e. after Flyway has
-    # already created the `backends` table -- inserting any earlier would fail with "relation does
-    # not exist". Idempotent (ON CONFLICT on the UNIQUE `name` column), safe to re-run on every
-    # `docker compose up`. Stays Gateway-side by design -- only the Gateway owns PostgreSQL.
+    # Legacy, opt-in local-smoke-test helper -- see the header comment above for the other two
+    # (recommended) ways to register a backend. Does NOT run on a plain `docker compose up`; needs
+    # `docker compose --profile seed up`, which is also what makes LLAMA_URL_1/LLAMA_URL_2/LLAMA_MODEL
+    # required only in that mode, not on every startup.
+    #
+    # One-shot job: registers both backend rows via a direct SQL insert (there's also a proper
+    # `POST /backends` admin endpoint now -- see the header comment). Runs once the Gateway is
+    # healthy, i.e. after Flyway has already created the `backends` table -- inserting any earlier
+    # would fail with "relation does not exist". Idempotent (ON CONFLICT on the UNIQUE `name`
+    # column), safe to re-run. Stays Gateway-side by design -- only the Gateway owns PostgreSQL.
+    profiles: ["seed"]
     image: postgres:14-alpine
     depends_on:
       gateway:
