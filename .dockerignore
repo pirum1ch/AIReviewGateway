@@ -8,3 +8,6 @@ docs/
 Dockerfile
 worker/Dockerfile
 .dockerignore
+CLAUDE*
+*prompt*
+*промпт*
