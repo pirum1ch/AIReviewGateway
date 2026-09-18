@@ -84,6 +84,19 @@ public class Backend {
     @Column(name = "structured_output_mode", length = 32)
     private String structuredOutputMode;
 
+    /**
+     * Backend Self-Registration (V6, BSQ-01/BSQ-10): the {@code workerId} of the Worker that currently
+     * holds self-registration of this row; {@code null} = unclaimed (registered by an admin, by raw SQL,
+     * or released by a successful admin write -- {@code BackendRegistryService#upsertByAdmin}). A
+     * <b>misconfiguration guard, never an authorization boundary</b> -- {@code workerId} is a
+     * self-declared claim under the shared {@code WORKER_TOKEN} (T-03/T-15/WT-16), not a verified
+     * identity. Its only real job: stop two hosts with a copy-pasted {@code BACKEND_ID} from silently
+     * sharing one registry row, and (BSQ-01) stop a first claim of an unowned row from also repointing
+     * its {@code url} in the same call.
+     */
+    @Column(name = "announced_by", length = 64)
+    private String announcedBy;
+
     @Column(name = "created_at", nullable = false, updatable = false)
     private Instant createdAt;
 
@@ -184,6 +197,14 @@ public class Backend {
 
     public void setStructuredOutputMode(String structuredOutputMode) {
         this.structuredOutputMode = structuredOutputMode;
+    }
+
+    public String getAnnouncedBy() {
+        return announcedBy;
+    }
+
+    public void setAnnouncedBy(String announcedBy) {
+        this.announcedBy = announcedBy;
     }
 
     public Instant getCreatedAt() {

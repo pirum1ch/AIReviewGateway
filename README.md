@@ -89,10 +89,12 @@ to tens of minutes), and **1–10** backend servers, each typically paired with 
 | PostgreSQL | tested against 14.22 | The only persistence backend (schema in `src/main/resources/db/migration/V1__initial_schema.sql`, applied by Flyway at startup). No specific minimum version is mandated in the requirements document; the test suite runs against PostgreSQL 14.22 via an embedded (Zonky) instance and the schema uses no PostgreSQL-14-specific features (identity columns and `FOR UPDATE SKIP LOCKED` are supported from PostgreSQL 10+/9.5+ respectively), so 12+ is a reasonable practical floor. |
 | Docker | **not required to build or test** | Tests use `io.zonky.test` embedded PostgreSQL (a real Postgres binary run in-process), not Testcontainers. The CI security gate (`.github/workflows/security-gate.yml`) also runs `mvn verify` directly on a GitHub-hosted runner with no Docker step. |
 
-A root `Dockerfile`, `worker/Dockerfile`, and a `docker-compose.yml` wiring Postgres + both images together
-are provided as an *optional* containerized deployment path — see [§5](#5-deployment) and
-[DEPLOYMENT.md §11](DEPLOYMENT.md#11-docker-deployment-verified-both-images). The plain-jar path below
-remains the primary one this document describes in detail.
+A root `Dockerfile` and a `docker-compose.yml` (Postgres + Gateway + one-shot backend registration) are
+provided as an *optional* containerized deployment path for this repo — see [§5](#5-deployment) and
+[DEPLOYMENT.md §11](DEPLOYMENT.md#11-docker-deployment-verified-both-images). The Worker's own
+`Dockerfile`/`docker-compose.yml` now live in the separate `worker/` repo (a git submodule of this one —
+see [worker/README.md §6](worker/README.md#6-deployment)). The plain-jar path below remains the primary
+one this document describes in detail.
 
 ## 3. Build & test
 
@@ -147,14 +149,16 @@ system. The two groups worth knowing about up front:
   box; only worth changing if your hardware is much slower/faster than typical, or your network has
   unusual latency. Full list in `DEPLOYMENT.md`.
 
-Two settings deserve a mention here because getting them wrong fails silently rather than loudly:
+Three settings deserve a mention here because getting them wrong fails silently rather than loudly:
 
 - **`BACKEND_ALLOWED_HOST_PATTERN`** — restricts which network the Gateway is allowed to send health
   checks to. Ships permissive (`.*`, any host); tighten it to your actual backend network in production
-  (see the deployment must-dos right below).
+  (see the deployment must-dos right below). Becomes a **hard, startup-enforced** requirement, not merely
+  a recommendation, the moment `BACKEND_SELF_REGISTRATION_ENABLED=true` — see [§4.6](#46-backend-self-registration-optional).
 - **`ALLOWED_PROMPT_VERSIONS`** — which review formats (`v1`/`v2`/`v3`) the Gateway accepts. `v3`
   (Structured Review Output, §4.5) is deliberately left out of the default until every Worker is ready
   for it.
+- **`BACKEND_SELF_REGISTRATION_ENABLED`** — off by default; see [§4.6](#46-backend-self-registration-optional).
 
 ### 4.3 Deployment must-dos (from `docs/security/feature-03-sast-report.md`)
 
@@ -276,9 +280,11 @@ is specifically built to tolerate that restart model.
 - **Schema migrations run automatically at startup.** `spring.flyway.enabled: true` applies
   `V1__initial_schema.sql` before the application accepts traffic; `spring.jpa.hibernate.ddl-auto:
   validate` means Hibernate never generates DDL itself — the schema is exclusively Flyway-owned.
-- **Backend (llama-server) registration has no REST endpoint.** The `backends` table (created by the
-  V1 migration) is the only place backends are registered; there is no `POST /backends` or admin UI —
-  register a backend with a direct SQL statement:
+- **Backend (llama-server) registration has three paths** (Backend Self-Registration, V6, off by
+  default — see [§4.6](#46-backend-self-registration-optional)): a Worker can announce itself
+  (`POST /backends/announce`, WORKER role), an admin can upsert one directly (`POST /backends`, ADMIN
+  role), or — as before this feature — a direct SQL insert into the `backends` table (created by the V1
+  migration) still works and is unaffected:
 
   ```sql
   INSERT INTO backends (name, url, model, capacity)
@@ -299,9 +305,11 @@ is specifically built to tolerate that restart model.
 ### 5.1 Docker / Docker Compose (optional alternative)
 
 A multi-stage root `Dockerfile` (`maven:3.9-eclipse-temurin-21` → `eclipse-temurin:21-jre-jammy`,
-non-root user, `HEALTHCHECK` against `GET /health`) and a matching `worker/Dockerfile` are provided,
-plus a `docker-compose.yml` that wires up Postgres + both images + a one-shot backend-registration job
-in one command:
+non-root user, `HEALTHCHECK` against `GET /health`) is provided, plus a `docker-compose.yml` that wires
+up Postgres + the Gateway + a one-shot backend-registration job in one command. This stack is
+**Gateway-only** — Workers are not part of it; each Worker deploys separately, one per `llama-server`
+host, from the [`AIReviewWorker`](https://github.com/pirum1ch/AIReviewWorker) repo's own
+`docker-compose.yml` (present here as the `worker/` submodule):
 
 ```bash
 export DB_PASSWORD=... CI_TOKEN=$(openssl rand -hex 32) WORKER_TOKEN=$(openssl rand -hex 32) \
@@ -309,12 +317,13 @@ export DB_PASSWORD=... CI_TOKEN=$(openssl rand -hex 32) WORKER_TOKEN=$(openssl r
 docker compose up --build
 ```
 
-Every environment variable from [§4](#4-configuration) is read by the images the same way as by the bare
+Every environment variable from [§4](#4-configuration) is read by the image the same way as by the bare
 jar — no Docker-specific configuration exists. See
 [DEPLOYMENT.md §11](DEPLOYMENT.md#11-docker-deployment-verified-both-images) for the full reference
 (production topology behind a reverse proxy, the `docker-compose.yml` walkthrough, and a manual
-`docker run` recipe) and [worker/README.md §6.3](worker/README.md#63-containerization) for the Worker
-image specifically.
+`docker run` recipe) and [worker/README.md §6.4](worker/README.md#64-docker-compose) for the Worker's own
+compose stack (resolves once this repo is checked out with `--recurse-submodules`; standalone readers use
+the [AIReviewWorker repo](https://github.com/pirum1ch/AIReviewWorker) directly).
 
 ## 6. API reference
 
@@ -330,6 +339,9 @@ by Jackson with default (camelCase) field naming — no custom naming strategy i
 | `/reviews/{id}` | `DELETE` | `ADMIN` |
 | `/jobs/claim`, `/jobs/{id}/heartbeat`, `/jobs/{id}/result`, `/jobs/{id}/fail` | `POST` | `WORKER` |
 | `/backends` | `GET` | `ADMIN` |
+| `/backends` | `POST` | `ADMIN` |
+| `/backends/{name}` | `DELETE` | `ADMIN` |
+| `/backends/announce` | `POST` | `WORKER` (Backend Self-Registration, **only exists in the Spring context** when `gateway.backend.self-registration.enabled=true` — off by default; see [§4.6](#46-backend-self-registration-optional)) |
 | `/metrics` | `GET` | `ADMIN` |
 | `/health` | `GET` | none (public) |
 
@@ -772,7 +784,8 @@ curl -s http://localhost:8080/backends -H "Authorization: Bearer $ADMIN_TOKEN"
     "status": "ACTIVE",
     "running": 0,
     "lastSeen": "2026-07-13T10:05:00Z",
-    "probeFailedSince": null
+    "probeFailedSince": null,
+    "announcedBy": "worker-mac-mini-01"
   }
 ]
 ```
@@ -783,7 +796,9 @@ written on every probe pass, success or failure). `probeFailedSince` (Worker Obs
 Latency) is non-`null` while a continuous failed-probe streak is in progress but hasn't yet reached
 `gateway.backend.failure-grace` (still `ACTIVE`) or while a failed-but-at-capacity backend's demotion is
 being deferred (§10) — an operator can read "failing for 2 of 3 minutes' grace" directly from this field
-without querying PostgreSQL.
+without querying PostgreSQL. `announcedBy` (Backend Self-Registration, V6) is the `workerId` currently
+holding self-registration of this row, or `null` if it was never self-registered (created by an admin
+write or raw SQL) or an admin write released ownership — see [§4.6](#46-backend-self-registration-optional).
 
 ```bash
 curl -s http://localhost:8080/metrics -H "Authorization: Bearer $ADMIN_TOKEN"
@@ -835,6 +850,53 @@ authenticated, unbounded `INSERT` primitive for any worker-token holder — a wo
 repudiation gap these counters close. A `workerId`-guessing campaign against `/jobs/**` is necessarily
 noisy; these counters (plus the existing `WARN` logs) are what makes that noise visible without that risk.
 
+### 6.7a `POST /backends/announce`, `POST /backends`, `DELETE /backends/{name}` — Backend Self-Registration
+
+Three write paths for the `backends` registry, all disabled/gated as described in
+[§4.6](#46-backend-self-registration-optional). None of these responses ever include the backend's
+`url` (deliberate minimization, same as `GET /backends` above).
+
+**`POST /backends/announce`** (WORKER role, only reachable when `gateway.backend.self-registration.enabled=true`
+— the route does not exist in the Spring context at all otherwise, not merely unauthenticated):
+
+```bash
+curl -s -X POST http://localhost:8080/backends/announce \
+  -H "Authorization: Bearer $WORKER_TOKEN" -H "Content-Type: application/json" \
+  -d '{"backendId":"mac-mini-01","workerId":"worker-mac-mini-01","url":"http://192.168.1.50:8080","model":"llama-3.1-8b-instruct"}'
+```
+```json
+{ "name": "mac-mini-01", "status": "ACTIVE", "created": true }
+```
+`status` is the row's *effective* status — if it's `MAINTENANCE`/`OFFLINE`, the announce still succeeds
+and returns that status; it just never resurrects a parked backend. `created` is `true` only for a fresh
+insert.
+
+**`POST /backends`** (ADMIN role) — upsert by `name`, PATCH-like (an absent/`null` optional field on an
+update leaves that column unchanged): `201` on a fresh insert, `200` on an update. `url`/`model` are
+required only when creating a brand-new row.
+
+```bash
+curl -s -X POST http://localhost:8080/backends \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -d '{"name":"mac-mini-01","url":"http://192.168.1.50:8080","model":"llama-3.1-8b-instruct","capacity":1}'
+```
+
+The full request body also accepts `status` (`ACTIVE`/`MAINTENANCE`/`OFFLINE` — `SUSPECT` is
+health-checker-owned, not admin-settable), `structuredOutputMode`, and `promptMessageFormat` — none of
+which `POST /backends/announce` can ever touch. **Any successful admin write releases self-registration
+ownership** (`announcedBy` reset to `null`) — the documented way to hand a `name` to a different Worker:
+one admin call, then the new Worker's next announce claims it.
+
+**`DELETE /backends/{name}`** (ADMIN role) — soft decommission: sets `status = OFFLINE`, releases
+ownership, clears `probeFailedSince`. Never deletes the row (a backend that ever ran a job has FK
+references from `review_jobs`/`review_results`). Idempotent — decommissioning an already-`OFFLINE` row is
+still `200`, a no-op. `404` if `name` is unknown.
+
+**Error codes specific to these three endpoints** (see [§6.8](#68-error-format) for the full table):
+`BACKEND_URL_REJECTED` (422), `BACKEND_NAME_TAKEN` (409), `BACKEND_REGISTRY_FULL` (503, `announce` only —
+a transient capacity condition, not a permanent failure; a Worker should retry with backoff, not treat it
+like a rejected URL).
+
 ### 6.8 Error format
 
 `GlobalExceptionHandler` (and, for the two cases below it, `SecurityConfig`/`RequestBodySizeLimitFilter`
@@ -847,10 +909,13 @@ short machine-readable code plus a human-readable message, never a stack trace o
 | 400 | `MALFORMED_REQUEST` | The request body is missing or is not valid JSON. |
 | 401 | `UNAUTHORIZED` | No/unrecognized bearer token. (Written by `SecurityConfig`, not `GlobalExceptionHandler`.) |
 | 403 | `FORBIDDEN` | Valid token, wrong role for this endpoint. (Written by `SecurityConfig`.) |
-| 404 | `NOT_FOUND` | Unknown review id. |
+| 404 | `NOT_FOUND` | Unknown review id, or an unknown `name` on `DELETE /backends/{name}`. |
 | 409 | `INVALID_STATE_TRANSITION` | Admin cancel on an already-terminal Review. |
+| 409 | `BACKEND_NAME_TAKEN` | Backend Self-Registration: `POST /backends/announce` targets a `name` owned by a different `workerId`, or a first claim of an unowned row also tried to change its `url` in the same call. A misconfiguration guard, not an authorization boundary — see [§4.6](#46-backend-self-registration-optional). |
 | 413 | `PAYLOAD_TOO_LARGE` | Request body exceeds the configured edge cap (`POST /reviews`, `POST /jobs/{id}/result`, or `POST /jobs/{id}/fail`). (Written by `RequestBodySizeLimitFilter`, not `GlobalExceptionHandler`.) |
 | 422 | `DIFF_TOO_LARGE` | Diff exceeds the token budget. |
+| 422 | `BACKEND_URL_REJECTED` | Backend Self-Registration: the submitted `url` failed the SSRF/allowlist/bare-origin validator. `POST /backends/announce` always returns the single fixed message `"Backend URL was rejected"` regardless of which rule failed (never the specific reason, to avoid forming a DNS-resolution/allowlist oracle); `POST /backends` (admin, a trusted principal) returns the validator's own specific reason. |
+| 503 | `BACKEND_REGISTRY_FULL` | Backend Self-Registration: `POST /backends/announce` would insert a new row and the registry is already at `BACKEND_MAX_BACKENDS` (default 16). Transient — resolves once an operator decommissions a stale backend or raises the cap; a Worker should retry with backoff, not treat this as fatal. Update-of-an-owned-row and the admin path are both exempt from this cap. |
 | 500 | `INTERNAL_ERROR` | Anything unmapped; the real exception is logged server-side only. |
 
 `GlobalExceptionHandler` also maps a `JOB_NOT_CLAIMABLE` (409) code, but as of this codebase **nothing
@@ -1217,8 +1282,8 @@ Backend status (`GET /backends`, ADMIN) is one of:
 |---|---|
 | `ACTIVE` | Eligible to be assigned new jobs. |
 | `SUSPECT` | Failed its last health probe; excluded from new assignments. Auto-recovers to `ACTIVE` the next time its `/health` probe succeeds. |
-| `MAINTENANCE` | Operator-set; excluded from new assignments. The health checker never touches a `MAINTENANCE`/`OFFLINE` backend's status — there is no endpoint to set these, only a direct `UPDATE backends SET status = 'MAINTENANCE' WHERE name = '...'`. |
-| `OFFLINE` | Same as `MAINTENANCE` — operator-managed, ignored by the automatic health checker. |
+| `MAINTENANCE` | Operator-set; excluded from new assignments. The health checker never touches a `MAINTENANCE`/`OFFLINE` backend's status — set it via `POST /backends` (`{"name": "...", "status": "MAINTENANCE"}`, ADMIN, Backend Self-Registration V6) or a direct `UPDATE backends SET status = 'MAINTENANCE' WHERE name = '...'`. **Parking a backend here does not lock its `url`** — a subsequent self-registration announce from a Worker with the right `workerId` still updates it (loudly logged); see [§4.6](#46-backend-self-registration-optional). |
+| `OFFLINE` | Same as `MAINTENANCE` — operator-managed, ignored by the automatic health checker. Also the terminal state of `DELETE /backends/{name}`'s soft decommission. |
 
 The health checker probes every `ACTIVE`/`SUSPECT` backend's `{url}/health` on the
 `gateway.scheduler.backend-health-interval` tick (default 60s). Capacity for claim purposes is always the
@@ -1325,6 +1390,19 @@ non-terminal chunk job in the same step for a multi-chunk Review.
   reported — see [§6.1c](#61c-structured-review-output-and-response-validation). Full threat model:
   `docs/structured-review-output-threat-model.md` (SOR-01..23, SOR-INH-1/2/3) and its companion
   `docs/security/feature-structured-review-output-sast-report.md`.
+- **Backend Self-Registration (V6, optional, off by default) — narrow, misconfiguration-guarded, not an
+  authorization boundary.** When enabled, a `POST /backends/announce` under the shared `WORKER_TOKEN` can
+  create up to `BACKEND_MAX_BACKENDS` (default 16) rows or repoint an owned one, gated by: the kill switch
+  itself (default off); a startup-enforced check that `BACKEND_ALLOWED_HOST_PATTERN` is not universal (see
+  [§4.6](#46-backend-self-registration-optional) — passing it is not proof of a narrow-enough pattern);
+  the same SSRF guard as backend health-probing (scheme/loopback/link-local/metadata checks, re-validated
+  on every probe, not just at write time); bare-origin normalization (no userinfo/path/query/fragment
+  ever persisted); a first-claim-cannot-also-repoint rule; and a registry-size cap. `announced_by` is
+  explicitly a misconfiguration guard (loud `409`/`WARN` on a name collision), never a verified identity —
+  the same trust model as every other `/jobs/*` endpoint under `WORKER_TOKEN`. Audit is **log-only**, not
+  a PostgreSQL row — see [§4.6](#46-backend-self-registration-optional) for what that means for log
+  retention. Full threat model: `docs/backend-self-registration-threat-model.md` (`BSQ-01..24`) and its
+  companion `docs/security/feature-backend-self-registration-sast-report.md`.
 - **CI security gate** (this project's own build, not the product's GitLab integration):
   `.github/workflows/security-gate.yml` runs on every PR and push to `master` — `gitleaks` (secret
   scanning, full git history), `osv-scanner` over a CycloneDX SBOM (blocks on High/Critical CVEs),

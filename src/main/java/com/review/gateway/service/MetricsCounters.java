@@ -43,6 +43,15 @@ public class MetricsCounters {
     /** F-WH-02: the {@code catch (RuntimeException)} backstop in {@code WebhookReviewTriggerService.handle} firing. */
     private final AtomicLong webhookUnexpectedFailure = new AtomicLong();
 
+    // Backend Self-Registration (BSQ-15): keyed only on a closed Gateway-side reason vocabulary
+    // (NAME_TAKEN/URL_REJECTED/VALIDATION/REGISTRY_FULL) -- never a backend name, workerId, or URL --
+    // same discipline as structuredValidationFailures above. This is the detection signal for a
+    // name-takeover or SSRF-probing campaign; the DB itself carries no durable trace (backends.updated_at
+    // is overwritten by the very next successful health probe).
+    private final Map<String, AtomicLong> backendAnnounceRejected = new ConcurrentHashMap<>();
+    /** BSQ-15: every accepted ownership claim or URL change via self-announce (BSQ-02's WARN condition). */
+    private final AtomicLong backendUrlRepointed = new AtomicLong();
+
     /** @param endpoint a short, fixed label — e.g. {@code "heartbeat"}, {@code "result"}, {@code "fail"}. */
     public void incrementOwnershipMismatch(String endpoint) {
         ownershipMismatches.computeIfAbsent(endpoint, key -> new AtomicLong()).incrementAndGet();

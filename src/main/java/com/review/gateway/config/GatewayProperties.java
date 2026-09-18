@@ -7,12 +7,22 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.stereotype.Component;
 
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.regex.Pattern;
+import java.util.regex.PatternSyntaxException;
 
 /**
  * Typed {@code gateway.*} configuration surface. Extended in feature/03-api-security with the
@@ -1129,6 +1139,76 @@ public class GatewayProperties {
          * {@code gateway.job.max-duration} so a wedged-but-busy backend cannot defer forever.
          */
         private Duration deferDemotionMax = Duration.ofMinutes(45);
+
+        private final SelfRegistration selfRegistration = new SelfRegistration();
+
+        /**
+         * BSQ-06: the {@link #allowedHostPattern} above, compiled exactly once by {@link
+         * GatewayProperties#validateAllowedHostPatternOnStartup()} and reused by every caller — never
+         * recompiled per call. {@code null} until that validation has run; a real Spring context always
+         * populates it before any bean depending on {@code GatewayProperties} can observe a null value
+         * ({@code @PostConstruct} runs before this bean is handed to any of its consumers). Deliberately
+         * has no public setter — only the enclosing {@code GatewayProperties} (a same-outer-class access,
+         * not a config-binding target) ever assigns it, so the Spring Boot relaxed binder has no writable
+         * property here to (mis)bind.
+         */
+        private Pattern compiledAllowedHostPattern;
+
+        public SelfRegistration getSelfRegistration() {
+            return selfRegistration;
+        }
+
+        public Pattern getCompiledAllowedHostPattern() {
+            return compiledAllowedHostPattern;
+        }
+
+        /**
+         * Returns the startup-compiled {@link Pattern} when available, else compiles {@link
+         * #allowedHostPattern} fresh (uncached) — the fallback exists only for plain unit tests that
+         * construct {@code new GatewayProperties()} directly and never invoke {@code validateOnStartup()}
+         * (e.g. {@code BackendProberImplTest}); every real Spring context always takes the cached path.
+         */
+        public Pattern resolveAllowedHostPattern() {
+            if (compiledAllowedHostPattern != null) {
+                return compiledAllowedHostPattern;
+            }
+            String raw = (allowedHostPattern == null || allowedHostPattern.isBlank()) ? ".*" : allowedHostPattern;
+            return Pattern.compile(raw);
+        }
+
+        /** Backend Self-Registration (architecture §3.1/BSR-11, {@code gateway.backend.self-registration.*}). */
+        public static class SelfRegistration {
+            /**
+             * Kill switch (BSR-11): default {@code false} — a Gateway upgrade must never silently open a
+             * new WORKER-writable endpoint. {@code POST /backends/announce} does not even exist in the
+             * Spring context while this is off ({@code @ConditionalOnProperty} on
+             * {@code BackendAnnounceController}).
+             */
+            private boolean enabled = false;
+            /**
+             * BSQ-03: hard cap on registry size, enforced on the announce INSERT branch only (ADMIN
+             * {@code POST /backends} is exempt — a trusted operator must always be able to fix things).
+             * {@code BackendHealthChecker} probes serially with a 10s read timeout, so an unbounded row
+             * count is a DoS on outage detection for every other backend (BST-08).
+             */
+            private int maxBackends = 16;
+
+            public boolean isEnabled() {
+                return enabled;
+            }
+
+            public void setEnabled(boolean enabled) {
+                this.enabled = enabled;
+            }
+
+            public int getMaxBackends() {
+                return maxBackends;
+            }
+
+            public void setMaxBackends(int maxBackends) {
+                this.maxBackends = maxBackends;
+            }
+        }
 
         public Duration getConnectTimeout() {
             return connectTimeout;

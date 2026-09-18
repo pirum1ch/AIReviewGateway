@@ -64,6 +64,29 @@ class BackendProberImplTest {
     }
 
     @Test
+    void legacyRowWithAPathIsRejectedBeforeAnyHttpCall() {
+        // BSQ-04/07: a legacy (pre-V6, raw-SQL-inserted) row whose url carries a path fails its next
+        // probe rather than ever being trusted -- BackendProberImpl re-validates on every probe, it does
+        // not just concatenate a stored url that "looked fine" at write time.
+        Backend backend = backendWithUrl("http://192.168.1.63:8080/admin/reset?x=1");
+
+        assertThatThrownBy(() -> prober.probe(backend)).isInstanceOf(BackendUnavailableException.class);
+        // No mockServer expectation was set -- MockRestServiceServer would fail this test with an
+        // AssertionError on any unexpected call, which is the implicit "no HTTP call happened" proof.
+    }
+
+    @Test
+    void legacyRowWithACurlyBraceNeverThrowsFromTheHttpClientsUriTemplateParser() {
+        // BST-02: RestClient#uri(String) treats its argument as a URI TEMPLATE -- a stored url containing
+        // '{' would otherwise throw an unrelated IllegalArgumentException deep inside the scheduler
+        // thread. BackendUrlValidator's bare-origin check rejects it first, with the clean
+        // BackendUnavailableException this class always throws for an unhealthy backend.
+        Backend backend = backendWithUrl("http://192.168.1.64:8080/{malformed");
+
+        assertThatThrownBy(() -> prober.probe(backend)).isInstanceOf(BackendUnavailableException.class);
+    }
+
+    @Test
     void hostNotMatchingConfiguredAllowlistIsRejected() {
         properties.getBackend().setAllowedHostPattern("^10\\..*");
         Backend backend = backendWithUrl("http://192.168.1.60:8080");

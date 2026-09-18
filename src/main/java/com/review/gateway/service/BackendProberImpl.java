@@ -10,6 +10,7 @@ import org.springframework.web.client.RestClient;
 import org.springframework.web.client.RestClientException;
 
 import java.util.function.Supplier;
+import java.util.regex.Pattern;
 
 /**
  * Real HTTP-based {@link BackendProber} (architecture §11): {@code GET {backend.url}/health} with a
@@ -38,12 +39,18 @@ public class BackendProberImpl implements BackendProber {
 
     @Override
     public void probe(Backend backend) {
-        BackendUrlValidator.validate(backend.getUrl(), properties.getBackend().getAllowedHostPattern());
+        // BSQ-06: the compiled-once Pattern held by GatewayProperties, never recompiled per probe (falls
+        // back to a fresh compile only for plain-unit-test callers that never ran validateOnStartup()).
+        Pattern allowedHostPattern = properties.getBackend().resolveAllowedHostPattern();
+        // BSQ-04/BSQ-07: validate() returns the normalized BARE ORIGIN -- this is what makes the
+        // concatenation below safe. A stored url with a path/query/fragment is rejected here (on every
+        // probe, not just at write time), so it can never reach the string-concat below.
+        String origin = BackendUrlValidator.validate(backend.getUrl(), allowedHostPattern);
 
         try {
             RestClient freshClient = backendProbeRestClientFactory.get();
             freshClient.get()
-                    .uri(backend.getUrl() + HEALTH_PATH)
+                    .uri(origin + HEALTH_PATH)
                     .retrieve()
                     .toBodilessEntity();
         } catch (RestClientException failure) {
