@@ -20,6 +20,8 @@ import com.review.gateway.repository.ReviewInputRepository;
 import com.review.gateway.repository.ReviewJobRepository;
 import com.review.gateway.repository.ReviewPromptSectionRepository;
 import com.review.gateway.repository.ReviewRepository;
+import com.review.gateway.service.GitLabClient;
+import static org.mockito.Mockito.mock;
 import com.review.gateway.service.dto.ClaimedJob;
 import jakarta.persistence.EntityManager;
 import org.junit.jupiter.api.AfterEach;
@@ -36,7 +38,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 /**
  * PMR-09 (MUST): {@code prompt_bundle_mode=REPO} but zero {@code CORPORATE_*} sections at claim time
- * must fail the job explicitly — never dispatch it with an empty/partial system prompt. Also proves the
+ * must fail the job explicitly â€” never dispatch it with an empty/partial system prompt. Also proves the
  * companion PMR-09 case (a {@code NONE}-mode Review still claims and runs normally) end to end against a
  * real (Zonky) PostgreSQL instance, matching {@code QueueManagerIntegrationTest}'s fixture conventions.
  */
@@ -81,8 +83,8 @@ class QueueManagerPromptSectionsMissingTest extends AbstractPostgresIntegrationT
                 entityManager, transactionManager);
         ChunkContextRenderer chunkContextRenderer = new ChunkContextRenderer(properties, new TextSanitizer());
         PromptMessageFormatter promptMessageFormatter = new PromptMessageFormatter(properties, new PromptAssembler(properties, new DiffSizeValidator(properties)));
-        RetryManager retryManager = new RetryManager(reviewJobRepository, jobStateMachine, chunkCoordinator,
-                properties, new TextSanitizer(), entityManager, transactionManager);
+        RetryManager retryManager = new RetryManager(reviewJobRepository, reviewRepository, jobStateMachine, chunkCoordinator,
+                properties, new TextSanitizer(), entityManager, transactionManager, mock(GitLabClient.class));
         return new QueueManager(reviewRepository, reviewJobRepository, reviewChunkRepository,
                 reviewPromptSectionRepository, backendDispatcher, jobStateMachine, chunkCoordinator, eventService,
                 Mockito.mock(ResultProcessor.class), chunkContextRenderer, promptMessageFormatter, retryManager,

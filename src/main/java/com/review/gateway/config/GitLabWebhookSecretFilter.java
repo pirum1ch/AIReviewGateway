@@ -43,6 +43,11 @@ public class GitLabWebhookSecretFilter extends OncePerRequestFilter {
     @Override
     protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response, FilterChain filterChain)
             throws ServletException, IOException {
+        String webhookPath = properties.getWebhook().getPath();
+        if (!request.getRequestURI().equals(webhookPath)) {
+            filterChain.doFilter(request, response);
+            return;
+        }
         String presented = request.getHeader(TOKEN_HEADER);
         if (TokenMatcher.matchesAny(presented, properties.getWebhook().getSecretTokens())) {
             Authentication authentication = new UsernamePasswordAuthenticationToken(

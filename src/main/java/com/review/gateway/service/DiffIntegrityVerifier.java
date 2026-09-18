@@ -233,7 +233,7 @@ public class DiffIntegrityVerifier {
 
     /** WHR-12: {@code a_mode}/{@code b_mode} must be a plain octal file-mode string before rendering. */
     private void validateMode(String mode) {
-        if (mode != null && !MODE_PATTERN.matcher(mode).matches()) {
+        if (mode != null && !"0".equals(mode) && !MODE_PATTERN.matcher(mode).matches()) {
             throw new DiffIntegrityException(DiffIntegrityException.Reason.DIFF_UNSUPPORTED_CONTENT,
                     "a_mode/b_mode did not match the expected ^[0-7]{6}$ shape");
         }

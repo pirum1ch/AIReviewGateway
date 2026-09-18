@@ -17,6 +17,8 @@ import com.review.gateway.repository.ReviewEventRepository;
 import com.review.gateway.repository.ReviewJobRepository;
 import com.review.gateway.repository.ReviewPromptSectionRepository;
 import com.review.gateway.repository.ReviewRepository;
+import com.review.gateway.service.GitLabClient;
+import static org.mockito.Mockito.mock;
 import jakarta.persistence.EntityManager;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -32,7 +34,7 @@ import java.util.List;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * {@code POST /jobs/{id}/fail} end-to-end against a real (Zonky) PostgreSQL instance (architecture §5,
+ * {@code POST /jobs/{id}/fail} end-to-end against a real (Zonky) PostgreSQL instance (architecture Â§5,
  * WOC-26..WOC-33, WOR-01..WOR-19; test guidance T-3.1/2/3/4/10/11). Same fixture conventions as
  * {@code QueueManagerIntegrationTest}/{@code RetryManagerTest}.
  */
@@ -78,8 +80,8 @@ class QueueManagerReportFailureTest extends AbstractPostgresIntegrationTest {
         ChunkContextRenderer chunkContextRenderer = new ChunkContextRenderer(properties, new TextSanitizer());
         PromptMessageFormatter promptMessageFormatter = new PromptMessageFormatter(properties,
                 new PromptAssembler(properties, new DiffSizeValidator(properties)));
-        RetryManager retryManager = new RetryManager(reviewJobRepository, jobStateMachine, chunkCoordinator,
-                properties, new TextSanitizer(), entityManager, transactionManager);
+        RetryManager retryManager = new RetryManager(reviewJobRepository, reviewRepository, jobStateMachine, chunkCoordinator,
+                properties, new TextSanitizer(), entityManager, transactionManager, mock(GitLabClient.class));
         return new QueueManager(reviewRepository, reviewJobRepository, reviewChunkRepository,
                 reviewPromptSectionRepository, backendDispatcher, jobStateMachine, chunkCoordinator, eventService,
                 Mockito.mock(ResultProcessor.class), chunkContextRenderer, promptMessageFormatter, retryManager,

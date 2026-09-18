@@ -14,6 +14,8 @@ import com.review.gateway.repository.ReviewEventRepository;
 import com.review.gateway.repository.ReviewJobRepository;
 import com.review.gateway.repository.ReviewResultRepository;
 import com.review.gateway.repository.ReviewRepository;
+import com.review.gateway.service.GitLabClient;
+import static org.mockito.Mockito.mock;
 import com.review.gateway.service.dto.SubmitResultCommand;
 import jakarta.persistence.EntityManager;
 import org.junit.jupiter.api.AfterEach;
@@ -45,7 +47,7 @@ import static org.mockito.Mockito.when;
  * separate transactions from whatever called them. If setup data were only flushed inside the
  * ambient per-test transaction (as {@code @DataJpaTest} does by default, only rolled back at the very
  * end of the test method), it would still be uncommitted and therefore invisible under read-committed
- * isolation to those separate {@code REQUIRES_NEW} transactions — causing exactly the spurious
+ * isolation to those separate {@code REQUIRES_NEW} transactions â€” causing exactly the spurious
  * foreign-key failures this fix addresses. Using the repositories directly (instead of
  * {@code TestEntityManager}, whose {@code persistAndFlush} only flushes within whatever transaction
  * happens to be active) for setup ensures every fixture row is genuinely committed before
@@ -98,8 +100,8 @@ class ResultProcessorTest extends AbstractPostgresIntegrationTest {
         JobStateMachine jobStateMachine = new JobStateMachine(eventService);
         ChunkCoordinator chunkCoordinator = new ChunkCoordinator(reviewRepository, reviewJobRepository,
                 reviewChunkRepository, reviewCommentRepository, stateMachine, jobStateMachine, properties, entityManager, transactionManager);
-        RetryManager retryManager = new RetryManager(reviewJobRepository, jobStateMachine, chunkCoordinator,
-                properties, new TextSanitizer(), entityManager, transactionManager);
+        RetryManager retryManager = new RetryManager(reviewJobRepository, reviewRepository, jobStateMachine, chunkCoordinator,
+                properties, new TextSanitizer(), entityManager, transactionManager, mock(GitLabClient.class));
         CommentRenderer commentRenderer = new CommentRenderer(commentParser, new TextSanitizer(), properties);
         StructuredResponseParser structuredResponseParser = new StructuredResponseParser(
                 commentParser, commentRenderer, new TextSanitizer(), properties, new MetricsCounters());

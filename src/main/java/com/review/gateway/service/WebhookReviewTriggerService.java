@@ -213,8 +213,8 @@ public class WebhookReviewTriggerService {
      */
     private void handleIntegrityFailure(Long projectId, Long mergeRequestIid, String headSha,
                                          DiffIntegrityException failure, boolean allowDiagnosticComment) {
-        log.error("event=diff_integrity_failed project_id={} mr_iid={} head_sha={} reason={}",
-                projectId, mergeRequestIid, headSha, failure.reason());
+        log.error("event=diff_integrity_failed project_id={} mr_iid={} head_sha={} reason={} detail={}",
+                projectId, mergeRequestIid, headSha, failure.reason(), failure.getMessage());
         metricsCounters.incrementWebhookDiffIntegrityFailure(failure.reason().name());
 
         if (allowDiagnosticComment) {

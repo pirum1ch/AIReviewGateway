@@ -18,6 +18,8 @@ import com.review.gateway.repository.ReviewEventRepository;
 import com.review.gateway.repository.ReviewJobRepository;
 import com.review.gateway.repository.ReviewPromptSectionRepository;
 import com.review.gateway.repository.ReviewRepository;
+import com.review.gateway.service.GitLabClient;
+import static org.mockito.Mockito.mock;
 import com.review.gateway.service.dto.ClaimedJob;
 import com.review.gateway.service.dto.FailureReportOutcome;
 import com.review.gateway.service.dto.HeartbeatResult;
@@ -41,13 +43,13 @@ import static org.assertj.core.api.Assertions.assertThat;
 /**
  * QA-added (Worker Observability &amp; Claim Latency): independent, real-database verification of the
  * WOC-27/WOR-19 ownership race the architecture/threat-model docs call out as the trickiest concurrency
- * property of Part 3 (architecture §5.4, threat-model §4.1/WOT-02/WOR-19; test guidance T-3.5) and of
+ * property of Part 3 (architecture Â§5.4, threat-model Â§4.1/WOT-02/WOR-19; test guidance T-3.5) and of
  * WOC-38 (a late heartbeat tick landing after a requeue must not resurrect the requeued job's apparent
  * freshness; test guidance T-3.6).
  *
  * <p>The scenario under test: a Worker-reported failure for a job it used to own arrives <em>after</em>
  * the Gateway's own stale-heartbeat sweep has already reclaimed that job and a different Worker has
- * re-claimed it (a fresh, healthy attempt). The stale report must never touch that new attempt — neither
+ * re-claimed it (a fresh, healthy attempt). The stale report must never touch that new attempt â€” neither
  * via {@link QueueManager#reportFailure}'s outer, unlocked pre-check, nor (independently, and more
  * importantly per WOC-27's own stated rationale) via {@link RetryManager#requeueOrFail(Long, String,
  * String)}'s locked ownership re-check, which is the control that actually matters if a future refactor
@@ -98,8 +100,8 @@ class QueueManagerReportFailureRaceIntegrationTest extends AbstractPostgresInteg
         ChunkContextRenderer chunkContextRenderer = new ChunkContextRenderer(properties, new TextSanitizer());
         PromptMessageFormatter promptMessageFormatter = new PromptMessageFormatter(properties,
                 new PromptAssembler(properties, new DiffSizeValidator(properties)));
-        this.retryManager = new RetryManager(reviewJobRepository, jobStateMachine, chunkCoordinator,
-                properties, new TextSanitizer(), entityManager, transactionManager);
+        this.retryManager = new RetryManager(reviewJobRepository, reviewRepository, jobStateMachine, chunkCoordinator,
+                properties, new TextSanitizer(), entityManager, transactionManager, mock(GitLabClient.class));
         this.queueManager = new QueueManager(reviewRepository, reviewJobRepository, reviewChunkRepository,
                 reviewPromptSectionRepository, backendDispatcher, jobStateMachine, chunkCoordinator, eventService,
                 Mockito.mock(ResultProcessor.class), chunkContextRenderer, promptMessageFormatter, retryManager,

@@ -51,7 +51,7 @@ services:
       POSTGRES_USER: review_gateway
       POSTGRES_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD}
     ports:
-      - "127.0.0.1:5432:5432"
+      - "5432:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
@@ -97,6 +97,11 @@ services:
       ALLOWED_PROMPT_VERSIONS: ${ALLOWED_PROMPT_VERSIONS:-v1,v2}
       STRUCTURED_OUTPUT_ENABLED: ${STRUCTURED_OUTPUT_ENABLED:-true}
       STRUCTURED_OUTPUT_DEFAULT_MODE: ${STRUCTURED_OUTPUT_DEFAULT_MODE:-OFF}
+      WEBHOOK_ENABLED: "true"
+      WEBHOOK_SECRET_TOKENS: ${WEBHOOK_SECRET_TOKENS:?set WEBHOOK_SECRET_TOKENS}
+      WEBHOOK_BOT_USER_ID: ${WEBHOOK_BOT_USER_ID:?set WEBHOOK_BOT_USER_ID}
+      GITLAB_DIFF_TOKEN: ${GITLAB_DIFF_TOKEN:?set GITLAB_DIFF_TOKEN}
+      WEBHOOK_ALLOWED_PROJECT_IDS: ${WEBHOOK_ALLOWED_PROJECT_IDS:-}
     ports:
       - "8080:8080"
     # GITLAB_BASE_URL uses the gitlab.local hostname (its self-signed cert's SAN is issued for
@@ -129,15 +134,13 @@ services:
     environment:
       PGPASSWORD: ${DB_PASSWORD:?set DB_PASSWORD}
       LLAMA_URL_1: ${LLAMA_URL_1:?set LLAMA_URL_1, e.g. http://192.168.1.101:8000}
-      LLAMA_URL_2: ${LLAMA_URL_2:?set LLAMA_URL_2, e.g. http://192.168.1.102:8000}
       LLAMA_MODEL: ${LLAMA_MODEL:?set LLAMA_MODEL}
     entrypoint: ["sh", "-c"]
     command:
       - >
         psql -h postgres -U review_gateway -d review_gateway -c
         "INSERT INTO backends (name, url, model, capacity) VALUES
-         ('llama-01', '$$LLAMA_URL_1', '$$LLAMA_MODEL', 1),
-         ('llama-02', '$$LLAMA_URL_2', '$$LLAMA_MODEL', 1)
+         ('llama-03', '$$LLAMA_URL_1', '$$LLAMA_MODEL', 1)
          ON CONFLICT (name) DO NOTHING;"
     networks:
       - airg
@@ -156,7 +159,7 @@ services:
       GATEWAY_URL: http://127.0.0.1:8080
       GATEWAY_API_KEY: ${WORKER_TOKEN:?set WORKER_TOKEN, must equal the Gateway's value}
       WORKER_ID: ${WORKER_ID_1:-worker-llama-01}
-      BACKEND_ID: llama-01
+      BACKEND_ID: llama-03
       LLAMA_MODEL: ${LLAMA_MODEL:?set LLAMA_MODEL}
       LLAMA_URL: ${LLAMA_URL_1:?set LLAMA_URL_1, e.g. http://192.168.1.101:8000}
       LLAMA_MAX_TOKENS: ${LLAMA_MAX_TOKENS:-12000}
@@ -168,31 +171,31 @@ services:
     # No `ports:` here -- forbidden alongside network_mode, and the Worker's Actuator
     # (server.address: 127.0.0.1, hardcoded) is only ever meant to be reached via
     # `docker compose exec worker1 curl http://127.0.0.1:8081/actuator/health` anyway.
-
-  worker2:
-    build:
-      context: ./worker
-      dockerfile: Dockerfile
-    image: llm-worker:local
-    depends_on:
-      backend-seed:
-        condition: service_completed_successfully
-    network_mode: "service:gateway"
-    environment:
-      GATEWAY_URL: http://127.0.0.1:8080
-      GATEWAY_API_KEY: ${WORKER_TOKEN:?set WORKER_TOKEN, must equal the Gateway's value}
-      WORKER_ID: ${WORKER_ID_2:-worker-llama-02}
-      BACKEND_ID: llama-02
-      LLAMA_MODEL: ${LLAMA_MODEL:?set LLAMA_MODEL}
-      LLAMA_URL: ${LLAMA_URL_2:?set LLAMA_URL_2, e.g. http://192.168.1.102:8000}
-      LLAMA_MAX_TOKENS: ${LLAMA_MAX_TOKENS:-12000}
-      LLAMA_ENABLE_THINKING: ${LLAMA_ENABLE_THINKING:-true}
-      WORKER_ALLOW_INSECURE_GATEWAY: "true"
-      # Must differ from worker1's -- see the comment there; both share one network namespace.
-      WORKER_HTTP_PORT: "8082"
-    # Actuator check: `docker compose exec worker2 curl http://127.0.0.1:8082/actuator/health`.
-    # You can't tell the two Workers apart by connecting from outside either way (no ports are
-    # published) -- use `docker compose logs worker1`/`worker2` or `docker compose exec workerN ...`.
+#
+#  worker2:
+#    build:
+#      context: ./worker
+#      dockerfile: Dockerfile
+#    image: llm-worker:local
+#    depends_on:
+#      backend-seed:
+#        condition: service_completed_successfully
+#    network_mode: "service:gateway"
+#    environment:
+#      GATEWAY_URL: http://127.0.0.1:8080
+#      GATEWAY_API_KEY: ${WORKER_TOKEN:?set WORKER_TOKEN, must equal the Gateway's value}
+#      WORKER_ID: ${WORKER_ID_2:-worker-llama-02}
+#      BACKEND_ID: llama-02
+#      LLAMA_MODEL: ${LLAMA_MODEL:?set LLAMA_MODEL}
+#      LLAMA_URL: ${LLAMA_URL_2:?set LLAMA_URL_2, e.g. http://192.168.1.102:8000}
+#      LLAMA_MAX_TOKENS: ${LLAMA_MAX_TOKENS:-12000}
+#      LLAMA_ENABLE_THINKING: ${LLAMA_ENABLE_THINKING:-true}
+#      WORKER_ALLOW_INSECURE_GATEWAY: "true"
+#      # Must differ from worker1's -- see the comment there; both share one network namespace.
+#      WORKER_HTTP_PORT: "8082"
+#    # Actuator check: `docker compose exec worker2 curl http://127.0.0.1:8082/actuator/health`.
+#    # You can't tell the two Workers apart by connecting from outside either way (no ports are
+#    # published) -- use `docker compose logs worker1`/`worker2` or `docker compose exec workerN ...`.
 
 volumes:
   postgres-data:
