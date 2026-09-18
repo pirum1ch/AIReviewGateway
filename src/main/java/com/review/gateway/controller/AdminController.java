@@ -77,8 +77,8 @@ public class AdminController {
                 snapshot.ownershipMismatches(), snapshot.workerFailureReportsIgnored(),
                 snapshot.legacyParseFallback(), snapshot.structuredValidationFailures(),
                 snapshot.structuredConstraintSent(), snapshot.structuredFallbackUsed(),
-                snapshot.structuredFieldTruncated(), snapshot.backendAnnounceRejected(),
-                snapshot.backendUrlRepointed());
+                snapshot.structuredFieldTruncated(), snapshot.webhookDiffIntegrityFailures(),
+                snapshot.webhookRateLimited(), snapshot.webhookUnexpectedFailure());
     }
 
     private BackendView toView(BackendSnapshot snapshot) {

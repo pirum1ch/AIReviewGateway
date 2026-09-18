@@ -1,10 +1,14 @@
 package com.review.gateway.service;
 
 import com.review.gateway.config.GatewayProperties;
+import com.review.gateway.exception.GitLabPublishException;
+import com.review.gateway.model.Review;
 import com.review.gateway.model.ReviewJob;
 import com.review.gateway.model.enums.EventType;
 import com.review.gateway.model.enums.JobStatus;
+import com.review.gateway.model.enums.ReviewStatus;
 import com.review.gateway.repository.ReviewJobRepository;
+import com.review.gateway.repository.ReviewRepository;
 import com.review.gateway.service.dto.RequeueOutcome;
 import jakarta.persistence.EntityManager;
 import org.slf4j.Logger;
@@ -60,21 +64,26 @@ public class RetryManager {
     private static final int MAX_LAST_ERROR_LENGTH = 512;
 
     private final ReviewJobRepository reviewJobRepository;
+    private final ReviewRepository reviewRepository;
     private final JobStateMachine jobStateMachine;
     private final ChunkCoordinator chunkCoordinator;
     private final GatewayProperties properties;
     private final TextSanitizer textSanitizer;
     private final EntityManager entityManager;
     private final TransactionTemplate requiresNewTransactionTemplate;
+    private final GitLabClient gitLabClient;
 
     public RetryManager(ReviewJobRepository reviewJobRepository,
+                         ReviewRepository reviewRepository,
                          JobStateMachine jobStateMachine,
                          ChunkCoordinator chunkCoordinator,
                          GatewayProperties properties,
                          TextSanitizer textSanitizer,
                          EntityManager entityManager,
-                         PlatformTransactionManager transactionManager) {
+                         PlatformTransactionManager transactionManager,
+                         GitLabClient gitLabClient) {
         this.reviewJobRepository = reviewJobRepository;
+        this.reviewRepository = reviewRepository;
         this.jobStateMachine = jobStateMachine;
         this.chunkCoordinator = chunkCoordinator;
         this.properties = properties;
@@ -83,6 +92,7 @@ public class RetryManager {
         this.requiresNewTransactionTemplate = new TransactionTemplate(transactionManager);
         this.requiresNewTransactionTemplate.setPropagationBehavior(TransactionTemplate.PROPAGATION_REQUIRES_NEW);
         this.requiresNewTransactionTemplate.setName("RetryManager");
+        this.gitLabClient = gitLabClient;
     }
 
     /**
@@ -115,7 +125,10 @@ public class RetryManager {
         if (outcome.reviewId() != null) {
             // CSR-17: the job-row lock above was released when that transaction committed; this call
             // takes its own, independent lock on the parent row only now.
-            chunkCoordinator.recomputeAndApply(outcome.reviewId());
+            ReviewStatus newStatus = chunkCoordinator.recomputeAndApply(outcome.reviewId());
+            if (newStatus == ReviewStatus.FAILED) {
+                postFailureNotification(outcome.reviewId());
+            }
         }
         return outcome;
     }
@@ -162,6 +175,18 @@ public class RetryManager {
                 job.getId(), job.getReviewId(), job.getChunkIndex(), reason, job.getAttempts(), maxAttempts);
         reviewJobRepository.save(job);
         return RequeueOutcome.requeued(job.getReviewId());
+    }
+
+    private void postFailureNotification(Long reviewId) {
+        reviewRepository.findById(reviewId).ifPresent(review -> {
+            try {
+                gitLabClient.postDiscussion(review.getProjectId(), review.getMergeRequestId(),
+                        DiagnosticCommentRenderer.renderLlmFailure(review.getHeadSha()));
+            } catch (GitLabPublishException e) {
+                log.warn("Failed to post LLM failure notification: reviewId={} projectId={} mrId={}",
+                        reviewId, review.getProjectId(), review.getMergeRequestId());
+            }
+        });
     }
 
     private String sanitizeLastError(String raw) {

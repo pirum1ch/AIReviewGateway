@@ -1,10 +1,8 @@
 package com.review.gateway.controller;
 
 import com.review.gateway.dto.ErrorResponse;
-import com.review.gateway.exception.BackendNameTakenException;
-import com.review.gateway.exception.BackendRegistryFullException;
-import com.review.gateway.exception.BackendUrlRejectedException;
-import com.review.gateway.exception.BackendValidationException;
+import com.review.gateway.exception.DiffFetchUnavailableException;
+import com.review.gateway.exception.DiffIntegrityException;
 import com.review.gateway.exception.DiffTooLargeException;
 import com.review.gateway.exception.IncompatiblePromptVersionException;
 import com.review.gateway.exception.InvalidStateTransitionException;
@@ -61,50 +59,26 @@ public class GlobalExceptionHandler {
     }
 
     /**
-     * Backend Self-Registration (BSQ-04/BSQ-13): the WORKER path always constructs this with the single
-     * fixed message; the ADMIN path preserves the validator's own specific (constant, non-reflecting)
-     * message. Either way, this handler never inspects/echoes the submitted {@code url} itself.
+     * GitLab Webhook Diff Trigger (WHR-07): defense-in-depth mapping only — {@code WebhookController}
+     * never lets this (or {@link DiffIntegrityException}) reach the framework, so this handler is not
+     * observable through the webhook endpoint's actual behavior in shipped code (which always responds
+     * with the same coarse outcome regardless of cause). Kept for consistency with this class's
+     * exception-handling discipline and as a safety net against a future refactor accidentally letting
+     * it propagate.
      */
-    @ExceptionHandler(BackendUrlRejectedException.class)
-    public ResponseEntity<ErrorResponse> handleBackendUrlRejected(BackendUrlRejectedException ex) {
+    @ExceptionHandler(DiffFetchUnavailableException.class)
+    public ResponseEntity<ErrorResponse> handleDiffFetchUnavailable(DiffFetchUnavailableException ex) {
+        log.warn("Diff fetch unavailable: {}", ex.getMessage());
+        return ResponseEntity.status(HttpStatus.BAD_GATEWAY)
+                .body(new ErrorResponse("DIFF_FETCH_FAILED", "Failed to fetch the merge request diff from GitLab"));
+    }
+
+    /** GitLab Webhook Diff Trigger (WHR-07) — see {@link #handleDiffFetchUnavailable} javadoc. */
+    @ExceptionHandler(DiffIntegrityException.class)
+    public ResponseEntity<ErrorResponse> handleDiffIntegrity(DiffIntegrityException ex) {
+        log.warn("Diff integrity check failed (reason={}): {}", ex.reason(), ex.getMessage());
         return ResponseEntity.status(HttpStatus.UNPROCESSABLE_ENTITY)
-                .body(new ErrorResponse("BACKEND_URL_REJECTED", ex.getMessage()));
-    }
-
-    /** Backend Self-Registration (BSQ-01): a misconfiguration guard, not an authorization boundary (BSQ-10). */
-    @ExceptionHandler(BackendNameTakenException.class)
-    public ResponseEntity<ErrorResponse> handleBackendNameTaken(BackendNameTakenException ex) {
-        return ResponseEntity.status(HttpStatus.CONFLICT)
-                .body(new ErrorResponse("BACKEND_NAME_TAKEN", ex.getMessage()));
-    }
-
-    /**
-     * Backend Self-Registration (BSQ-03 / F-BSR-04): deliberately a distinct status/code from {@link
-     * BackendNameTakenException}'s {@code 409} so the two different "announce did not land" causes stay
-     * distinguishable to a Worker. Mapped to {@code 503}, not {@code 422} — unlike a rejected URL (a
-     * permanent Worker-side misconfiguration), a full registry is a transient Gateway-side capacity
-     * condition that resolves itself once an operator decommissions a stale backend or raises the cap;
-     * the Worker (which never reads this response body, BSR-19) must bucket it with "retry with backoff",
-     * the same bucket as a genuinely unreachable Gateway, not with "fail startup permanently".
-     */
-    @ExceptionHandler(BackendRegistryFullException.class)
-    public ResponseEntity<ErrorResponse> handleBackendRegistryFull(BackendRegistryFullException ex) {
-        return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
-                .body(new ErrorResponse("BACKEND_REGISTRY_FULL", ex.getMessage()));
-    }
-
-    /**
-     * Backend Self-Registration (F-BSR-01): {@code BackendRegistryService#upsertByAdminTx} throws this for
-     * a create missing a required {@code url}/{@code model} — a condition bean validation on the DTO
-     * cannot see (it cannot know whether the target row already exists). Deliberately scoped to this
-     * specific exception type rather than the application-wide {@code IllegalArgumentException} (which a
-     * prior version of this handler caught, catching every unrelated IAE from every other endpoint —
-     * SR-17 regression, see F-BSR-01). Message is a fixed, non-reflecting string.
-     */
-    @ExceptionHandler(BackendValidationException.class)
-    public ResponseEntity<ErrorResponse> handleBackendValidation(BackendValidationException ex) {
-        return ResponseEntity.status(HttpStatus.BAD_REQUEST)
-                .body(new ErrorResponse("VALIDATION_ERROR", ex.getMessage()));
+                .body(new ErrorResponse("DIFF_INTEGRITY_CHECK_FAILED", "The merge request diff failed an integrity check"));
     }
 
     @ExceptionHandler(ReviewNotFoundException.class)

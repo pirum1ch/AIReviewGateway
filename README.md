@@ -238,64 +238,28 @@ change, never a redeploy):
 | 3 — fleet | All backends on the mode that worked in stage 2. | Steady-state failure rate. |
 | 4 — default | CI templates switch to `promptVersion: v3` (with `git -c core.quotePath=false diff` — see [§6.1c](#61c-structured-review-output-and-response-validation)). | — |
 
-### 4.6 Backend Self-Registration (optional)
+### 4.6 GitLab webhook diff trigger (optional)
 
-**Off by default.** Out of the box, backends are registered by an operator (raw SQL or, as of this
-feature, `POST /backends`) — a Worker never writes to the registry. Turning this on lets each Worker
-register/re-claim its own `backends` row at startup instead, which is the natural fit for this project's
-reference topology (one Worker per `llama-server` host, deployed independently, e.g. via launchd on a Mac
-mini): nothing to run against the Gateway by hand per host. Nothing changes for anyone until you set
-`BACKEND_SELF_REGISTRATION_ENABLED=true` on the Gateway **and** `BACKEND_URL` on a Worker — see
-`worker/README.md` for the Worker-side setting and `DEPLOYMENT.md`'s config reference for both. Full
-design: [`docs/backend-self-registration-architecture.md`](docs/backend-self-registration-architecture.md);
-full threat model:
-[`docs/backend-self-registration-threat-model.md`](docs/backend-self-registration-threat-model.md)
-(`BSQ-01..24`) and its companion
-[`docs/security/feature-backend-self-registration-sast-report.md`](docs/security/feature-backend-self-registration-sast-report.md).
+**Off by default** (`WEBHOOK_ENABLED=false`). Turning it on replaces the CI runner as the source of the
+diff: GitLab posts a `merge_request` webhook, and the Gateway fetches, verifies and assembles the diff
+itself over the GitLab REST API before creating the Review. Nothing about the `POST /reviews` CI path
+changes, and the two can run side by side. When it is off, no webhook route, security matcher, filter or
+sweep job exists at all.
 
-**What it changes.** A Worker started with `BACKEND_URL` set sends `POST /backends/announce
-{backendId, workerId, url, model}` once, before it starts polling for jobs. The Gateway either creates a
-new `backends` row (if the registry is under `BACKEND_MAX_BACKENDS`, default 16) or updates an existing
-one it already owns (`announced_by = workerId`); a first claim of a row nobody owns yet may take
-ownership but may not simultaneously change that row's `url` in the same call (a misconfiguration guard,
-not an authorization boundary — `workerId` is a self-declared claim under the shared `WORKER_TOKEN`, the
-same trust model as everything else on `/jobs/*`).
+Turning it on makes four things **required** at startup (the Gateway refuses to boot without them):
+`WEBHOOK_SECRET_TOKENS` (comma-separated set, ≥32 chars each — a set so the secret can be rotated
+without a delivery gap), `WEBHOOK_BOT_USER_ID` (the *numeric* GitLab user id of the reviewer bot — never
+a username), `GITLAB_DIFF_TOKEN` (a **third** GitLab credential, `read_api` only, scoped as narrowly as
+possible — never the comment-publishing token, never the Prompt Manager token), and a
+`WEBHOOK_PROMPT_VERSION` that is present in `ALLOWED_PROMPT_VERSIONS`.
 
-**Before turning this on, `BACKEND_ALLOWED_HOST_PATTERN` must already be narrowed** — with the flag on,
-the Gateway refuses to start unless the configured pattern is *behaviourally* non-universal against a set
-of sentinel hosts covering three shapes (dotted hostnames, IP literals, single-label names). **Passing
-that startup check is not proof the pattern is narrow enough** — it only proves the pattern is not
-universal for at least one tested shape (e.g. `^192\.168\.1\.\d+$` passes trivially and is genuinely
-narrow; `^[0-9.]+$` also passes and grants the entire IPv4 space). Narrowing the pattern correctly for
-your actual backend network remains the operator's responsibility; the startup check exists only to catch
-the grossest misconfiguration (`.*`, `.+`, `[\s\S]*`, and similar) before it ships to production.
-
-**Two deliberate deviations, recorded here rather than left as unexplained gaps:**
-
-- **`http://` backend URLs are knowingly accepted**, unlike `GITLAB_BASE_URL` (which must be `https://`).
-  Backends are `llama-server` instances on an operator's own LAN (Mac minis, etc.), not public endpoints —
-  the SSRF guard (allowlist pattern + loopback/link-local/metadata blocking, re-checked on every probe)
-  applies regardless of scheme. This is an explicit, accepted deviation from this project's general
-  "prefer HTTPS" posture, not an oversight.
-- **Parking a backend at `MAINTENANCE`/`OFFLINE` does not lock its `url`.** It stops that backend from
-  receiving new dispatch, but a subsequent successful `announce` from a Worker with the right `workerId`
-  still updates the row's `url` (loudly, via a `WARN` log line) — parking is not a way to freeze a
-  backend's network address against future self-registration. To actually prevent a name from being
-  reclaimed, stop the Worker(s) that could announce under it, or rename the row via the admin API.
-
-**Audit is log-only, not a PostgreSQL table.** Every self-registration write (new row, ownership claim,
-`url` change) logs a structured `INFO`/`WARN` line, but does **not** write a `review_events` row (that
-table requires a `review_id`, which a backend-registry mutation has none of) and `backends.updated_at` is
-overwritten by the very next successful health probe (within `gateway.scheduler.backend-health-interval`,
-default 60s) — it is not a durable trail either. **Gateway log retention is therefore the effective audit
-retention for this feature**; size your log retention/shipping accordingly if you need to investigate a
-hostile or accidental backend repoint after the fact.
-
-**A full registry (`BACKEND_MAX_BACKENDS`, default 16) returns `503 BACKEND_REGISTRY_FULL`, not a
-permanent failure** — a Worker whose announce hits the cap retries with backoff rather than giving up, and
-the condition resolves itself once an operator decommissions a stale backend (`DELETE /backends/{name}`)
-or raises the cap. The cap only bounds new-row inserts; a Worker updating a row it already owns is exempt,
-as is every admin-path write.
+The one decision to make deliberately: `WEBHOOK_ALLOWED_PROJECT_IDS`. Left empty, *any* project where
+someone adds the bot as a reviewer can have its diff fetched into this Gateway's database — the Gateway
+logs a loud WARN at startup for exactly that reason. Set it unless you really do want org-wide
+enrollment. See [§7.2](#72-optional-gitlab-webhook-diff-trigger-default-off) for how the trigger works,
+`DEPLOYMENT.md` for every parameter, and
+[`docs/gitlab-webhook-trigger-threat-model.md`](docs/gitlab-webhook-trigger-threat-model.md) for the
+security rationale behind each one.
 
 ## 5. Deployment
 
@@ -988,14 +952,15 @@ job that blocks the pipeline until the review is actually `PUBLISHED`) is at
 [`examples/.gitlab-ci.yml`](examples/.gitlab-ci.yml) — copy it into the *target* project being
 reviewed, not into this repository.
 
-**The Gateway never calls out to GitLab to compute or fetch a diff.** `GitLabClientImpl` has exactly
-four methods — `postDiscussion` (publish a comment), and, only when Prompt Manager is enabled,
-`resolveCommitSha`/`fetchRawFile`/`resolveDefaultBranch` (read system-prompt source files, [§6.1b](#61b-prompt-manager-and-system-prompt-assembly)).
-There is no `GET .../merge_requests/{iid}/diffs` or `/changes` call anywhere in the Gateway, and no
-inbound GitLab webhook receiver either. The `diff` field in `POST /reviews` is the **entire** contract:
-whoever calls the endpoint (normally this CI job, via `git diff`) must compute the unified diff itself
-and push it in the request body — the Gateway is a purely passive receiver of diff text, never an
-initiator of a GitLab diff fetch.
+**In the default configuration the Gateway never calls out to GitLab to compute or fetch a diff.** The
+`diff` field in `POST /reviews` is the **entire** contract: whoever calls the endpoint (normally this CI
+job, via `git diff`) must compute the unified diff itself and push it in the request body. With
+`gateway.webhook.enabled=false` (the shipped default) `GitLabClientImpl` only ever issues
+`postDiscussion` (publish a comment) and, when Prompt Manager is enabled,
+`resolveCommitSha`/`fetchRawFile`/`resolveDefaultBranch` (read system-prompt source files,
+[§6.1b](#61b-prompt-manager-and-system-prompt-assembly)); there is no inbound webhook endpoint at all —
+the path is not registered as a route, a security matcher, or a filter (see [§7.2](#72-optional-gitlab-webhook-diff-trigger-default-off)).
+
 
 ```yaml
 ai-review:
@@ -1132,6 +1097,57 @@ name a template that actually exists in the Worker's bundle
 (`worker/src/main/resources/.../<promptVersion>.yml`), which the Gateway has no way to verify at request
 time; an allowlisted `promptVersion` whose template is missing from a given Worker still fails only once
 a job reaches that Worker.
+
+### 7.2 Optional: GitLab webhook diff trigger (default off)
+
+An alternative trigger path exists behind a kill-switch: instead of a CI job pushing `git diff`, GitLab
+sends a `merge_request` webhook and the **Gateway fetches the diff itself** over the GitLab REST API.
+It is off by default (`gateway.webhook.enabled=false`); nothing below is registered, validated or
+required until an operator turns it on. Both trigger paths can coexist — the webhook path calls exactly
+the same `ReviewService.createReview(...)` the CI path does, with the same
+`(project_id, merge_request_id, head_sha)` deduplication, so a project running both does not get two
+Reviews.
+
+How it works when enabled:
+
+1. GitLab `POST`s a `merge_request` event to `gateway.webhook.path` (default `/webhooks/gitlab`) with an
+   `X-Gitlab-Token` header. The header is checked against the `gateway.webhook.secret-tokens` **set**
+   (comma-separated, ≥32 chars each — a set, so rotation is add → re-point GitLab → remove, with no
+   delivery gap) and, on success, authorizes the request as `ROLE_WEBHOOK` inside the normal Spring
+   Security chain. Everything else still falls through to `anyRequest().denyAll()`.
+2. **Only `project.id` and `object_attributes.iid` are read out of the body** (plus
+   `object_attributes.last_commit.id` as an untrusted dedup *hint*, never persisted). Every fact the
+   Gateway acts on — whether the bot is a reviewer, the MR state, `base_sha`, `head_sha` — comes from the
+   Gateway's own authenticated `GET /projects/{id}/merge_requests/{iid}`. The bot is matched by numeric
+   `gateway.webhook.bot-user-id`, never by username.
+3. `gateway.webhook.allowed-project-ids` (deploy-time only) gates which projects may be fetched at all,
+   *before* any GitLab call. Empty means "any project the bot can see as a reviewer" and logs a loud
+   startup WARN.
+4. The diff is fetched via `GET /projects/{id}/repository/compare?from=&to=&unidiff=true` using a
+   **third, separate** GitLab credential (`gateway.gitlab.diff-token`, `read_api`, group-scoped —
+   never the write token, never the Prompt Manager token), verified fail-closed
+   (`DiffIntegrityVerifier`: whole-MR `overflow`/`compare_timeout`, per-hunk self-consistency,
+   line-prefix invariant, empty-diff rules incl. an `X-Gitlab-Size` `HEAD` check for new/deleted files),
+   and only then assembled into unified-diff text (`DiffAssembler` synthesizes the `diff --git`/`---`/
+   `+++`/mode lines GitLab does not return). **Any** integrity check failing means no Review is created
+   at all — the Gateway never repairs or partially accepts a diff.
+5. A deterministic integrity failure produces an ERROR log line
+   (`event=diff_integrity_failed project_id=… mr_iid=… head_sha=… reason=…`), a `/metrics` counter, and
+   a best-effort constant-template comment on the MR. It never writes a Review row.
+6. `ReviewerSweepService` runs every `gateway.scheduler.reviewer-sweep-interval` (default 1h) as a
+   backstop in case a delivery is lost or GitLab auto-disables the hook. It is a no-op when the feature
+   is off.
+
+The endpoint always answers the same coarse `202` for everything it accepted (created, deduplicated, bot
+not a reviewer, not an interesting event, rate-limited) — it never tells its caller whether a project
+exists, is reachable, or failed an integrity check.
+
+Config: `gateway.webhook.*` (`enabled`, `secret-tokens`, `path`, `bot-user-id`, `bot-username`,
+`allowed-project-ids`, `max-request-body-bytes`, `prompt-version`, `max-reviews-per-project-per-hour`,
+`max-reviews-per-hour`, `max-concurrent-fetches`, `sweep.*`), `gateway.gitlab.diff-token`,
+`gateway.gitlab.diff.*`, `gateway.scheduler.reviewer-sweep-interval` — the full parameter-by-parameter
+reference is in `DEPLOYMENT.md`, and the security rationale for each is in
+`docs/gitlab-webhook-trigger-threat-model.md`.
 
 ## 8. Review lifecycle
 

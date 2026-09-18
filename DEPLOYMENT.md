@@ -682,12 +682,16 @@ in [§11](#11-docker-deployment-verified-both-images).
 
 ## 7. Step 5: GitLab integration
 
-> **STUB — not implemented: no GitLab webhook receiver.** The Gateway has no webhook/event endpoint of
-> any kind (its only inbound endpoints are `/reviews*`, `/jobs/*`, `/backends`, `/metrics`, `/health`,
-> confirmed by listing every `@RestController` in the codebase). Integration is **entirely CI-initiated**:
-> a `.gitlab-ci.yml` job explicitly calls `POST /reviews`. There is nothing to configure on GitLab's
-> "Webhooks" settings page for this integration — only CI/CD variables (below) and the pipeline job
-> itself.
+> **Default deployment: entirely CI-initiated, nothing to configure under GitLab → Webhooks.** With the
+> shipped defaults the Gateway's only inbound endpoints are `/reviews*`, `/jobs/*`, `/backends`,
+> `/metrics`, `/health`; a `.gitlab-ci.yml` job explicitly calls `POST /reviews` with a diff it computed
+> itself. Configure the CI/CD variables (§7.1) and the pipeline job (§7.2) and you are done.
+>
+> **Optional second trigger path (off by default):** `gateway.webhook.enabled=true` registers a real
+> `POST {gateway.webhook.path}` receiver (default `/webhooks/gitlab`) so GitLab can trigger a review by
+> webhook and the Gateway fetches the diff itself over the REST API — see §7.4 below. Until that flag is
+> set, the endpoint does not exist (no route, no security matcher, no filter, no sweep job), and this
+> section's "nothing to configure on the Webhooks page" statement holds exactly as written.
 
 ### 7.1 The CI/CD variables
 
@@ -753,7 +757,8 @@ headSha)` already existed — dedup, root [README §8](README.md#8-review-lifecy
 
 ### 7.3 What the Gateway needs from GitLab, and the resulting MR flow
 
-The Gateway calls exactly one GitLab API endpoint, via `GitLabClientImpl.postDiscussion`:
+In the default configuration (Prompt Manager off, webhook trigger off) the Gateway calls exactly one
+GitLab API endpoint, via `GitLabClientImpl.postDiscussion`:
 
 ```
 POST {GITLAB_BASE_URL}/projects/{projectId}/merge_requests/{mergeRequestIid}/discussions
@@ -762,9 +767,11 @@ Body:   { "body": "<one parsed comment's text>" }
 ```
 
 — once per parsed review comment (not one combined comment), each in its own request, each tracked by
-the returned discussion `id` (stored in `review_comments.discussion_id`) for idempotent retry. This is
-the **only** direction of GitLab traffic; the Gateway never reads anything else from the GitLab API
-(no MR metadata fetch, no repository access).
+the returned discussion `id` (stored in `review_comments.discussion_id`) for idempotent retry. With both
+optional features off this is the **only** direction of GitLab traffic; the Gateway reads nothing else
+from the GitLab API (no MR metadata fetch, no repository access). Enabling Prompt Manager adds read-only
+prompt-file reads on `GITLAB_PROMPT_TOKEN` (§7 of the parameter reference); enabling the webhook trigger
+adds read-only diff/MR/notes reads on `GITLAB_DIFF_TOKEN` (§7.4).
 
 End-to-end MR flow: CI job posts the diff (`POST /reviews`, `202`-equivalent `201`/`200` + `reviewId`) →
 Gateway queues it (`QUEUED`) → a Worker claims and runs it (`RUNNING`) → the parsed comments are stored
@@ -772,6 +779,94 @@ and the review flips `COMPLETED` → the Gateway's own publish cycle (`gateway.s
 60s) posts each comment as a GitLab discussion and, once all are posted, flips the review to `PUBLISHED` —
 this is when comments actually appear on the Merge Request. None of this depends on the original CI job
 still running.
+
+### 7.4 Optional: the GitLab webhook diff trigger (`WEBHOOK_ENABLED`, default `false`)
+
+Turns the flow around: instead of a CI job computing `git diff` and pushing it, GitLab notifies the
+Gateway and the **Gateway fetches the diff itself**. Off by default; with `WEBHOOK_ENABLED=false`
+nothing below is registered, validated, or required, and §7.1–§7.3 describe the whole integration.
+
+**Before turning it on, provision these (startup fails otherwise):**
+
+| Variable | What it must be |
+|---|---|
+| `WEBHOOK_SECRET_TOKENS` | Comma-separated **set** of operator-chosen secrets, each **≥32 characters**. A set, not a single value, so rotation is: add the new one here → re-point GitLab at it → remove the old one, with no delivery gap. Never commit it; env only. |
+| `WEBHOOK_BOT_USER_ID` | The **numeric** GitLab user id of the reviewer bot (e.g. `35`). Never a username — usernames are renameable and the freed name is re-claimable, so a username-based gate can be silently re-pointed at a different account. |
+| `GITLAB_DIFF_TOKEN` | A **third**, separate GitLab credential: a **group access token**, **`read_api` scope only**, scoped to the group under review, with an expiry and a rotation entry in your runbook. Never a personal or admin token, never the same value as `GITLAB_TOKEN` (write, comment publishing) or `GITLAB_PROMPT_TOKEN`. Worst case for a leak of this one must be "the reviewed group leaks", not "the instance leaks". |
+| `WEBHOOK_PROMPT_VERSION` | Must also appear in `ALLOWED_PROMPT_VERSIONS`, or the Gateway refuses to start. Default `v2`. |
+
+**Decide `WEBHOOK_ALLOWED_PROJECT_IDS` deliberately.** Comma-separated project ids. Left empty, the only
+gate on which projects this Gateway will pull source code from is "someone added the bot as a reviewer"
+— i.e. any Developer on any project the bot can see can enroll that project unilaterally, and its diffs
+then live in this Gateway's database and travel to every Worker that claims the job. The Gateway logs a
+loud startup WARN in that case. Setting the allowlist is the recommended posture; leaving it empty is a
+legitimate but explicit choice.
+
+**On the GitLab side** (project or group → Settings → Webhooks):
+
+- URL: `https://gateway.internal{WEBHOOK_PATH}` (default path `/webhooks/gitlab`).
+- Secret token: one of the values in `WEBHOOK_SECRET_TOKENS`.
+- Trigger: **Merge request events** only.
+- SSL verification: on.
+- **Rotation gotcha (empirically confirmed on GitLab 16.3.9):** a `PUT /projects/:id/hooks/:hook_id`
+  that does not re-send `token` **silently drops the stored secret** — deliveries then arrive with no
+  `X-Gitlab-Token` header at all and are rejected `401`. Any script that updates a hook (even to change
+  only its URL) MUST resend `token` on every `PUT`.
+
+**What it costs on the GitLab API, per triggered MR:** `GET /projects/{id}/merge_requests/{iid}` (state,
+reviewers, `diff_refs`), `GET /projects/{id}/merge_requests/{iid}/changes` (the deprecated endpoint, read
+for its whole-MR `overflow` flag only), `GET /projects/{id}/repository/compare?from=&to=&unidiff=true`,
+plus — only for a new/deleted file whose `diff` came back empty — one `HEAD
+/projects/{id}/repository/files/{path}?ref={sha}` size check. All on `GITLAB_DIFF_TOKEN`; `429` is
+honoured with a bounded retry budget.
+
+**What to alert on.** A deterministic diff-integrity failure deliberately writes **no row to
+PostgreSQL** (there is no Review yet at that point). Its authoritative record is a single structured log
+line plus a `/metrics` counter, and those are what your monitoring must watch:
+
+```
+event=diff_integrity_failed project_id=… mr_iid=… head_sha=… reason=DIFF_TOO_LARGE_OR_TRUNCATED|DIFF_UNAVAILABLE|DIFF_UNSUPPORTED_CONTENT
+```
+
+`GET /metrics` exposes the same counts per reason, plus a counter for creations suppressed by the
+in-memory rate limits. A sustained non-zero `diff_integrity_failed` rate means merge requests are
+**not being reviewed**, silently from every other dashboard's point of view — treat it as a real alert,
+not as noise. The MR comment the Gateway posts alongside it is a courtesy for the MR author and is
+best-effort only: it is capped per sweep tick and can be suppressed by anyone able to write notes on the
+MR, which is exactly why it is not the authoritative signal.
+
+**Data-collection footprint (widened, on purpose).** Any MR where the bot is a reviewer results in that
+project's diff being stored in `review_inputs.diff` in the Gateway database and sent to whichever Worker
+claims the job. The at-rest protection and the retention job cover it unchanged, but the *population* of
+projects they cover is now "whatever the allowlist above permits", not "projects that wired up the CI
+job". Size the allowlist and the retention window with that in mind.
+
+Bounds worth reviewing before enabling (all in §"Конфигурация: полный справочник параметров"):
+`WEBHOOK_MAX_REQUEST_BODY_BYTES` (edge body cap), `gateway.webhook.max-reviews-per-project-per-hour` /
+`max-reviews-per-hour` (in-memory rate limits — the trigger rate is no longer controlled by your own
+CI), `gateway.webhook.max-concurrent-fetches` (so a slow GitLab cannot consume the Tomcat pool and
+starve `/jobs/claim`), `gateway.webhook.sweep.*` (the hourly backstop's per-tick ceilings),
+`GITLAB_DIFF_MAX_RESPONSE_BYTES` and `gateway.gitlab.diff.max-pages` (bounded reads).
+
+**Three accepted behaviours to plan around** (decisions from the security review, recorded in
+`docs/gitlab-webhook-trigger-threat-model.md` §7 — not bugs, but each will surprise you once):
+
+- **A webhook-triggered review that ends `FAILED` is not re-attempted for that revision.** The dedup
+  fast path matches an existing Review in *any* status, so neither a redelivery nor an hourly sweep tick
+  creates a second one for the same `head_sha`. Remedy: push a new commit, or create the Review over the
+  CI path (`POST /reviews`, §7.1–§7.2), whose dedup does allow superseding a `FAILED` predecessor. The
+  alternative — re-creating it every tick forever — was judged worse.
+- **The hourly rate limits count deliveries that reach the fetch stage, not Reviews created.** A delivery
+  for an MR where the bot is *not* a reviewer still consumes a slot, because "is the bot a reviewer" can
+  only be answered by the GitLab read the limit exists to bound. On a busy allowlisted project, raise
+  `gateway.webhook.max-reviews-per-project-per-hour` above the project's MR-event rate rather than above
+  its review rate. Suppression is self-healing within one hour via the sweep, and shows up as the
+  `webhookRateLimited` counter on `GET /metrics`.
+- **Before enabling in production, close F-WH-13** (threat model WHR-15, exemption (c)): a *renamed*
+  file whose content changed by a length-preserving edit, and which is large enough that GitLab drops its
+  patch, is currently accepted as a "pure rename" and silently excluded from what the model reviews. The
+  fix is one extra header off the `HEAD` request already being made (`X-Gitlab-Blob-Id` instead of
+  `X-Gitlab-Size`), pending one read-only probe of this GitLab version.
 
 ## 8. Step 6: End-to-end smoke test
 

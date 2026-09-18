@@ -35,6 +35,13 @@ public class MetricsCounters {
     // Structured Output Grammar Budget (SGB-03/SOGB-11): keyed only on the fixed field-name vocabulary
     // ("comment"/"suggestion") -- never a file path, project id, or any model-supplied string.
     private final Map<String, AtomicLong> structuredFieldTruncated = new ConcurrentHashMap<>();
+    // GitLab Webhook Diff Trigger (WHR-28): keyed only on DiffIntegrityException.Reason's closed
+    // vocabulary -- never a project id, MR iid, head_sha, or any GitLab-supplied string.
+    private final Map<String, AtomicLong> webhookDiffIntegrityFailures = new ConcurrentHashMap<>();
+    /** WHR-22: every webhook/sweep-triggered creation attempt suppressed by the in-memory rate limit. */
+    private final AtomicLong webhookRateLimited = new AtomicLong();
+    /** F-WH-02: the {@code catch (RuntimeException)} backstop in {@code WebhookReviewTriggerService.handle} firing. */
+    private final AtomicLong webhookUnexpectedFailure = new AtomicLong();
 
     // Backend Self-Registration (BSQ-15): keyed only on a closed Gateway-side reason vocabulary
     // (NAME_TAKEN/URL_REJECTED/VALIDATION/REGISTRY_FULL) -- never a backend name, workerId, or URL --
@@ -90,13 +97,29 @@ public class MetricsCounters {
         structuredFieldTruncated.computeIfAbsent(field, key -> new AtomicLong()).incrementAndGet();
     }
 
-    /** @param reason one of {@code NAME_TAKEN}/{@code URL_REJECTED}/{@code VALIDATION}/{@code REGISTRY_FULL}. */
-    public void incrementBackendAnnounceRejected(String reason) {
-        backendAnnounceRejected.computeIfAbsent(reason, key -> new AtomicLong()).incrementAndGet();
+    /**
+     * WHR-28: the authoritative, unconditional signal for a deterministic diff-integrity failure — this
+     * fires regardless of whether the best-effort diagnostic MR comment was posted.
+     *
+     * @param reason one of {@code DiffIntegrityException.Reason}'s names.
+     */
+    public void incrementWebhookDiffIntegrityFailure(String reason) {
+        webhookDiffIntegrityFailures.computeIfAbsent(reason, key -> new AtomicLong()).incrementAndGet();
     }
 
-    public void incrementBackendUrlRepointed() {
-        backendUrlRepointed.incrementAndGet();
+    /** WHR-22: fires once per suppressed creation attempt (per-project or global bucket, whichever tripped first). */
+    public void incrementWebhookRateLimited() {
+        webhookRateLimited.incrementAndGet();
+    }
+
+    /**
+     * F-WH-02: fires once per webhook/sweep trigger attempt that hit the {@code catch (RuntimeException)}
+     * backstop -- i.e. an exception type neither of {@code doHandle}'s specific catches enumerated. Should
+     * stay at zero in normal operation; a nonzero count means a new {@code ReviewService.createReview}
+     * exception type (or similar) needs its own specific handling, not just the coarse backstop.
+     */
+    public void incrementWebhookUnexpectedFailure() {
+        webhookUnexpectedFailure.incrementAndGet();
     }
 
     public Map<String, Long> ownershipMismatchSnapshot() {
@@ -129,12 +152,16 @@ public class MetricsCounters {
         return snapshotOf(structuredFieldTruncated);
     }
 
-    public Map<String, Long> backendAnnounceRejectedSnapshot() {
-        return snapshotOf(backendAnnounceRejected);
+    public Map<String, Long> webhookDiffIntegrityFailuresSnapshot() {
+        return snapshotOf(webhookDiffIntegrityFailures);
     }
 
-    public long backendUrlRepointedCount() {
-        return backendUrlRepointed.get();
+    public long webhookRateLimitedCount() {
+        return webhookRateLimited.get();
+    }
+
+    public long webhookUnexpectedFailureCount() {
+        return webhookUnexpectedFailure.get();
     }
 
     private Map<String, Long> snapshotOf(Map<String, AtomicLong> counters) {

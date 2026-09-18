@@ -73,6 +73,7 @@ public class GatewayProperties {
     private final Prompt prompt = new Prompt();
     private final Structured structured = new Structured();
     private final Review review = new Review();
+    private final Webhook webhook = new Webhook();
 
     public Diff getDiff() {
         return diff;
@@ -122,6 +123,10 @@ public class GatewayProperties {
         return review;
     }
 
+    public Webhook getWebhook() {
+        return webhook;
+    }
+
     /** PMR-14: project reference = numeric id, or up to 10 {@code /}-separated path segments — never a scheme/host. */
     private static final Pattern PROJECT_REF_PATTERN =
             Pattern.compile("^[0-9]+$|^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+){1,10}$");
@@ -129,6 +134,17 @@ public class GatewayProperties {
     private static final Pattern REF_PATTERN = Pattern.compile("^[A-Za-z0-9._/-]{1,255}$");
     /** PMR-13/PMR-14: a repo-relative file path, no leading {@code /}, no {@code ..} segment. */
     private static final Pattern SOURCE_PATH_PATTERN = Pattern.compile("^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$");
+    /** WHR-11: same shape as {@code CreateReviewRequest.promptVersion}'s {@code @Pattern}. */
+    private static final Pattern PROMPT_VERSION_PATTERN = Pattern.compile("^[A-Za-z0-9._-]{1,32}$");
+    /**
+     * F-WH-06: {@code gateway.webhook.bot-username} reaches {@code GitLabClientImpl}'s reviewer-listing
+     * call as a query parameter (a value like {@code "bot&scope=all"} would inject extra query params
+     * under Spring's {@code TEMPLATE_AND_VALUES} encoding, which encodes illegal-in-query characters but
+     * leaves {@code &}/{@code =} alone). GitLab's own username alphabet, pinned at startup like every
+     * other config value that reaches a URI (PROJECT_REF_PATTERN/REF_PATTERN/SOURCE_PATH_PATTERN/
+     * PROMPT_VERSION_PATTERN).
+     */
+    private static final Pattern BOT_USERNAME_PATTERN = Pattern.compile("^[A-Za-z0-9._-]{1,255}$");
     private static final int MAX_SOURCE_PATH_LENGTH = 200;
     private static final int MAX_OVERRIDES = 500;
     /**
@@ -188,162 +204,7 @@ public class GatewayProperties {
         validateRetryAndBackendHealthOnStartup();
         validatePromptOnStartup();
         validateStructuredOnStartup();
-        // Backend Self-Registration (BSQ-06): unconditional -- runs regardless of whether
-        // gateway.backend.self-registration.enabled is true, so an uncompilable/pathological
-        // allowed-host-pattern is caught at startup even for a deployment that never opts into this
-        // feature (today's permissive default keeps working unchanged for everyone else).
-        validateAllowedHostPatternOnStartup();
-        // BSQ-05/BSR-12: only when the feature is actually opted into (default false).
-        validateBackendSelfRegistrationOnStartup();
-    }
-
-    /**
-     * Backend Self-Registration (BSQ-06, blocking): compiles {@code gateway.backend.allowed-host-pattern}
-     * exactly once, here, and caches the result on {@link Backend#compiledAllowedHostPattern} for reuse by
-     * {@code BackendUrlValidator}/{@code BackendProberImpl}/{@code BackendRegistryService} — never
-     * recompiled per call. Runs unconditionally: until self-registration exists, this pattern is only ever
-     * evaluated against DBA-chosen data (SR-10), so a slow/uncompilable pattern was tolerable; once a
-     * caller-chosen host can reach it (BSTB-ANN), it is not.
-     *
-     * <p>A {@link PatternSyntaxException} always refuses startup. Immediately after compiling, the pattern
-     * is run against two pathological ~255-character inputs on a background thread with a hard 100ms
-     * wall-clock budget (never waited out past that — a genuinely catastrophic pattern can take
-     * astronomically longer than 100ms to actually finish, so this measures "did it finish in time", not
-     * "how long did it take", and abandons the probe thread rather than blocking on it).
-     */
-    void validateAllowedHostPatternOnStartup() {
-        String rawPattern = backend.getAllowedHostPattern();
-        String effectivePattern = (rawPattern == null || rawPattern.isBlank()) ? ".*" : rawPattern;
-        Pattern compiled;
-        try {
-            compiled = Pattern.compile(effectivePattern);
-        } catch (PatternSyntaxException invalid) {
-            throw new IllegalStateException(
-                    "gateway.backend.allowed-host-pattern does not compile as a regular expression — refusing to start",
-                    invalid);
-        }
-        runBacktrackingBudgetProbe(compiled);
-        backend.compiledAllowedHostPattern = compiled;
-    }
-
-    /** BSQ-06: 100ms wall-clock budget for the pathological-input probe below. */
-    private static final Duration REDOS_PROBE_BUDGET = Duration.ofMillis(100);
-
-    private void runBacktrackingBudgetProbe(Pattern compiled) {
-        String pathologicalMatch = "a".repeat(255);
-        String pathologicalNearMiss = "a".repeat(255) + "!";
-        var executor = Executors.newSingleThreadExecutor(runnable -> {
-            Thread probeThread = new Thread(runnable, "allowed-host-pattern-redos-probe");
-            probeThread.setDaemon(true);
-            return probeThread;
-        });
-        Future<?> probe = executor.submit(() -> {
-            compiled.matcher(pathologicalMatch).matches();
-            compiled.matcher(pathologicalNearMiss).matches();
-        });
-        try {
-            probe.get(REDOS_PROBE_BUDGET.toMillis(), TimeUnit.MILLISECONDS);
-        } catch (TimeoutException tooSlow) {
-            throw new IllegalStateException(
-                    "gateway.backend.allowed-host-pattern took longer than " + REDOS_PROBE_BUDGET
-                            + " to evaluate a pathological input — likely catastrophic backtracking — refusing to start");
-        } catch (InterruptedException interrupted) {
-            Thread.currentThread().interrupt();
-            throw new IllegalStateException(
-                    "Interrupted while probing gateway.backend.allowed-host-pattern for catastrophic backtracking — refusing to start",
-                    interrupted);
-        } catch (ExecutionException probeFailed) {
-            throw new IllegalStateException(
-                    "gateway.backend.allowed-host-pattern failed while probing for catastrophic backtracking — refusing to start",
-                    probeFailed.getCause());
-        } finally {
-            // The regex-evaluation thread itself cannot be interrupted mid-match (java.util.regex has no
-            // cooperative cancellation) -- shutdownNow() only stops the executor from accepting further
-            // work. A genuinely pathological match keeps burning CPU on that orphaned daemon thread until
-            // the JVM exits, which it does immediately after this throws (startup failure).
-            executor.shutdownNow();
-        }
-    }
-
-    /** BSQ-05: name-shaped sentinels (BSR-12's original three), plus one randomly-generated per boot. */
-    private static final List<String> NAME_SHAPED_SENTINELS =
-            List.of("evil.example.com", "metadata.google.internal", "a3f9c1e2-probe.invalid");
-    /**
-     * BSQ-05: IP-literal sentinels covering every "an operator thinks this is narrow but it isn't" shape
-     * — private (10/8, 172.16/12, 192.168/16), CGNAT (100.64/10), link-local-metadata, and public.
-     * {@code ^[0-9.]+\$} passes every {@link #NAME_SHAPED_SENTINELS} entry while granting the entire IPv4
-     * space (BST-03) — this list exists specifically to still catch that shape.
-     */
-    private static final List<String> IP_LITERAL_SENTINELS =
-            List.of("10.0.0.1", "172.16.0.1", "192.168.0.1", "100.100.100.200", "169.254.169.254",
-                    "8.8.8.8", "203.0.113.7");
-    /** BSQ-05: a single-label (no-dot) sentinel — catches {@code ^[^.]*\$}, "every single-label internal hostname". */
-    private static final String SINGLE_LABEL_SENTINEL = "internal-probe-host";
-    private static final String[] RANDOM_SENTINEL_TLDS = {"test", "example", "invalid", "probe-net"};
-
-    /**
-     * Backend Self-Registration (BSQ-05/BST-03, blocking): when the flag is on, refuse to start unless
-     * {@code gateway.backend.allowed-host-pattern} is <em>behaviourally</em> non-universal. "Behaviourally
-     * non-universal" is tested by sentinel, not string-compared (a literal {@code ".*".equals(pattern)}
-     * check is false assurance — {@code .+}, {@code .*.*}, {@code [\s\S]*}, {@code (?s).*} all defeat it).
-     *
-     * <p>The check is grouped, not one flat AND over every sentinel: refuse if the pattern matches
-     * <b>every</b> sentinel within <em>any single group</em> (dotted name-shaped / IP-literal /
-     * single-label). A flat AND over the whole combined list would never flag {@code ^[0-9.]+\$} (which
-     * fails to match the name-shaped sentinels) even though it grants the entire IPv4 space, nor
-     * {@code ^[^.]*\$} (which fails to match every dotted sentinel) even though it grants every
-     * unqualified internal hostname — each is universal <em>within its own shape</em>, which is exactly
-     * what makes it dangerous, and the grouped check is what catches that. One randomly-generated
-     * dotted-and single-label sentinel per boot additionally defeats a pattern hard-tuned to this exact
-     * fixed list.
-     *
-     * <p><b>Passing this check is not evidence the pattern is narrow</b> — only that it is not universal
-     * for at least one of the tested shapes. See {@code docs/backend-self-registration-threat-model.md}
-     * §3.1 for why no automated check can do better than that.
-     */
-    void validateBackendSelfRegistrationOnStartup() {
-        if (!backend.getSelfRegistration().isEnabled()) {
-            return;
-        }
-        if (backend.getSelfRegistration().getMaxBackends() < 1) {
-            throw new IllegalStateException(
-                    "gateway.backend.self-registration.max-backends must be >= 1; got: "
-                            + backend.getSelfRegistration().getMaxBackends());
-        }
-
-        Pattern compiled = backend.getCompiledAllowedHostPattern();
-        List<String> dottedNameGroup = new ArrayList<>(NAME_SHAPED_SENTINELS);
-        dottedNameGroup.add(randomLabel() + "." + randomTld());
-        List<String> singleLabelGroup = List.of(SINGLE_LABEL_SENTINEL, randomLabel());
-
-        boolean universal = matchesEvery(compiled, dottedNameGroup)
-                || matchesEvery(compiled, IP_LITERAL_SENTINELS)
-                || matchesEvery(compiled, singleLabelGroup);
-        if (universal) {
-            throw new IllegalStateException(
-                    "gateway.backend.allowed-host-pattern must be narrowed to your actual backend network "
-                            + "before gateway.backend.self-registration.enabled=true — the configured pattern "
-                            + "matches every sentinel host in at least one tested shape (dotted names / IP "
-                            + "literals / single-label names) — passing this check only proves the pattern is "
-                            + "not universal for that shape, never that it is narrow enough — refusing to start");
-        }
-    }
-
-    private boolean matchesEvery(Pattern compiled, List<String> hosts) {
-        for (String host : hosts) {
-            if (!compiled.matcher(host.toLowerCase(Locale.ROOT)).matches()) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    private String randomLabel() {
-        return "sentinel-" + UUID.randomUUID().toString().replace("-", "").substring(0, 12);
-    }
-
-    private String randomTld() {
-        return RANDOM_SENTINEL_TLDS[ThreadLocalRandom.current().nextInt(RANDOM_SENTINEL_TLDS.length)];
+        validateWebhookOnStartup();
     }
 
     /**
@@ -647,6 +508,89 @@ public class GatewayProperties {
         if (prompt.getTotalTimeout().compareTo(prompt.getReadTimeout().multipliedBy(2)) < 0) {
             throw new IllegalStateException(
                     "gateway.prompt.total-timeout must be >= 2x gateway.prompt.read-timeout");
+        }
+    }
+
+    /**
+     * GitLab Webhook Diff Trigger (threat model WHR-01..30): kill-switch pattern identical to
+     * {@link #validatePromptOnStartup()} -- {@code gateway.webhook.enabled=false} (the default) means
+     * none of this subtree is validated and none of it is required, so an upgraded Gateway keeps
+     * booting exactly as before this feature existed (WHT-24).
+     *
+     * <p>WHR-04: {@code secret-tokens} is operator-chosen (unlike the GitLab-issued {@code diffToken}),
+     * so SR-01's 32-char floor applies to every entry, same as the three bearer tokens.
+     */
+    private void validateWebhookOnStartup() {
+        if (!webhook.isEnabled()) {
+            log.warn("gateway.webhook.enabled=false: no inbound GitLab webhook endpoint is registered and "
+                    + "the reviewer sweep never runs (legacy CI-runner-pushed-diff behavior only)");
+            return;
+        }
+        if (webhook.getSecretTokens().isEmpty()) {
+            throw new IllegalStateException(
+                    "gateway.webhook.secret-tokens must have at least one entry when gateway.webhook.enabled=true (WHR-04) — refusing to start");
+        }
+        for (String token : webhook.getSecretTokens()) {
+            requireSecret("gateway.webhook.secret-tokens", token);
+        }
+        if (webhook.getBotUserId() == null || webhook.getBotUserId() <= 0) {
+            throw new IllegalStateException(
+                    "gateway.webhook.bot-user-id must be a positive GitLab numeric user id (WHR-03) — refusing to start");
+        }
+        if (webhook.getPath() == null || !webhook.getPath().startsWith("/")) {
+            throw new IllegalStateException("gateway.webhook.path must start with '/' — refusing to start");
+        }
+        if (webhook.getBotUsername() == null || !BOT_USERNAME_PATTERN.matcher(webhook.getBotUsername()).matches()) {
+            throw new IllegalStateException(
+                    "gateway.webhook.bot-username must match " + BOT_USERNAME_PATTERN.pattern()
+                            + " (F-WH-06 — it reaches a GitLab query parameter) — refusing to start");
+        }
+        requireGitLabToken("gateway.gitlab.diff-token", gitlab.getDiffToken());
+
+        if (webhook.getPromptVersion() == null || !PROMPT_VERSION_PATTERN.matcher(webhook.getPromptVersion()).matches()) {
+            throw new IllegalStateException(
+                    "gateway.webhook.prompt-version must match " + PROMPT_VERSION_PATTERN.pattern() + " — refusing to start");
+        }
+        if (!review.getAllowedPromptVersions().contains(webhook.getPromptVersion())) {
+            throw new IllegalStateException(
+                    "gateway.webhook.prompt-version (" + webhook.getPromptVersion()
+                            + ") must be present in gateway.review.allowed-prompt-versions (WHR-11) — refusing to start");
+        }
+
+        // WHT-06/WHR-09: the bot-is-reviewer check is a trigger, not an authorization boundary for the
+        // org-wide read_api diffToken -- an empty allowlist is a legitimate but loud operational choice.
+        if (webhook.getAllowedProjectIds().isEmpty()) {
+            log.warn("gateway.webhook.allowed-project-ids is empty: ANY project the webhook bot user can see "
+                    + "as a reviewer may have its diff fetched and stored (WHT-06) -- set this allowlist to "
+                    + "restrict which projects this Gateway instance will pull source code from");
+        }
+
+        if (webhook.getMaxRequestBodyBytes() < 1) {
+            throw new IllegalStateException("gateway.webhook.max-request-body-bytes must be >= 1; got: "
+                    + webhook.getMaxRequestBodyBytes());
+        }
+        if (webhook.getMaxConcurrentFetches() < 1) {
+            throw new IllegalStateException("gateway.webhook.max-concurrent-fetches must be >= 1; got: "
+                    + webhook.getMaxConcurrentFetches());
+        }
+        if (webhook.getMaxReviewsPerProjectPerHour() < 1 || webhook.getMaxReviewsPerHour() < 1) {
+            throw new IllegalStateException(
+                    "gateway.webhook.max-reviews-per-project-per-hour and gateway.webhook.max-reviews-per-hour "
+                            + "must both be >= 1 (WHR-22) — refusing to start");
+        }
+        Webhook.Sweep sweep = webhook.getSweep();
+        if (sweep.getMaxMrsPerTick() < 1 || sweep.getMaxDiagnosticCommentsPerTick() < 1
+                || sweep.getUpdatedWithinDays() < 1 || sweep.getMaxPages() < 1) {
+            throw new IllegalStateException(
+                    "gateway.webhook.sweep.* bounds must all be >= 1 (WHR-23) — refusing to start");
+        }
+        if (gitlab.getDiff().getMaxResponseBytes() < 1) {
+            throw new IllegalStateException("gateway.gitlab.diff.max-response-bytes must be >= 1; got: "
+                    + gitlab.getDiff().getMaxResponseBytes());
+        }
+        if (gitlab.getDiff().getMaxPages() < 1) {
+            throw new IllegalStateException("gateway.gitlab.diff.max-pages must be >= 1; got: "
+                    + gitlab.getDiff().getMaxPages());
         }
     }
 
@@ -1004,8 +948,18 @@ public class GatewayProperties {
          * {@link #toString()}, same as {@link #token}.
          */
         private String promptToken;
+        /**
+         * GitLab Webhook Diff Trigger (WHR-10, threat model WHT-06): a THIRD, distinct credential --
+         * {@code read_api}, scoped to the group(s) under webhook-triggered review -- used exclusively by
+         * {@code gitLabDiffRestClient}. Never the write-scoped {@link #token} above, never the same value
+         * as {@link #promptToken} (which is pinned to the small corporate-prompt-source project set,
+         * PMT-24) -- a leak of any one of the three stays bounded to its own blast radius. Masked by
+         * {@link #toString()}, same as the other two.
+         */
+        private String diffToken;
         private Duration connectTimeout = Duration.ofSeconds(5);
         private Duration readTimeout = Duration.ofSeconds(30);
+        private final DiffFetch diff = new DiffFetch();
 
         public String getBaseUrl() {
             return baseUrl;
@@ -1047,10 +1001,68 @@ public class GatewayProperties {
             this.readTimeout = readTimeout;
         }
 
+        public String getDiffToken() {
+            return diffToken;
+        }
+
+        public void setDiffToken(String diffToken) {
+            this.diffToken = diffToken;
+        }
+
+        public DiffFetch getDiff() {
+            return diff;
+        }
+
         @Override
         public String toString() {
             return "GitLab{baseUrl='" + baseUrl + "', token=" + (token == null ? "null" : "***MASKED***")
-                    + ", promptToken=" + (promptToken == null ? "null" : "***MASKED***") + "}";
+                    + ", promptToken=" + (promptToken == null ? "null" : "***MASKED***")
+                    + ", diffToken=" + (diffToken == null ? "null" : "***MASKED***") + "}";
+        }
+
+        /**
+         * GitLab Webhook Diff Trigger ({@code gateway.gitlab.diff.*}): bounds/timeouts for the
+         * {@code gitLabDiffRestClient}-served reads (WHR-06/WHR-18/WHR-19).
+         */
+        public static class DiffFetch {
+            /** WHR-19: bound for {@code BoundedInputStream} around {@code /compare}/{@code /changes}/notes/MR-list reads. */
+            private long maxResponseBytes = 5_000_000;
+            private Duration connectTimeout = Duration.ofSeconds(5);
+            private Duration readTimeout = Duration.ofSeconds(20);
+            /** WHR-18: bound on how many {@code X-Next-Page} pages any paginated read will follow. */
+            private int maxPages = 20;
+
+            public long getMaxResponseBytes() {
+                return maxResponseBytes;
+            }
+
+            public void setMaxResponseBytes(long maxResponseBytes) {
+                this.maxResponseBytes = maxResponseBytes;
+            }
+
+            public Duration getConnectTimeout() {
+                return connectTimeout;
+            }
+
+            public void setConnectTimeout(Duration connectTimeout) {
+                this.connectTimeout = connectTimeout;
+            }
+
+            public Duration getReadTimeout() {
+                return readTimeout;
+            }
+
+            public void setReadTimeout(Duration readTimeout) {
+                this.readTimeout = readTimeout;
+            }
+
+            public int getMaxPages() {
+                return maxPages;
+            }
+
+            public void setMaxPages(int maxPages) {
+                this.maxPages = maxPages;
+            }
         }
     }
 
@@ -1252,6 +1264,12 @@ public class GatewayProperties {
         private Duration heartbeatCheckInterval = Duration.ofSeconds(30);
         private Duration backendHealthInterval = Duration.ofSeconds(60);
         private Duration publishRetryInterval = Duration.ofSeconds(60);
+        /**
+         * GitLab Webhook Diff Trigger: how often {@code ReviewerSweepService} runs as a backstop against
+         * GitLab silently disabling the webhook (architectural decision #1 in the plan). A no-op tick
+         * when {@code gateway.webhook.enabled=false} (WHT-24).
+         */
+        private Duration reviewerSweepInterval = Duration.ofHours(1);
 
         public Duration getHeartbeatCheckInterval() {
             return heartbeatCheckInterval;
@@ -1275,6 +1293,14 @@ public class GatewayProperties {
 
         public void setPublishRetryInterval(Duration publishRetryInterval) {
             this.publishRetryInterval = publishRetryInterval;
+        }
+
+        public Duration getReviewerSweepInterval() {
+            return reviewerSweepInterval;
+        }
+
+        public void setReviewerSweepInterval(Duration reviewerSweepInterval) {
+            this.reviewerSweepInterval = reviewerSweepInterval;
         }
     }
 
@@ -1728,6 +1754,189 @@ public class GatewayProperties {
         public void setAllowedPromptVersions(Set<String> allowedPromptVersions) {
             this.allowedPromptVersions = allowedPromptVersions != null
                     ? allowedPromptVersions : new LinkedHashSet<>();
+        }
+    }
+
+    /**
+     * GitLab Webhook Diff Trigger ({@code gateway.webhook.*}, threat model WHR-01..30). Kill-switch
+     * pattern identical to {@link Prompt#enabled} (F-PM-02): {@link #enabled} defaults to {@code false}
+     * here AND in {@code application.yml} so the two can never disagree (WHT-24) -- an upgraded or
+     * freshly-deployed Gateway keeps accepting only CI-runner-pushed diffs until an operator explicitly
+     * provisions the webhook secret/bot user id/diff token and turns this on.
+     */
+    public static class Webhook {
+        private boolean enabled = false;
+        /**
+         * WHR-01/WHR-04: a SET (not a single value) so rotation is add -&gt; re-point GitLab -&gt; remove,
+         * with no delivery gap (SR-03's shape). Bound from a comma-separated
+         * {@code gateway.webhook.secret-tokens} property. Operator-chosen (unlike the GitLab-issued
+         * {@code diffToken}), so the SR-01 32-character floor applies to every entry.
+         */
+        private Set<String> secretTokens = new LinkedHashSet<>();
+        private String path = "/webhooks/gitlab";
+        /**
+         * WHR-03: the bot is matched by numeric GitLab user id, never username (a renameable,
+         * re-claimable value) -- this is the ONLY value the reviewer check trusts.
+         */
+        private Long botUserId;
+        /** Logging/sweep-query only (WHR-03) -- never part of the authorization decision itself. */
+        private String botUsername = "ai-review-bot";
+        /**
+         * WHR-09: deploy-time-only allowlist (never runtime-mutable -- PMR-30 discipline). Empty means
+         * "any project the bot user can see as a reviewer may be enrolled" -- a loud startup WARN fires
+         * for that case; this is a legitimate but explicitly-accepted operational choice, never a silent
+         * default.
+         */
+        private Set<Long> allowedProjectIds = new LinkedHashSet<>();
+        /** WHR-08: a webhook payload is small -- tens of KB is generous. */
+        private long maxRequestBodyBytes = 65_536;
+        /** WHR-11: the only {@code promptVersion} webhook/sweep-triggered Reviews are created with. */
+        private String promptVersion = "v2";
+        /** WHR-22: in-memory (single instance) per-project rate limit. */
+        private int maxReviewsPerProjectPerHour = 20;
+        /** WHR-22: in-memory (single instance) global rate limit, across every project. */
+        private int maxReviewsPerHour = 100;
+        /** WHR-25 (SHOULD): bounded concurrency permit around fetch+verify+assemble+create, PMR-19's pattern. */
+        private int maxConcurrentFetches = 4;
+        private final Sweep sweep = new Sweep();
+
+        public boolean isEnabled() {
+            return enabled;
+        }
+
+        public void setEnabled(boolean enabled) {
+            this.enabled = enabled;
+        }
+
+        public Set<String> getSecretTokens() {
+            return secretTokens;
+        }
+
+        public void setSecretTokens(Set<String> secretTokens) {
+            this.secretTokens = secretTokens != null ? secretTokens : new LinkedHashSet<>();
+        }
+
+        public String getPath() {
+            return path;
+        }
+
+        public void setPath(String path) {
+            this.path = path;
+        }
+
+        public Long getBotUserId() {
+            return botUserId;
+        }
+
+        public void setBotUserId(Long botUserId) {
+            this.botUserId = botUserId;
+        }
+
+        public String getBotUsername() {
+            return botUsername;
+        }
+
+        public void setBotUsername(String botUsername) {
+            this.botUsername = botUsername;
+        }
+
+        public Set<Long> getAllowedProjectIds() {
+            return allowedProjectIds;
+        }
+
+        public void setAllowedProjectIds(Set<Long> allowedProjectIds) {
+            this.allowedProjectIds = allowedProjectIds != null ? allowedProjectIds : new LinkedHashSet<>();
+        }
+
+        public long getMaxRequestBodyBytes() {
+            return maxRequestBodyBytes;
+        }
+
+        public void setMaxRequestBodyBytes(long maxRequestBodyBytes) {
+            this.maxRequestBodyBytes = maxRequestBodyBytes;
+        }
+
+        public String getPromptVersion() {
+            return promptVersion;
+        }
+
+        public void setPromptVersion(String promptVersion) {
+            this.promptVersion = promptVersion;
+        }
+
+        public int getMaxReviewsPerProjectPerHour() {
+            return maxReviewsPerProjectPerHour;
+        }
+
+        public void setMaxReviewsPerProjectPerHour(int maxReviewsPerProjectPerHour) {
+            this.maxReviewsPerProjectPerHour = maxReviewsPerProjectPerHour;
+        }
+
+        public int getMaxReviewsPerHour() {
+            return maxReviewsPerHour;
+        }
+
+        public void setMaxReviewsPerHour(int maxReviewsPerHour) {
+            this.maxReviewsPerHour = maxReviewsPerHour;
+        }
+
+        public int getMaxConcurrentFetches() {
+            return maxConcurrentFetches;
+        }
+
+        public void setMaxConcurrentFetches(int maxConcurrentFetches) {
+            this.maxConcurrentFetches = maxConcurrentFetches;
+        }
+
+        public Sweep getSweep() {
+            return sweep;
+        }
+
+        @Override
+        public String toString() {
+            return "Webhook{enabled=" + enabled + ", secretTokens=<" + secretTokens.size() + " masked>, path='"
+                    + path + "', botUserId=" + botUserId + ", allowedProjectIds=" + allowedProjectIds.size()
+                    + " entries}";
+        }
+
+        /** WHR-23: bounds on {@code ReviewerSweepService}'s per-tick GitLab org-wide read cost. */
+        public static class Sweep {
+            private int maxMrsPerTick = 200;
+            private int maxDiagnosticCommentsPerTick = 10;
+            private int updatedWithinDays = 30;
+            private int maxPages = 20;
+
+            public int getMaxMrsPerTick() {
+                return maxMrsPerTick;
+            }
+
+            public void setMaxMrsPerTick(int maxMrsPerTick) {
+                this.maxMrsPerTick = maxMrsPerTick;
+            }
+
+            public int getMaxDiagnosticCommentsPerTick() {
+                return maxDiagnosticCommentsPerTick;
+            }
+
+            public void setMaxDiagnosticCommentsPerTick(int maxDiagnosticCommentsPerTick) {
+                this.maxDiagnosticCommentsPerTick = maxDiagnosticCommentsPerTick;
+            }
+
+            public int getUpdatedWithinDays() {
+                return updatedWithinDays;
+            }
+
+            public void setUpdatedWithinDays(int updatedWithinDays) {
+                this.updatedWithinDays = updatedWithinDays;
+            }
+
+            public int getMaxPages() {
+                return maxPages;
+            }
+
+            public void setMaxPages(int maxPages) {
+                this.maxPages = maxPages;
+            }
         }
     }
 }

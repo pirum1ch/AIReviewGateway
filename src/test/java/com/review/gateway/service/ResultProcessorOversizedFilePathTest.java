@@ -15,6 +15,8 @@ import com.review.gateway.repository.ReviewEventRepository;
 import com.review.gateway.repository.ReviewJobRepository;
 import com.review.gateway.repository.ReviewResultRepository;
 import com.review.gateway.repository.ReviewRepository;
+import com.review.gateway.service.GitLabClient;
+import static org.mockito.Mockito.mock;
 import com.review.gateway.service.dto.SubmitResultCommand;
 import jakarta.persistence.EntityManager;
 import org.junit.jupiter.api.AfterEach;
@@ -32,11 +34,11 @@ import static org.assertj.core.api.Assertions.assertThatCode;
 
 /**
  * Gap-fill for {@code CommentParserTest}: SR-08/SR-09 require caps on the parsed comment <em>text</em>
- * (already covered — {@code commentLengthIsCappedWithTruncationMarker}), and {@link CommentParser} now
+ * (already covered â€” {@code commentLengthIsCappedWithTruncationMarker}), and {@link CommentParser} now
  * applies the equivalent cap to the LLM-controlled {@code filePath} field too
  * ({@code CommentParser.sanitize(...)} routes {@code candidate.filePath()} through
  * {@code sanitizeFilePath}: newline collapse, length cap to {@code review_comments.file_path
- * VARCHAR(1024)}, mention-neutralization, HTML-escape — F02-04/KD-2).
+ * VARCHAR(1024)}, mention-neutralization, HTML-escape â€” F02-04/KD-2).
  *
  * <p><b>Fixed (previously DEFECT, Important):</b> before this fix, an oversized {@code file_path} made
  * {@code persistCommentsAndComplete}'s {@code REQUIRES_NEW} transaction roll back with a
@@ -80,8 +82,8 @@ class ResultProcessorOversizedFilePathTest extends AbstractPostgresIntegrationTe
         GatewayProperties properties = new GatewayProperties();
         ChunkCoordinator chunkCoordinator = new ChunkCoordinator(reviewRepository, reviewJobRepository,
                 reviewChunkRepository, reviewCommentRepository, stateMachine, jobStateMachine, properties, entityManager, transactionManager);
-        RetryManager retryManager = new RetryManager(reviewJobRepository, jobStateMachine, chunkCoordinator,
-                properties, new TextSanitizer(), entityManager, transactionManager);
+        RetryManager retryManager = new RetryManager(reviewJobRepository, reviewRepository, jobStateMachine, chunkCoordinator,
+                properties, new TextSanitizer(), entityManager, transactionManager, mock(GitLabClient.class));
         CommentRenderer commentRenderer = new CommentRenderer(commentParser, new TextSanitizer(), properties);
         StructuredResponseParser structuredResponseParser = new StructuredResponseParser(
                 commentParser, commentRenderer, new TextSanitizer(), properties, new MetricsCounters());

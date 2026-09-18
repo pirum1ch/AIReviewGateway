@@ -1,0 +1,30 @@
+rules:
+  - id: gitlab-diff-fetch-must-use-bounded-exchange
+    languages: [java]
+    severity: ERROR
+    message: >
+      diff-fetch reads must use exchange(...) + BoundedInputStream (WHR-19, F-WH-09), never
+      .retrieve().body(...) -- the latter buffers the whole response before any size check runs
+      (F-DC-01 / PMT-13 / the fetchMergeRequest recurrence this rule exists to prevent).
+    patterns:
+      - pattern-either:
+          - pattern: $CLIENT.retrieve().body($T.class)
+          - pattern: $CLIENT.retrieve().body(new $TYPEREF())
+      - metavariable-regex:
+          metavariable: $CLIENT
+          regex: gitLabDiffRestClient|gitLabPromptRestClient
+
+  - id: gitlab-uri-must-not-be-concatenated
+    languages: [java]
+    severity: ERROR
+    message: >
+      Build GitLab request URIs from templated path segments and UriBuilder.queryParam only, never
+      by concatenating a variable into the URI/path/query string (WHR-06/SR-10/PMR-13).
+    patterns:
+      - pattern-either:
+          - pattern: $BUILDER.uri("..." + $X, ...)
+          - pattern: $BUILDER.uri($X + "...", ...)
+          - pattern: $BUILDER.queryParam($N, "..." + $X)
+          - pattern: $BUILDER.queryParam($N, $X + "...")
+          - pattern: $BUILDER.path("..." + $X)
+          - pattern: $BUILDER.path($X + "...")

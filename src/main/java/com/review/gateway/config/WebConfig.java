@@ -9,6 +9,15 @@ import org.springframework.core.Ordered;
  * Registers {@link RequestBodySizeLimitFilter} for the whole servlet container, ahead of Spring
  * Security's filter chain (SR-11: reject an oversized body before any other processing, including
  * authentication, so a flood of huge unauthenticated requests still gets a fast, cheap rejection).
+ *
+ * <p><b>WHR-08 (QA finding, GitLab Webhook Diff Trigger):</b> {@link RequestBodySizeLimitFilter} itself
+ * has always known how to cap {@code gateway.webhook.path} (see its own {@code webhookPattern} field),
+ * but this bean's {@code addUrlPatterns} — the servlet container's own URL mapping, evaluated before the
+ * filter's Java code ever runs — never included it, so the filter was never actually invoked for that
+ * path in the real running application; only direct unit tests calling {@code doFilterInternal} in
+ * isolation exercised that branch. Registered unconditionally (harmless when
+ * {@code gateway.webhook.enabled=false}: the filter's own {@code webhookPattern} is {@code null} then,
+ * so it no-ops, and no controller exists to serve the path anyway — WHT-24).
  */
 @Configuration
 public class WebConfig {
@@ -18,12 +27,7 @@ public class WebConfig {
         FilterRegistrationBean<RequestBodySizeLimitFilter> registration =
                 new FilterRegistrationBean<>(new RequestBodySizeLimitFilter(properties));
         registration.setOrder(Ordered.HIGHEST_PRECEDENCE);
-        // BSQ-11 (Backend Self-Registration): registered unconditionally, regardless of
-        // gateway.backend.self-registration.enabled -- a cap on a path that 403s/404s when the feature is
-        // off costs nothing, and the filter would otherwise never be invoked for these paths at all (the
-        // servlet container only calls a filter for the URL patterns it is registered against here --
-        // adding a PathPattern inside the filter class alone does NOT do this).
-        registration.addUrlPatterns("/reviews", "/jobs/*", "/backends", "/backends/announce");
+        registration.addUrlPatterns("/reviews", "/jobs/*", properties.getWebhook().getPath());
         return registration;
     }
 }

@@ -238,4 +238,90 @@ class RequestBodySizeLimitFilterTest {
                 .doesNotContain("Exception")
                 .doesNotContain("at com.review");
     }
+
+    // =================================================================================================
+    // GitLab Webhook Diff Trigger: WHR-08 (webhook path joins the capped-endpoint list) / WOR-09 lesson
+    // explicitly re-applied to the new endpoint (threat model §7 non-regression set).
+    //
+    // Every test above constructs `filter` from a properties instance with `gateway.webhook.enabled`
+    // left at its default `false` -- so `webhookPattern` is null and none of them touch this branch at
+    // all. These are the first tests to exercise it.
+    // =================================================================================================
+
+    private RequestBodySizeLimitFilter webhookEnabledFilter(long maxWebhookBodyBytes) {
+        GatewayProperties webhookProperties = new GatewayProperties();
+        webhookProperties.getWebhook().setEnabled(true);
+        webhookProperties.getWebhook().setMaxRequestBodyBytes(maxWebhookBodyBytes);
+        return new RequestBodySizeLimitFilter(webhookProperties);
+    }
+
+    @Test
+    void webhookPathOverLimitIsRejectedWith413WhenFeatureEnabled() throws Exception {
+        RequestBodySizeLimitFilter filter = webhookEnabledFilter(64);
+        MockHttpServletRequest request = new MockHttpServletRequest("POST", "/webhooks/gitlab");
+        request.setContent(new byte[65]);
+        MockHttpServletResponse response = new MockHttpServletResponse();
+        FilterChain chain = Mockito.mock(FilterChain.class);
+
+        filter.doFilterInternal(request, response, chain);
+
+        assertThat(response.getStatus()).isEqualTo(413);
+        assertThat(response.getContentAsString()).contains("PAYLOAD_TOO_LARGE");
+        verify(chain, never()).doFilter(Mockito.any(), Mockito.any());
+    }
+
+    @Test
+    void webhookPathAtOrUnderLimitPassesThroughWhenFeatureEnabled() throws Exception {
+        RequestBodySizeLimitFilter filter = webhookEnabledFilter(64);
+        MockHttpServletRequest request = new MockHttpServletRequest("POST", "/webhooks/gitlab");
+        request.setContent(new byte[64]);
+        MockHttpServletResponse response = new MockHttpServletResponse();
+        FilterChain chain = Mockito.mock(FilterChain.class);
+
+        filter.doFilterInternal(request, response, chain);
+
+        verify(chain).doFilter(request, response);
+    }
+
+    @Test
+    void webhookPathIsNotSizeLimitedAtAllWhenFeatureDisabled() throws Exception {
+        // Default properties: gateway.webhook.enabled=false -- webhookPattern is null (WHT-24), so this
+        // filter must never even attempt to match against the (unregistered) webhook path.
+        MockHttpServletRequest request = new MockHttpServletRequest("POST", "/webhooks/gitlab");
+        request.setContent(new byte[999_999]);
+        MockHttpServletResponse response = new MockHttpServletResponse();
+        FilterChain chain = Mockito.mock(FilterChain.class);
+
+        filter.doFilterInternal(request, response, chain);
+
+        verify(chain).doFilter(request, response); // passes through untouched -- not this filter's concern when disabled
+    }
+
+    @Test
+    void percentEncodedWebhookPathCannotBypassTheCapWhenFeatureEnabled() throws Exception {
+        // WOR-09/WHR-08: "%67itlab" decodes to "gitlab" -- must be capped exactly like the plain path.
+        RequestBodySizeLimitFilter filter = webhookEnabledFilter(64);
+        MockHttpServletRequest request = new MockHttpServletRequest("POST", "/webhooks/%67itlab");
+        request.setContent(new byte[999_999]);
+        MockHttpServletResponse response = new MockHttpServletResponse();
+        FilterChain chain = Mockito.mock(FilterChain.class);
+
+        filter.doFilterInternal(request, response, chain);
+
+        assertThat(response.getStatus()).isEqualTo(413);
+        verify(chain, never()).doFilter(Mockito.any(), Mockito.any());
+    }
+
+    @Test
+    void percentEncodedWebhookPathUnderLimitStillPassesThroughWhenFeatureEnabled() throws Exception {
+        RequestBodySizeLimitFilter filter = webhookEnabledFilter(64);
+        MockHttpServletRequest request = new MockHttpServletRequest("POST", "/webhooks/%67itlab");
+        request.setContent(new byte[64]);
+        MockHttpServletResponse response = new MockHttpServletResponse();
+        FilterChain chain = Mockito.mock(FilterChain.class);
+
+        filter.doFilterInternal(request, response, chain);
+
+        verify(chain).doFilter(request, response);
+    }
 }

@@ -248,6 +248,30 @@ class GatewayPropertiesPromptValidationTest {
         }).doesNotThrowAnyException();
     }
 
+    /** F-WH-08/WHR-10/WHR-29: the diff-fetch token must never appear verbatim in {@code GitLab#toString()}. */
+    @Test
+    void diffTokenIsMaskedInToString() {
+        GatewayProperties properties = validProperties();
+        properties.getGitlab().setDiffToken("f".repeat(32));
+
+        String rendered = properties.getGitlab().toString();
+
+        assertThat(rendered).doesNotContain("f".repeat(32));
+        assertThat(rendered).contains("diffToken=***MASKED***");
+    }
+
+    /** F-WH-08/WHR-29: the webhook secret tokens must never appear verbatim in {@code Webhook#toString()}. */
+    @Test
+    void webhookSecretTokensAreMaskedInToString() {
+        GatewayProperties properties = validProperties();
+        properties.getWebhook().setSecretTokens(java.util.Set.of("g".repeat(32)));
+
+        String rendered = properties.getWebhook().toString();
+
+        assertThat(rendered).doesNotContain("g".repeat(32));
+        assertThat(rendered).contains("masked");
+    }
+
     // ---- overrides ----
 
     @Test

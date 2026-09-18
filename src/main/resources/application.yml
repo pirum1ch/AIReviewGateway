@@ -66,6 +66,16 @@ gateway:
     prompt-token: ${GITLAB_PROMPT_TOKEN:}   # read-only токен GitLab для Prompt Manager (чтение корпоративных/проектных промпт-файлов из репозиториев)
     connect-timeout: 5s             # таймаут установления TCP-соединения с GitLab API
     read-timeout: 30s               # таймаут ожидания ответа от GitLab API
+    # GitLab Webhook Diff Trigger (WHR-10): ТРЕТИЙ, отдельный read_api токен -- никогда не тот же, что
+    # token (запись) или prompt-token (корпоративные промпты). Требуется (проверяется на наличие) только
+    # если gateway.webhook.enabled=true. DEPLOYMENT.md: group access token, read_api-only, scoped to the
+    # group under review, with an expiry -- never a personal/admin token.
+    diff-token: ${GITLAB_DIFF_TOKEN:}   # read-only токен GitLab для получения diff'ов по вебхуку (widened read_api, group-scoped)
+    diff:
+      max-response-bytes: ${GITLAB_DIFF_MAX_RESPONSE_BYTES:5000000}   # WHR-19 bounded-read cap for /compare, /changes, notes, MR-list responses
+      connect-timeout: 5s
+      read-timeout: 20s
+      max-pages: 20              # WHR-18: bound on how many X-Next-Page pages any paginated read follows
   backend:
     connect-timeout: 3s             # таймаут установления соединения с backend'ом (llama-server) при health-пробе
     read-timeout: 10s               # WOC-16: raised from 5s -- safe because WOC-14 moved probe I/O
@@ -192,6 +202,7 @@ gateway:
     heartbeat-check-interval: 30s   # как часто фоновый планировщик проверяет джобы на "зависание" по heartbeat
     backend-health-interval: 60s    # как часто планировщик опрашивает backend'ы (llama-server) для проверки их состояния
     publish-retry-interval: 60s     # как часто планировщик повторяет неудавшиеся попытки публикации комментариев в GitLab
+    reviewer-sweep-interval: 1h     # GitLab Webhook Diff Trigger: как часто ReviewerSweepService подстраховывает вебхук (backstop); no-op при gateway.webhook.enabled=false
 
   # ---- §G Allowlist версий промпта ---------------------------------------------------------------
   # Structured Review Output (threat model SOR-08, CRITICAL): allowlist прикладного значения
@@ -200,6 +211,29 @@ gateway:
   # v3.yml (порядок разворачивания: сначала Worker'ы, потом Gateway, §11).
   review:
     allowed-prompt-versions: ${ALLOWED_PROMPT_VERSIONS:v1,v2}   # allowlist значений promptVersion, принимаемых POST /reviews; "v3" добавляется явно оператором после разворачивания Worker'ов с v3.yml
+
+  # ---- §H GitLab Webhook Diff Trigger (опционально, kill-switch по умолчанию выключен) ----------
+  # Заменяет CI-раннер как источник diff'а: ревью запускается автоматически по вебхуку GitLab, когда
+  # бот назначен ревьюером на MR, и повторяется на каждый новый пуш. Полностью аддитивно -- при
+  # enabled=false ни матчер, ни фильтр, ни контроллер, ни sweep не регистрируются (WHT-24). См.
+  # docs/gitlab-webhook-trigger-threat-model.md (WHR-01..30) для полного обоснования каждого параметра.
+  webhook:
+    enabled: ${WEBHOOK_ENABLED:false}   # kill-switch: F-PM-02-style -- ОБЯЗАН совпадать со значением по умолчанию в GatewayProperties.Webhook#enabled
+    secret-tokens: ${WEBHOOK_SECRET_TOKENS:}   # comma-separated набор секретов X-Gitlab-Token (WHR-04); каждый >= 32 символов; ротация = добавить новый -> перенастроить GitLab -> удалить старый
+    path: ${WEBHOOK_PATH:/webhooks/gitlab}     # путь, на который GitLab шлёт merge_request-события
+    bot-user-id: ${WEBHOOK_BOT_USER_ID:}       # числовой GitLab user id бота-ревьювера (WHR-03) -- НИКОГДА не username
+    bot-username: ${WEBHOOK_BOT_USERNAME:ai-review-bot}   # только для логов и sweep-запроса reviewer_username -- не участвует в авторизации
+    allowed-project-ids: ${WEBHOOK_ALLOWED_PROJECT_IDS:}   # comma-separated allowlist project id (WHR-09); пусто = allow-all с громким WARN при старте
+    max-request-body-bytes: ${WEBHOOK_MAX_REQUEST_BODY_BYTES:65536}   # WHR-08 edge cap for the webhook endpoint
+    prompt-version: ${WEBHOOK_PROMPT_VERSION:v2}   # promptVersion, с которым создаются вебхук/sweep-ревью (WHR-11); должен быть в gateway.review.allowed-prompt-versions
+    max-reviews-per-project-per-hour: 20   # WHR-22 in-memory rate limit (per project)
+    max-reviews-per-hour: 100              # WHR-22 in-memory rate limit (global, across all projects)
+    max-concurrent-fetches: 4              # WHR-25 bounded concurrency permit around fetch+verify+assemble+create
+    sweep:
+      max-mrs-per-tick: 200                # WHR-23: верхняя граница MR, обрабатываемых за один тик sweep
+      max-diagnostic-comments-per-tick: 10  # WHR-24: верхняя граница диагностических комментариев за тик (защита бюджета write-токена)
+      updated-within-days: 30               # WHR-23: MR, не обновлявшиеся дольше этого срока, не попадают в кандидаты sweep
+      max-pages: 20                         # WHR-18/WHR-23: верхняя граница страниц GET /merge_requests за тик
 
 # ПРИМЕЧАНИЕ: gateway.security.*/gateway.gitlab.token ОБЯЗАНЫ быть длиной >=32 символов (SR-01), а
 # gateway.gitlab.base-url ОБЯЗАН начинаться с https:// (SR-15) -- иначе GatewayProperties прерывает

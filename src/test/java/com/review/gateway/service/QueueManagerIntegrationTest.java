@@ -18,6 +18,8 @@ import com.review.gateway.repository.ReviewInputRepository;
 import com.review.gateway.repository.ReviewJobRepository;
 import com.review.gateway.repository.ReviewPromptSectionRepository;
 import com.review.gateway.repository.ReviewRepository;
+import com.review.gateway.service.GitLabClient;
+import static org.mockito.Mockito.mock;
 import com.review.gateway.service.dto.ClaimedJob;
 import com.review.gateway.service.dto.HeartbeatOutcome;
 import com.review.gateway.service.dto.HeartbeatResult;
@@ -50,11 +52,11 @@ import static org.mockito.Mockito.when;
  *
  * <p>{@code @Transactional(NOT_SUPPORTED)}: {@link QueueManager#claim} (CSR-17) genuinely opens its own
  * separate, independently-committed transactions (via {@code TransactionTemplate}, not a proxied
- * {@code @Transactional} — this works even though {@code QueueManager} is constructed directly here,
+ * {@code @Transactional} â€” this works even though {@code QueueManager} is constructed directly here,
  * bypassing Spring AOP, precisely because {@code TransactionTemplate} manages the transaction itself).
  * Fixture rows must therefore be genuinely committed (not merely flushed within an ambient, never-
  * committed per-test transaction) for {@code claim}'s separate transaction to see them under
- * read-committed isolation — exactly the same reasoning as {@code ResultProcessorTest}.
+ * read-committed isolation â€” exactly the same reasoning as {@code ResultProcessorTest}.
  */
 @Transactional(propagation = Propagation.NOT_SUPPORTED)
 class QueueManagerIntegrationTest extends AbstractPostgresIntegrationTest {
@@ -96,8 +98,8 @@ class QueueManagerIntegrationTest extends AbstractPostgresIntegrationTest {
                 reviewChunkRepository, reviewCommentRepository, stateMachine, jobStateMachine, properties, entityManager, transactionManager);
         ChunkContextRenderer chunkContextRenderer = new ChunkContextRenderer(properties, new TextSanitizer());
         PromptMessageFormatter promptMessageFormatter = new PromptMessageFormatter(properties, new PromptAssembler(properties, new DiffSizeValidator(properties)));
-        RetryManager retryManager = new RetryManager(reviewJobRepository, jobStateMachine, chunkCoordinator,
-                properties, new TextSanitizer(), entityManager, transactionManager);
+        RetryManager retryManager = new RetryManager(reviewJobRepository, reviewRepository, jobStateMachine, chunkCoordinator,
+                properties, new TextSanitizer(), entityManager, transactionManager, mock(GitLabClient.class));
         return new QueueManager(reviewRepository, reviewJobRepository, reviewChunkRepository,
                 reviewPromptSectionRepository, backendDispatcher, jobStateMachine, chunkCoordinator, eventService,
                 resultProcessor, chunkContextRenderer, promptMessageFormatter, retryManager, new TextSanitizer(),
@@ -133,7 +135,7 @@ class QueueManagerIntegrationTest extends AbstractPostgresIntegrationTest {
         assertThat(claimed).isPresent();
         assertThat(claimed.get().reviewId()).isEqualTo(review.getId());
         assertThat(claimed.get().diff()).isEqualTo("diff-sha-a");
-        assertThat(claimed.get().chunkContext()).isNull(); // single chunk -> no context header (§8)
+        assertThat(claimed.get().chunkContext()).isNull(); // single chunk -> no context header (Â§8)
 
         Review reloaded = reviewRepository.findById(review.getId()).orElseThrow();
         assertThat(reloaded.getStatus()).isEqualTo(ReviewStatus.RUNNING);

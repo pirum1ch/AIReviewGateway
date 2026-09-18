@@ -17,6 +17,8 @@ import com.review.gateway.repository.ReviewInputRepository;
 import com.review.gateway.repository.ReviewJobRepository;
 import com.review.gateway.repository.ReviewPromptSectionRepository;
 import com.review.gateway.repository.ReviewRepository;
+import com.review.gateway.service.GitLabClient;
+import static org.mockito.Mockito.mock;
 import com.review.gateway.service.dto.ClaimedJob;
 import jakarta.persistence.EntityManager;
 import org.junit.jupiter.api.AfterEach;
@@ -35,7 +37,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 /**
  * Fills a coverage gap in {@link QueueManagerIntegrationTest}: that suite proves claim's capacity/
- * status/payload behavior but never exercises the ordering guarantee itself (architecture §5 step 2:
+ * status/payload behavior but never exercises the ordering guarantee itself (architecture Â§5 step 2:
  * {@code ORDER BY priority DESC, created_at ASC}, now on {@code review_jobs} as of V2 diff chunking).
  *
  * <p>{@code @Transactional(NOT_SUPPORTED)}: see {@code QueueManagerIntegrationTest}'s javadoc for why.
@@ -81,8 +83,8 @@ class QueueManagerPriorityOrderingIntegrationTest extends AbstractPostgresIntegr
                 entityManager, transactionManager);
         ChunkContextRenderer chunkContextRenderer = new ChunkContextRenderer(properties, new TextSanitizer());
         PromptMessageFormatter promptMessageFormatter = new PromptMessageFormatter(properties, new PromptAssembler(properties, new DiffSizeValidator(properties)));
-        RetryManager retryManager = new RetryManager(reviewJobRepository, jobStateMachine, chunkCoordinator,
-                properties, new TextSanitizer(), entityManager, transactionManager);
+        RetryManager retryManager = new RetryManager(reviewJobRepository, reviewRepository, jobStateMachine, chunkCoordinator,
+                properties, new TextSanitizer(), entityManager, transactionManager, mock(GitLabClient.class));
         return new QueueManager(reviewRepository, reviewJobRepository, reviewChunkRepository,
                 reviewPromptSectionRepository, backendDispatcher, jobStateMachine, chunkCoordinator, eventService,
                 Mockito.mock(ResultProcessor.class), chunkContextRenderer, promptMessageFormatter, retryManager,

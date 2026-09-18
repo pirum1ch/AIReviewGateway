@@ -14,6 +14,8 @@ import com.review.gateway.repository.ReviewCommentRepository;
 import com.review.gateway.repository.ReviewEventRepository;
 import com.review.gateway.repository.ReviewJobRepository;
 import com.review.gateway.repository.ReviewRepository;
+import com.review.gateway.service.GitLabClient;
+import static org.mockito.Mockito.mock;
 import com.review.gateway.service.dto.RequeueOutcome;
 import jakarta.persistence.EntityManager;
 import org.junit.jupiter.api.AfterEach;
@@ -76,8 +78,8 @@ class RetryManagerTest extends AbstractPostgresIntegrationTest {
         }
         ChunkCoordinator chunkCoordinator = new ChunkCoordinator(reviewRepository, reviewJobRepository,
                 reviewChunkRepository, reviewCommentRepository, stateMachine, jobStateMachine, properties, entityManager, transactionManager);
-        return new RetryManager(reviewJobRepository, jobStateMachine, chunkCoordinator, properties,
-                new TextSanitizer(), entityManager, transactionManager);
+        return new RetryManager(reviewJobRepository, reviewRepository, jobStateMachine, chunkCoordinator, properties,
+                new TextSanitizer(), entityManager, transactionManager, mock(GitLabClient.class));
     }
 
     private Review persistRunningReview(String headSha) {
@@ -267,7 +269,7 @@ class RetryManagerTest extends AbstractPostgresIntegrationTest {
     }
 
     /**
-     * Sibling cancellation on chunk-job permanent failure (§4): once one chunk job exhausts its
+     * Sibling cancellation on chunk-job permanent failure (Â§4): once one chunk job exhausts its
      * retries and lands FAILED, the parent Review transitions to FAILED and every other non-terminal
      * sibling job (QUEUED or RUNNING) is cancelled in the same transaction (parent-then-child, CSR-17).
      */

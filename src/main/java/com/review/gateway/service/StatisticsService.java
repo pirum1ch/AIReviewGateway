@@ -112,8 +112,8 @@ public class StatisticsService {
                 metricsCounters.ownershipMismatchSnapshot(), metricsCounters.workerFailureReportsIgnoredCount(),
                 metricsCounters.legacyParseFallbackCount(), metricsCounters.structuredValidationFailuresSnapshot(),
                 metricsCounters.structuredConstraintSentSnapshot(), metricsCounters.structuredFallbackUsedCount(),
-                metricsCounters.structuredFieldTruncatedSnapshot(), metricsCounters.backendAnnounceRejectedSnapshot(),
-                metricsCounters.backendUrlRepointedCount());
+                metricsCounters.structuredFieldTruncatedSnapshot(), metricsCounters.webhookDiffIntegrityFailuresSnapshot(),
+                metricsCounters.webhookRateLimitedCount(), metricsCounters.webhookUnexpectedFailureCount());
     }
 
     private double nullToZero(Double value) {

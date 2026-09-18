@@ -28,6 +28,7 @@ public record MetricsSnapshot(
         Map<String, Long> structuredConstraintSent,
         long structuredFallbackUsed,
         Map<String, Long> structuredFieldTruncated,
-        Map<String, Long> backendAnnounceRejected,
-        long backendUrlRepointed) {
+        Map<String, Long> webhookDiffIntegrityFailures,
+        long webhookRateLimited,
+        long webhookUnexpectedFailure) {
 }
