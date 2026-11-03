@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 
 # --- Build stage: compile the fat jar with Maven + JDK 21 ---
-FROM --platform=linux/amd64 maven:3.9-eclipse-temurin-21 AS build
+FROM maven:3.9-eclipse-temurin-21 AS build
 WORKDIR /build
 
 # Cache dependency resolution separately from source changes.
@@ -12,7 +12,7 @@ COPY src ./src
 RUN --mount=type=cache,target=/root/.m2 mvn -q -B -DskipTests package
 
 # --- Runtime stage: JRE only, non-root user ---
-FROM --platform=linux/amd64 eclipse-temurin:21-jre-jammy
+FROM eclipse-temurin:21-jre-jammy
 RUN apt-get update \
     && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/* \
