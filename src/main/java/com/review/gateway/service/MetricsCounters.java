@@ -174,6 +174,14 @@ public class MetricsCounters {
         return webhookUnexpectedFailure.get();
     }
 
+    public Map<String, Long> backendAnnounceRejectedSnapshot() {
+        return snapshotOf(backendAnnounceRejected);
+    }
+
+    public long backendUrlRepointedCount() {
+        return backendUrlRepointed.get();
+    }
+
     private Map<String, Long> snapshotOf(Map<String, AtomicLong> counters) {
         Map<String, Long> snapshot = new LinkedHashMap<>();
         counters.forEach((key, count) -> snapshot.put(key, count.get()));
