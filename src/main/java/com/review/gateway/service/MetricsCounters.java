@@ -122,6 +122,16 @@ public class MetricsCounters {
         webhookUnexpectedFailure.incrementAndGet();
     }
 
+    /** @param reason one of the closed Gateway-side reason vocabulary (NAME_TAKEN/URL_REJECTED/VALIDATION/REGISTRY_FULL). */
+    public void incrementBackendAnnounceRejected(String reason) {
+        backendAnnounceRejected.computeIfAbsent(reason, key -> new AtomicLong()).incrementAndGet();
+    }
+
+    /** BSQ-15: every accepted ownership claim or URL change via self-announce. */
+    public void incrementBackendUrlRepointed() {
+        backendUrlRepointed.incrementAndGet();
+    }
+
     public Map<String, Long> ownershipMismatchSnapshot() {
         Map<String, Long> snapshot = new LinkedHashMap<>();
         ownershipMismatches.forEach((endpoint, count) -> snapshot.put(endpoint, count.get()));
