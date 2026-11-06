@@ -52,6 +52,7 @@ public class SecurityConfig {
     @Bean
     public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
         boolean webhookEnabled = properties.getWebhook().isEnabled();
+        boolean selfRegEnabled = properties.getBackend().getSelfRegistration().isEnabled();
         http
                 .csrf(AbstractHttpConfigurer::disable)
                 .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
@@ -60,11 +61,16 @@ public class SecurityConfig {
                             .requestMatchers(EndpointRequest.to("health")).permitAll()
                             .requestMatchers(HttpMethod.DELETE, "/reviews/**").hasRole("ADMIN")
                             .requestMatchers(HttpMethod.GET, "/backends", "/backends/**").hasRole("ADMIN")
+                            .requestMatchers(HttpMethod.POST, "/backends").hasRole("ADMIN")
+                            .requestMatchers(HttpMethod.DELETE, "/backends/**").hasRole("ADMIN")
                             .requestMatchers(HttpMethod.GET, "/metrics", "/metrics/**").hasRole("ADMIN")
                             .requestMatchers("/reviews/**").hasRole("CI")
                             .requestMatchers("/jobs/**").hasRole("WORKER");
                     if (webhookEnabled) {
                         auth.requestMatchers(HttpMethod.POST, properties.getWebhook().getPath()).hasRole("WEBHOOK");
+                    }
+                    if (selfRegEnabled) {
+                        auth.requestMatchers(HttpMethod.POST, "/backends/announce").hasRole("WORKER");
                     }
                     auth.anyRequest().denyAll();
                 })
