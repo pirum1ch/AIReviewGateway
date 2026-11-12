@@ -27,5 +27,10 @@ public record MetricsResponse(
         Map<String, Long> structuredFieldTruncated,
         Map<String, Long> webhookDiffIntegrityFailures,
         long webhookRateLimited,
-        long webhookUnexpectedFailure) {
+        long webhookUnexpectedFailure,
+        boolean positionAnchoringEnabled,
+        long positionsAnchored,
+        long positionsUnresolved,
+        long diffRefsUnavailable,
+        long positionRejectedByGitLab) {
 }

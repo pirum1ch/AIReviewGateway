@@ -136,7 +136,7 @@ class WebhookReviewTriggerServiceTest {
         service.handle(PROJECT_ID, MR_IID, null);
 
         verify(reviewService, never()).createReview(any());
-        verify(gitLabClient, never()).postDiscussion(anyLong(), anyLong(), anyString());
+        verify(gitLabClient, never()).postDiscussion(anyLong(), anyLong(), anyString(), any());
     }
 
     @Test
@@ -150,7 +150,7 @@ class WebhookReviewTriggerServiceTest {
 
         verify(reviewService, never()).createReview(any());
         verify(metricsCounters).incrementWebhookDiffIntegrityFailure("DIFF_TOO_LARGE_OR_TRUNCATED");
-        verify(gitLabClient, times(1)).postDiscussion(eq(PROJECT_ID), eq(MR_IID), anyString());
+        verify(gitLabClient, times(1)).postDiscussion(eq(PROJECT_ID), eq(MR_IID), anyString(), any());
     }
 
     @Test
@@ -164,7 +164,7 @@ class WebhookReviewTriggerServiceTest {
 
         service.handle(PROJECT_ID, MR_IID, null);
 
-        verify(gitLabClient, never()).postDiscussion(anyLong(), anyLong(), anyString());
+        verify(gitLabClient, never()).postDiscussion(anyLong(), anyLong(), anyString(), any());
         // WHR-28: the authoritative signal still fires even though the courtesy comment is suppressed.
         verify(metricsCounters).incrementWebhookDiffIntegrityFailure("DIFF_UNAVAILABLE");
     }
@@ -179,7 +179,7 @@ class WebhookReviewTriggerServiceTest {
 
         service.handle(PROJECT_ID, MR_IID, null);
 
-        verify(gitLabClient, never()).postDiscussion(anyLong(), anyLong(), anyString());
+        verify(gitLabClient, never()).postDiscussion(anyLong(), anyLong(), anyString(), any());
         // WHR-28: the authoritative signal still fires even though the courtesy comment is suppressed.
         verify(metricsCounters).incrementWebhookDiffIntegrityFailure("DIFF_UNAVAILABLE");
     }
@@ -196,7 +196,7 @@ class WebhookReviewTriggerServiceTest {
 
         service.handle(PROJECT_ID, MR_IID, null);
 
-        verify(gitLabClient, times(1)).postDiscussion(eq(PROJECT_ID), eq(MR_IID), anyString());
+        verify(gitLabClient, times(1)).postDiscussion(eq(PROJECT_ID), eq(MR_IID), anyString(), any());
     }
 
     @Test
@@ -208,7 +208,7 @@ class WebhookReviewTriggerServiceTest {
         service.handle(PROJECT_ID, MR_IID, null, false);
 
         verify(gitLabClient, never()).listRecentNotes(anyLong(), anyLong());
-        verify(gitLabClient, never()).postDiscussion(anyLong(), anyLong(), anyString());
+        verify(gitLabClient, never()).postDiscussion(anyLong(), anyLong(), anyString(), any());
         verify(metricsCounters).incrementWebhookDiffIntegrityFailure("DIFF_UNSUPPORTED_CONTENT");
     }
 
@@ -256,7 +256,7 @@ class WebhookReviewTriggerServiceTest {
         assertThatCode(() -> service.handle(PROJECT_ID, MR_IID, null)).doesNotThrowAnyException();
 
         verify(metricsCounters).incrementWebhookUnexpectedFailure();
-        verify(gitLabClient, never()).postDiscussion(anyLong(), anyLong(), anyString());
+        verify(gitLabClient, never()).postDiscussion(anyLong(), anyLong(), anyString(), any());
     }
 
     /**

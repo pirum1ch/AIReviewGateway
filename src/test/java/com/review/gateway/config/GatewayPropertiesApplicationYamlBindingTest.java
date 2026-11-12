@@ -53,6 +53,17 @@ class GatewayPropertiesApplicationYamlBindingTest {
     private static final Path APPLICATION_YAML = Path.of("src/main/resources/application.yml");
 
     private GatewayProperties.Backend bindShippedBackendConfig() throws Exception {
+        return bindShippedConfig("gateway.backend", GatewayProperties::getBackend);
+    }
+
+    /** F-DP-03: twin of {@link #bindShippedBackendConfig()} for {@code gateway.publish} -- same
+     * config-data-path caveat, same fix. */
+    private GatewayProperties.Publish bindShippedPublishConfig() throws Exception {
+        return bindShippedConfig("gateway.publish", GatewayProperties::getPublish);
+    }
+
+    private <T> T bindShippedConfig(String prefix, java.util.function.Function<GatewayProperties, T> subtree)
+            throws Exception {
         assertThat(Files.exists(APPLICATION_YAML))
                 .as("expected to find %s relative to the Maven module working directory", APPLICATION_YAML)
                 .isTrue();
@@ -69,13 +80,14 @@ class GatewayPropertiesApplicationYamlBindingTest {
         // a bare Binder (no PlaceholdersResolver) leaves an unset placeholder as its literal, unresolved
         // "${VAR:default}" text, which happened to silently "work" for the String-typed
         // allowed-host-pattern field but hard-fails Binder's boolean/int conversion for the new fields.
+        // F-DP-03: same fix applies to gateway.publish.position-anchoring-enabled (${POSITION_ANCHORING_ENABLED:true}).
         // Resolving placeholders against these same property sources first (exactly what the real
         // ConfigData/Environment machinery does at production boot) is what this test's own docstring
         // already claims to reproduce.
         Binder binder = new Binder(ConfigurationPropertySources.from(mutableSources),
                 new PropertySourcesPlaceholdersResolver(mutableSources));
-        binder.bind("gateway.backend", Bindable.ofInstance(properties.getBackend()));
-        return properties.getBackend();
+        binder.bind(prefix, Bindable.ofInstance(subtree.apply(properties)));
+        return subtree.apply(properties);
     }
 
     @Test
@@ -98,5 +110,25 @@ class GatewayPropertiesApplicationYamlBindingTest {
         // Sanity companion: connect-timeout was NOT supposed to change (WOC-16 only raises read-timeout).
         GatewayProperties.Backend backend = bindShippedBackendConfig();
         assertThat(backend.getConnectTimeout()).isEqualTo(Duration.ofSeconds(3));
+    }
+
+    /**
+     * F-DP-03: DPR-10 requires {@code GatewayProperties.Publish#positionAnchoringEnabled}'s Java default
+     * to equal {@code application.yml}'s {@code gateway.publish.position-anchoring-enabled} default --
+     * the exact drift class that has already shipped three times in this repo for want of this test
+     * (F-PM-02, F-DC-04, WOC-16 above). {@code AdminControllerTest}'s {@code positionAnchoringEnabled}
+     * assertion does not cover this: it binds {@code GatewayProperties} against the test classpath's
+     * {@code application.yml} (which has no {@code gateway.publish} override at all), never the shipped
+     * {@code src/main/resources/application.yml} -- this test is the only one that actually does.
+     */
+    @Test
+    void shippedApplicationYamlBindsPositionAnchoringEnabledToTheJavaDefault() throws Exception {
+        GatewayProperties.Publish publish = bindShippedPublishConfig();
+
+        assertThat(publish.isPositionAnchoringEnabled())
+                .as("gateway.publish.position-anchoring-enabled as bound from the actual shipped "
+                        + "src/main/resources/application.yml must equal GatewayProperties.Publish's own "
+                        + "Java-level default")
+                .isEqualTo(new GatewayProperties().getPublish().isPositionAnchoringEnabled());
     }
 }

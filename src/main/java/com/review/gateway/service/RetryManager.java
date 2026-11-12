@@ -181,7 +181,7 @@ public class RetryManager {
         reviewRepository.findById(reviewId).ifPresent(review -> {
             try {
                 gitLabClient.postDiscussion(review.getProjectId(), review.getMergeRequestId(),
-                        DiagnosticCommentRenderer.renderLlmFailure(review.getHeadSha()));
+                        DiagnosticCommentRenderer.renderLlmFailure(review.getHeadSha()), null);
             } catch (GitLabPublishException e) {
                 log.warn("Failed to post LLM failure notification: reviewId={} projectId={} mrId={}",
                         reviewId, review.getProjectId(), review.getMergeRequestId());

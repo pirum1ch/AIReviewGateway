@@ -48,7 +48,10 @@ GitLab CI job  ──POST /reviews──▶  Review Gateway  ──▶  PostgreS
        │                       (OpenAI-Chat-Completions-compatible)
        │
        └──────── discussions posted to the Merge Request ◀── GitLab API
-                 (Gateway → GitLab, via a configured project/group token)
+                 (Gateway → GitLab, via a configured project/group token; comments with a resolvable
+                 file+line are anchored to that diff position — native diff threads, not just top-level
+                 notes — Diff Position Anchoring, see `gateway.publish.position-anchoring-enabled` in §4.2
+                 and `docs/diff-position-anchoring-architecture.md`)
 ```
 
 - **GitLab CI** submits a diff for a Merge Request and gets a review id back immediately; it does not
@@ -122,13 +125,14 @@ settings look independent but aren't.
 The Gateway refuses to start if any of these is missing, blank, or (for the three tokens) shorter than
 32 characters. Error messages never repeat the secret's value back, only which one is missing.
 
-| Environment variable | Purpose |
-|---|---|
-| `CI_TOKEN` | Bearer token GitLab CI uses to create/check reviews. |
-| `WORKER_TOKEN` | Bearer token a Worker uses to talk to the Gateway. **Must be the exact same value** you give every Worker's own `GATEWAY_API_KEY`. |
-| `ADMIN_TOKEN` | Bearer token for admin actions (cancel a review, view metrics). |
-| `GITLAB_TOKEN` | Token the Gateway itself uses to post comments back to GitLab. Never shared with CI or Workers. |
-| `DB_USER` / `DB_PASSWORD` | PostgreSQL credentials. |
+| Environment variable | Bound property | Purpose |
+|---|---|---|
+| `CI_TOKEN` | `gateway.security.ci-token` | Bearer token for GitLab-CI-facing endpoints (`POST /reviews`, `GET /reviews/{id}`). **≥32 chars.** |
+| `WORKER_TOKEN` | `gateway.security.worker-token` | Bearer token for Worker-facing endpoints (`POST /jobs/**`). **≥32 chars.** |
+| `ADMIN_TOKEN` | `gateway.security.admin-token` | Bearer token for admin endpoints (`DELETE /reviews/{id}`, `GET /backends`, `GET /metrics`). **≥32 chars.** |
+| `GITLAB_TOKEN` | `gateway.gitlab.token` | Token the Gateway itself uses to call the GitLab API when publishing comments (`PRIVATE-TOKEN` header). Never exposed to CI or Workers. **Presence-only check — a real `glpat-...` token (26 chars) is expected and accepted.** **Diff Position Anchoring** (`gateway.publish.position-anchoring-enabled`, default `true`) additionally uses this token for a *read* call (`GET /projects/{id}/merge_requests/{iid}`, to fetch `diff_refs`) — it now needs **Reporter+/`api`** access to the reviewed MRs, not just write access to post discussions. A token that lacks this read scope degrades **silently** to plain (non-anchored) notes; set `gateway.publish.position-anchoring-enabled=false` if you cannot widen the token's scope. |
+| `DB_USER` | `spring.datasource.username` | PostgreSQL username. No default. |
+| `DB_PASSWORD` | `spring.datasource.password` | PostgreSQL password. No default. |
 
 Generate the three bearer tokens as random values, e.g. `openssl rand -hex 32`. For `GITLAB_TOKEN`, use a
 GitLab project or group access token scoped only to the repositories under review, not a personal token
@@ -159,6 +163,45 @@ Three settings deserve a mention here because getting them wrong fails silently 
   (Structured Review Output, §4.5) is deliberately left out of the default until every Worker is ready
   for it.
 - **`BACKEND_SELF_REGISTRATION_ENABLED`** — off by default; see [§4.6](#46-backend-self-registration-optional).
+
+| Property | Default | Purpose |
+|---|---|---|
+| `spring.datasource.url` (`DB_URL`) | `jdbc:postgresql://localhost:5432/review_gateway` | JDBC URL. See [§4.3](#43-deployment-must-dos-from-the-sast-report) for the non-loopback TLS note. |
+| `spring.datasource.hikari.maximum-pool-size` | `20` | Connection pool size. |
+| `server.port` | `8080` | HTTP listen port. |
+| `server.max-http-request-header-size` | `16KB` | Hard cap on request header size. |
+| `management.endpoints.web.exposure.include` | `health` | Only `/actuator/health` is exposed; no `/actuator/env`, `/actuator/beans`, etc. Business metrics are the custom `GET /metrics` endpoint, not an actuator/Prometheus endpoint (there is no Micrometer Prometheus registry in this project). |
+| `gateway.diff.context-window` | `16384` | Assumed LLM context window, in tokens, for the diff-size budget heuristic. |
+| `gateway.diff.prompt-reserve` | `2000` | Tokens reserved for prompt scaffolding. |
+| `gateway.diff.answer-reserve` | `4000` | Tokens reserved for the model's answer. |
+| `gateway.diff.max-diff-tokens` | `10000` | Explicit cap; the enforced budget is `min(max-diff-tokens, context-window - prompt-reserve - answer-reserve)` — 10000 with the stock defaults. **As of diff chunking (V2), this is the per-chunk budget**, not a whole-diff reject threshold — see [§6.1a](#61a-diff-chunking). |
+| `gateway.diff.chars-per-token` | `4` | Heuristic characters-per-token ratio (no real tokenizer is used); diff size is estimated as `ceil(chars / chars-per-token)`. |
+| `gateway.diff.max-chunks` | `5` | **V2.** Maximum number of chunks `DiffChunker` may split one diff into; a diff needing more is rejected with `422 DIFF_TOO_LARGE` rather than dispatched. Deliberately conservative (see the javadoc on `GatewayProperties.Diff.maxChunks` for the pool-starvation compute-cost math: `max-chunks × job.max-duration × retry.max-attempts` is the worst-case aggregate Worker time one MR can occupy). |
+| `gateway.diff.chunk-header-reserve-tokens` | `256` | **V2.** Tokens reserved per chunk for the injected cross-chunk context header (§6.1a); subtracted from the per-chunk budget during bin-packing. |
+| `gateway.diff.max-chunk-context-chars` | `1000` | **V2.** Hard cap (characters) on the rendered cross-chunk context header text; excess other-file paths collapse to `"... and N more"`. |
+| `gateway.diff.max-request-body-bytes` | `320000` | Hard byte cap on the whole `POST /reviews` body, enforced by a servlet filter **before** Spring/Jackson reads it (see [§6.9](#69-body-size-limits)). **V2:** derived from `max-chunks × max-diff-tokens × chars-per-token × 1.5 (JSON-escaping safety factor) + 20000 (fixed overhead)` — see `GatewayProperties.Diff.maxRequestBodyBytes` javadoc (CSR-02); if you change `max-chunks`/`max-diff-tokens`/`chars-per-token`, recompute and update this value too, it is not auto-derived. |
+| `gateway.heartbeat.timeout` | `180s` | A `RUNNING` job is considered stale if `now - heartbeat_at` exceeds this; it is then requeued or failed. |
+| `gateway.heartbeat.interval` | `60s` | **Documents** the expected Worker heartbeat cadence; as of this codebase it is not bound to any `GatewayProperties` field (only `gateway.heartbeat.timeout` is read by the application), so changing it has no runtime effect — it exists purely as the value Worker implementations should target for `POST /jobs/{id}/heartbeat` frequency. |
+| `gateway.retry.max-attempts` | `3` | Max claim attempts before a Review is marked `FAILED` instead of requeued. |
+| `gateway.retry.requeue-delay` | `90s` | **Worker Observability & Claim Latency.** Delay before a requeued job becomes claimable again (`review_jobs.not_before`). **90s, not the more obvious-looking 30s** — a startup check enforces `requeue-delay × (max-attempts − 1) ≥ gateway.backend.failure-grace`, so a dead/restarting backend's attempt budget can never be exhausted faster than it can be detected and demoted (see §10). `0` disables the mechanism entirely (immediate requeue, today's pre-this-feature behavior) and **must** be paired with `gateway.backend.failure-grace: 0` — neither may be zeroed alone. |
+| `gateway.job.max-duration` | `45m` | Hard backstop: a `RUNNING` job older than this is requeued/failed even if heartbeats are still arriving. |
+| `gateway.job.max-fail-body-bytes` | `4096` | Hard byte cap on the whole `POST /jobs/{id}/fail` body (edge filter, see [§6.9](#69-body-size-limits)). |
+| `gateway.publish.max-comment-count` | `50` | Max parsed comments kept per Review; excess is dropped. |
+| `gateway.publish.max-comment-length` | `4000` | Max characters per parsed comment; excess is truncated. |
+| `gateway.publish.max-raw-response-length` | `200000` | Max characters of the raw LLM response actually persisted; oversized responses are truncated (not rejected) before storage and parsing. |
+| `gateway.publish.max-request-body-bytes` | `500000` | Hard byte cap on the whole `POST /jobs/{id}/result` body (edge filter, see [§6.9](#69-body-size-limits)). |
+| `gateway.publish.position-anchoring-enabled` | `true` | **Diff Position Anchoring.** Anchors published comments that have a resolvable `(file, line)` to that diff position (native GitLab diff thread) instead of a top-level note. Every failure mode (flag off, stale/short `headSha`, GitLab unreachable, unresolvable line) degrades silently to today's plain-note behavior — never fails a Review. Requires `GITLAB_TOKEN` to additionally have read access to the reviewed MRs (see [§4.1](#41-required-secrets-no-default--startup-fails-without-them)); a token lacking that scope also degrades silently to plain notes. `false` is the supported kill switch. |
+| `gateway.scheduler.heartbeat-check-interval` | `30s` | Tick interval for the stale-heartbeat sweep and the max-duration sweep. |
+| `gateway.scheduler.backend-health-interval` | `60s` | Tick interval for the backend health probe. |
+| `gateway.scheduler.publish-retry-interval` | `60s` | Tick interval for retrying publication of `COMPLETED` reviews. |
+| `gateway.gitlab.base-url` (`GITLAB_BASE_URL`) | `https://gitlab.example.com/api/v4` | GitLab API base URL. **Must** start with `https://` or the application refuses to start. |
+| `gateway.gitlab.connect-timeout` / `read-timeout` | `5s` / `30s` | Timeouts for the GitLab HTTP client. |
+| `gateway.backend.connect-timeout` / `read-timeout` | `3s` / `10s` | Timeouts for the backend `/health` probe client (which also disables following redirects). `read-timeout` was raised from `5s` — safe because the probe's HTTP call no longer runs inside a database transaction (see §10). |
+| `gateway.backend.allowed-host-pattern` (`BACKEND_ALLOWED_HOST_PATTERN`) | `.*` (matches any host) | Regex a backend's URL host must match before it is probed, on top of an always-on block of loopback/link-local/any-local/multicast addresses. **See the deployment must-do below — the default is permissive.** |
+| `gateway.backend.failure-grace` | `180s` | **Worker Observability & Claim Latency.** A backend flips `ACTIVE → SUSPECT` only after this many seconds of *continuous* failed health probes (fail-slow); recovery (`SUSPECT → ACTIVE`) stays single-success (recover-fast). Must be `≥ gateway.scheduler.backend-health-interval`; see the `requeue-delay` coupling above. |
+| `gateway.backend.defer-demotion-while-busy` | `true` | A failed probe does not demote a backend that is at capacity with at least one `RUNNING` job whose heartbeat is still fresh (dispatch-neutral: an at-capacity backend is already unclaimable). |
+| `gateway.backend.defer-demotion-max` | `45m` | Upper bound on how long the deferral above may postpone a demotion; past it, demotion proceeds regardless of capacity/heartbeat freshness. |
+| `worker.log.idle-summary-interval-sec` (`WORKER_IDLE_SUMMARY_INTERVAL_SEC`, **Worker module**) | `300` | At most one INFO idle-liveness summary line per this many seconds while a Worker finds no job to claim; `0` disables it. See [§9](#9-worker-protocol). |
 
 ### 4.3 Deployment must-dos (from `docs/security/feature-03-sast-report.md`)
 
@@ -819,7 +862,12 @@ curl -s http://localhost:8080/metrics -H "Authorization: Bearer $ADMIN_TOKEN"
   "legacyParseFallback": 0,
   "structuredValidationFailures": { "NOT_JSON": 0, "SCHEMA_MISMATCH": 0, "COVERAGE_SHORTFALL": 0, "TRUNCATED": 0 },
   "structuredConstraintSent": { "OFF": 0 },
-  "structuredFallbackUsed": 0
+  "structuredFallbackUsed": 0,
+  "positionAnchoringEnabled": true,
+  "positionsAnchored": 142,
+  "positionsUnresolved": 9,
+  "diffRefsUnavailable": 0,
+  "positionRejectedByGitLab": 1
 }
 ```
 `promptManagerEnabled`/`promptDisabledCount`/`promptSectionMissingCount` (Prompt Manager, V3) mirror
@@ -842,13 +890,19 @@ constraint on" at a glance. `structuredFallbackUsed` counts every time
 one of these four is keyed only on a closed, Gateway-defined vocabulary — never a file path, project id,
 backend URL, or any model-supplied string.
 
-`ownershipMismatches` (broken down by endpoint) and `workerFailureReportsIgnored` (Worker Observability &
-Claim Latency, WOR-03) are process-local, in-memory counters — they reset on a Gateway restart, unlike
-every other field on this endpoint, which is derived from PostgreSQL. This is deliberate: writing a
-`review_events` row for every rejected/no-op `POST /jobs/{id}/fail` report would turn the endpoint into an
-authenticated, unbounded `INSERT` primitive for any worker-token holder — a worse problem than the
-repudiation gap these counters close. A `workerId`-guessing campaign against `/jobs/**` is necessarily
-noisy; these counters (plus the existing `WARN` logs) are what makes that noise visible without that risk.
+`ownershipMismatches` (broken down by endpoint), `workerFailureReportsIgnored` (Worker Observability &
+Claim Latency, WOR-03), and the four Diff Position Anchoring counters — `positionsAnchored` (a comment was
+successfully anchored to a diff position), `positionsUnresolved` (a comment had a `file`/`line` but no
+matching diff line was found — including every comment in a Review where *nothing* resolved, F-DP-02),
+`diffRefsUnavailable` (`fetchDiffRefs` came back empty — network or an insufficiently-scoped token — **or**
+GitLab's `diff_refs.head_sha` didn't match `review.headSha`, i.e. stale MR state, F-DP-02), `positionRejectedByGitLab` (GitLab 400'd a positioned POST and
+the position-less fallback ran) — are all process-local, in-memory counters that reset on a Gateway
+restart, unlike every other field on this endpoint, which is derived from PostgreSQL. This is deliberate
+for the same reason in both cases: writing a `review_events` row for every one of these would turn the
+endpoint into an authenticated, unbounded `INSERT` primitive (for a worker-token holder in the first case,
+for anyone triggering a publish pass in the second). Every failure mode of Diff Position Anchoring is
+silent by design (it always falls back to a plain note, never fails a Review) — these four counters are
+the only way to notice "anchoring stopped working" without reading logs.
 
 ### 6.7a `POST /backends/announce`, `POST /backends`, `DELETE /backends/{name}` — Backend Self-Registration
 
@@ -1174,7 +1228,7 @@ transition is validated and applied in exactly one place (`StateMachine`) and wr
 | `RUNNING → COMPLETED` | `POST /jobs/{id}/result` is processed successfully. |
 | `RUNNING → QUEUED` | Heartbeat timeout, max-duration backstop, **or** a Worker-reported failure (`POST /jobs/{id}/fail`) — any of the three, **and** attempts remaining (retry). |
 | `RUNNING → FAILED` | Any of the three triggers above with attempts exhausted, **or** the result could not be parsed at all. |
-| `COMPLETED → PUBLISHED` | All parsed comments were successfully posted to the MR. |
+| `COMPLETED → PUBLISHED` | All parsed comments were successfully posted to the MR (as native diff threads where a comment's `file`/`line` could be resolved against the stored diff — Diff Position Anchoring, `gateway.publish.position-anchoring-enabled` — otherwise as a plain top-level note, identical to pre-feature behavior). |
 | `COMPLETED → COMPLETED` | A transient GitLab API failure during publish — stays `COMPLETED`, retried later; not a state change, no new event. |
 | `(NEW/QUEUED/RUNNING/COMPLETED) → OBSOLETE` | A new `head_sha` arrives for the same `(projectId, mergeRequestId)`. |
 | `(NEW/QUEUED/RUNNING/COMPLETED) → CANCELLED` | `DELETE /reviews/{id}` (admin). |

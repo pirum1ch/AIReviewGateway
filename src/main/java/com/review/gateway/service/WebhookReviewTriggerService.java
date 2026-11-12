@@ -247,7 +247,7 @@ public class WebhookReviewTriggerService {
             return;
         }
         try {
-            gitLabClient.postDiscussion(projectId, mergeRequestIid, DiagnosticCommentRenderer.render(reason, headSha));
+            gitLabClient.postDiscussion(projectId, mergeRequestIid, DiagnosticCommentRenderer.render(reason, headSha), null);
         } catch (GitLabPublishException publishFailure) {
             log.warn("Failed to post diagnostic comment for project={} mr={}: {}",
                     projectId, mergeRequestIid, publishFailure.getMessage());

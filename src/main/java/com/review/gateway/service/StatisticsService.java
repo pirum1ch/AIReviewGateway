@@ -113,7 +113,9 @@ public class StatisticsService {
                 metricsCounters.legacyParseFallbackCount(), metricsCounters.structuredValidationFailuresSnapshot(),
                 metricsCounters.structuredConstraintSentSnapshot(), metricsCounters.structuredFallbackUsedCount(),
                 metricsCounters.structuredFieldTruncatedSnapshot(), metricsCounters.webhookDiffIntegrityFailuresSnapshot(),
-                metricsCounters.webhookRateLimitedCount(), metricsCounters.webhookUnexpectedFailureCount());
+                metricsCounters.webhookRateLimitedCount(), metricsCounters.webhookUnexpectedFailureCount(),
+                metricsCounters.positionsAnchoredCount(), metricsCounters.positionsUnresolvedCount(),
+                metricsCounters.diffRefsUnavailableCount(), metricsCounters.positionRejectedByGitLabCount());
     }
 
     private double nullToZero(Double value) {

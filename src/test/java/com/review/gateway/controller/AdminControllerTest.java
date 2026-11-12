@@ -72,7 +72,7 @@ class AdminControllerTest {
         Map<ReviewStatus, Long> byStatus = new EnumMap<>(ReviewStatus.class);
         byStatus.put(ReviewStatus.QUEUED, 3L);
         when(statisticsService.computeMetrics())
-                .thenReturn(new MetricsSnapshot(10, byStatus, 100.0, 200.0, 5, 1, 2, 1, Map.of(), 0, 0, Map.of(), Map.of(), 0, Map.of(), Map.of(), 0, 0));
+                .thenReturn(new MetricsSnapshot(10, byStatus, 100.0, 200.0, 5, 1, 2, 1, Map.of(), 0, 0, Map.of(), Map.of(), 0, Map.of(), Map.of(), 0, 0, 0, 0, 0, 0));
 
         mockMvc.perform(get("/metrics").header("Authorization", "Bearer " + SecurityTestTokens.ADMIN_TOKEN))
                 .andExpect(status().isOk())
@@ -82,6 +82,26 @@ class AdminControllerTest {
                 .andExpect(jsonPath("$.promptSectionMissingCount").value(1))
                 // Prompt Manager kill-switch off in the shared test application.yml (PMR-10 premise).
                 .andExpect(jsonPath("$.promptManagerEnabled").value(false));
+    }
+
+    @Test
+    void metricsExposesDiffPositionAnchoringCounters() throws Exception {
+        // DPR-12: independently confirm StatisticsService/MetricsCounters -> MetricsResponse actually
+        // reaches the wire -- the developer's own metricsRequiresAdmin only re-verified the constructor
+        // arity after these fields were added, never asserted their JSON path/value.
+        Map<ReviewStatus, Long> byStatus = new EnumMap<>(ReviewStatus.class);
+        when(statisticsService.computeMetrics())
+                .thenReturn(new MetricsSnapshot(0, byStatus, 0.0, 0.0, 0, 0, 0, 0, Map.of(), 0, 0, Map.of(), Map.of(), 0, Map.of(), Map.of(), 0, 0, 7, 3, 2, 1));
+
+        mockMvc.perform(get("/metrics").header("Authorization", "Bearer " + SecurityTestTokens.ADMIN_TOKEN))
+                .andExpect(status().isOk())
+                // DPR-10: the flag surfaced here comes live from GatewayProperties, not the (unrelated)
+                // MetricsSnapshot mock above -- default true, no override in the shared test application.yml.
+                .andExpect(jsonPath("$.positionAnchoringEnabled").value(true))
+                .andExpect(jsonPath("$.positionsAnchored").value(7))
+                .andExpect(jsonPath("$.positionsUnresolved").value(3))
+                .andExpect(jsonPath("$.diffRefsUnavailable").value(2))
+                .andExpect(jsonPath("$.positionRejectedByGitLab").value(1));
     }
 
     @Test

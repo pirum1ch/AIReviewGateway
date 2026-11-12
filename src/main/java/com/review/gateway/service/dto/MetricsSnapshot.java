@@ -30,5 +30,9 @@ public record MetricsSnapshot(
         Map<String, Long> structuredFieldTruncated,
         Map<String, Long> webhookDiffIntegrityFailures,
         long webhookRateLimited,
-        long webhookUnexpectedFailure) {
+        long webhookUnexpectedFailure,
+        long positionsAnchored,
+        long positionsUnresolved,
+        long diffRefsUnavailable,
+        long positionRejectedByGitLab) {
 }

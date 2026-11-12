@@ -165,7 +165,7 @@ class WebhookReviewTriggerServiceIntegrationTest extends AbstractPostgresIntegra
         newTriggerService(properties, gitLabClient).handle(PROJECT_ID, MR_IID, null);
 
         assertThat(reviewRepository.findAll()).isEmpty();
-        verify(gitLabClient, times(1)).postDiscussion(anyLong(), anyLong(), anyString());
+        verify(gitLabClient, times(1)).postDiscussion(anyLong(), anyLong(), anyString(), any());
     }
 
     @Test
@@ -178,6 +178,6 @@ class WebhookReviewTriggerServiceIntegrationTest extends AbstractPostgresIntegra
         newTriggerService(properties, gitLabClient).handle(PROJECT_ID, MR_IID, null);
 
         assertThat(reviewRepository.findAll()).isEmpty();
-        verify(gitLabClient, never()).postDiscussion(anyLong(), anyLong(), anyString());
+        verify(gitLabClient, never()).postDiscussion(anyLong(), anyLong(), anyString(), any());
     }
 }

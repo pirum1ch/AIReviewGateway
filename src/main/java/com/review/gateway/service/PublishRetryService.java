@@ -31,15 +31,31 @@ public class PublishRetryService {
         this.gitLabPublisher = gitLabPublisher;
     }
 
-    /** @return the number of reviews that were fully published during this pass */
+    /**
+     * @return the number of reviews that were fully published during this pass
+     *
+     * <p>DPR-01b (Diff Position Anchoring): each candidate is guarded by its own {@code catch
+     * (RuntimeException)}. Before this feature, {@code publishReview} was effectively non-throwing (every
+     * GitLab failure is already caught per-comment inside it), so this loop had no guard and needed none.
+     * Position resolution changes that — without this guard, one poisoned Review (e.g. a crafted diff
+     * hunk header) sitting at the head of the {@code createdAt ASC}-ordered candidate list would abort
+     * every subsequent iteration of every future pass, permanently blocking publication for every other
+     * Review. Never logs the exception message (class name only — same WOR-05/F02-03 rationale as
+     * {@code GitLabPublisher}'s own guard).
+     */
     @Transactional(readOnly = true)
     public int retryPublications() {
         List<Review> completed = reviewRepository.findByStatusOrderByCreatedAtAsc(ReviewStatus.COMPLETED);
         int publishedCount = 0;
         for (Review review : completed) {
-            PublishOutcome outcome = gitLabPublisher.publishReview(review.getId());
-            if (outcome == PublishOutcome.PUBLISHED) {
-                publishedCount++;
+            try {
+                PublishOutcome outcome = gitLabPublisher.publishReview(review.getId());
+                if (outcome == PublishOutcome.PUBLISHED) {
+                    publishedCount++;
+                }
+            } catch (RuntimeException e) {
+                log.warn("Publish retry pass: reviewId={} failed unexpectedly, skipping to the next candidate: {}",
+                        review.getId(), e.getClass().getSimpleName());
             }
         }
         if (publishedCount > 0) {
